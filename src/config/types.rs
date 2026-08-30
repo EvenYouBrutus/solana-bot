@@ -12,6 +12,7 @@ pub struct Config {
     pub risk: RiskConfig,
     pub execution: ExecutionConfig,
     pub storage: StorageConfig,
+    #[serde(default)] pub runtime: RuntimeConfig,
     #[serde(default)] pub observability: ObservabilityConfig,
 }
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -33,10 +34,14 @@ pub enum ExecutionProvider { Jupiter }
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig { pub sqlite_path: String }
 #[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeConfig { #[serde(default)] pub signal_feed_path: Option<String>, #[serde(default = "default_poll")] pub poll_interval_secs: u64, #[serde(default = "default_paper_haircut")] pub paper_fill_haircut_bps: u32 }
+#[derive(Debug, Clone, Deserialize)]
 pub struct ObservabilityConfig { #[serde(default = "default_log")] pub log_format: String }
 fn default_stale() -> i64 { 15 } fn default_timeout() -> u64 { 8 } fn default_log() -> String { "json".into() }
+fn default_poll() -> u64 { 2 } fn default_paper_haircut() -> u32 { 25 }
 
 impl Default for ObservabilityConfig { fn default() -> Self { Self { log_format: default_log() } } }
+impl Default for RuntimeConfig { fn default() -> Self { Self { signal_feed_path: None, poll_interval_secs: default_poll(), paper_fill_haircut_bps: default_paper_haircut() } } }
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.rpc.http_endpoints.is_empty() { return Err(ConfigError::Invalid("at least one HTTP RPC endpoint is required".into())); }
@@ -44,8 +49,9 @@ impl Config {
         if self.risk.max_risk_per_trade_percent <= Decimal::ZERO || self.risk.max_risk_per_trade_percent > Decimal::new(100, 0) { return Err(ConfigError::Invalid("max_risk_per_trade_percent must be in (0,100]".into())); }
         if self.risk.max_slippage_bps == 0 || self.execution.slippage_bps as u32 > self.risk.max_slippage_bps { return Err(ConfigError::Invalid("execution slippage must be positive and no greater than risk maximum".into())); }
         if self.economics.min_expected_net_return_pct <= Decimal::ZERO || self.risk.min_liquidity_usd <= Decimal::ZERO { return Err(ConfigError::Invalid("minimum edge and liquidity must be positive".into())); }
-        if self.mode == Mode::Live && (self.execution.live_signer_env.as_deref().unwrap_or_default().is_empty() || self.risk.max_live_capital_usd <= Decimal::ZERO) { return Err(ConfigError::Invalid("live mode requires live_signer_env and a positive max_live_capital_usd".into())); }
+        if self.mode == Mode::Live && (self.execution.live_signer_env.as_deref().unwrap_or_default().is_empty() || self.risk.max_live_capital_usd <= Decimal::ZERO || self.risk.max_live_capital_usd > self.risk.starting_capital_usd) { return Err(ConfigError::Invalid("live mode requires signer and a positive capital cap no greater than starting capital".into())); }
         if self.mode == Mode::Live && self.execution.allowed_program_ids.is_empty() { return Err(ConfigError::Invalid("live mode requires a non-empty execution program allowlist".into())); }
+        if self.runtime.poll_interval_secs == 0 || self.economics.max_quote_age_secs <= 0 || self.rpc.max_data_age_secs <= 0 || self.execution.slippage_bps > 10_000 { return Err(ConfigError::Invalid("poll, freshness intervals, and slippage must be valid".into())); }
         Ok(())
     }
 }

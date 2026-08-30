@@ -51,5 +51,12 @@ allowed_program_ids = []
 [storage]
 sqlite_path = "state/solana-bot.sqlite3"
 
+[runtime]
+# JSONL CandidateInput records. This is the explicit boundary for a verified
+# on-chain/indexer collector; absent input means no orders are generated.
+signal_feed_path = ""
+poll_interval_secs = 2
+paper_fill_haircut_bps = 25
+
 [observability]
 log_format = "json"

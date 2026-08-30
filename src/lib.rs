@@ -8,6 +8,7 @@ pub mod execution;
 pub mod observability;
 pub mod portfolio;
 pub mod risk;
+pub mod runtime;
 pub mod smart_money;
 pub mod storage;
 pub mod strategy;
