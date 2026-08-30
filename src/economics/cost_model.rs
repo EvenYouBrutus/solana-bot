@@ -2,6 +2,37 @@ use super::{break_even_calculator, BreakEvenInputs, BreakEvenResult, ViabilityEr
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use rust_decimal_macros::dec;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedValue {
+    pub gross_return_pct: Decimal,
+    pub trading_fees_pct: Decimal,
+    pub priority_and_network_pct: Decimal,
+    pub slippage_pct: Decimal,
+    pub price_impact_pct: Decimal,
+    pub failed_transaction_pct: Decimal,
+    pub adverse_selection_pct: Decimal,
+    pub expected_exit_cost_pct: Decimal,
+    pub uncertainty_haircut_pct: Decimal,
+    pub net_return_pct: Decimal,
+}
+impl ExpectedValue {
+    pub fn estimate(gross_return_pct: Decimal, model: &CostModel, adverse_selection_bps: Decimal, exit_cost_bps: Decimal, uncertainty_haircut_pct: Decimal) -> Result<Self, ViabilityError> {
+        let r = model.calculate()?;
+        if adverse_selection_bps < Decimal::ZERO || exit_cost_bps < Decimal::ZERO || uncertainty_haircut_pct < Decimal::ZERO { return Err(ViabilityError::Negative("expected-value component")); }
+        let p = model.input.position_size_usd;
+        let fees = dec!(2) * model.input.avg_swap_fee_bps / dec!(100);
+        let priority = dec!(2) * model.input.avg_priority_fee_usd / p * dec!(100);
+        let slippage = dec!(2) * model.input.avg_slippage_bps / dec!(100);
+        let impact = dec!(2) * model.input.avg_price_impact_bps / dec!(100);
+        let failed = r.expected_failed_tx_cost_usd / p * dec!(100);
+        let adverse = adverse_selection_bps / dec!(100);
+        let exit = exit_cost_bps / dec!(100);
+        let net = gross_return_pct - fees - priority - slippage - impact - failed - adverse - exit - uncertainty_haircut_pct;
+        Ok(Self { gross_return_pct, trading_fees_pct: fees, priority_and_network_pct: priority, slippage_pct: slippage, price_impact_pct: impact, failed_transaction_pct: failed, adverse_selection_pct: adverse, expected_exit_cost_pct: exit, uncertainty_haircut_pct, net_return_pct: net })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostModel {

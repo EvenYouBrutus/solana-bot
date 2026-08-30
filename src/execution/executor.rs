@@ -1,0 +1,5 @@
+use crate::domain::trade::Fill; use async_trait::async_trait; use chrono::{DateTime,Utc}; use thiserror::Error;
+#[derive(Debug,Clone)] pub struct Quote { pub input_mint:String,pub output_mint:String,pub input_amount:u64,pub output_amount:u64,pub price_impact_bps:u32,pub route:serde_json::Value,pub observed_at:DateTime<Utc> }
+#[derive(Debug,Clone)] pub struct ExecutionRequest { pub order_id:String,pub quote:Quote,pub max_slippage_bps:u32,pub min_output_amount:u64 }
+#[derive(Debug,Error)] pub enum ExecutionError { #[error("quote unavailable: {0}")] Quote(String),#[error("quote is stale") ] StaleQuote,#[error("quote violates slippage/receive limit") ] InvalidQuote,#[error("transaction failed: {0}")] Transaction(String),#[error("execution backend unavailable: {0}")] Unavailable(String) }
+#[async_trait] pub trait Executor: Send+Sync { async fn quote(&self,input_mint:&str,output_mint:&str,amount:u64,slippage_bps:u16)->Result<Quote,ExecutionError>; async fn execute(&self,request:ExecutionRequest)->Result<Fill,ExecutionError>; async fn health(&self)->Result<(),ExecutionError>; }
