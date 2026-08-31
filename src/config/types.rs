@@ -137,6 +137,11 @@ pub struct RuntimeConfig {
     /// (startup reconciliation still runs).
     #[serde(default = "default_reconcile_interval")]
     pub reconcile_interval_secs: u64,
+    /// Maximum age (seconds) of persisted liquidity evidence before it is
+    /// treated as stale and treated identically to missing liquidity (triggering
+    /// a LiquidityDeterioration exit). Zero disables staleness checks.
+    #[serde(default = "default_max_liquidity_age")]
+    pub max_liquidity_age_secs: u64,
     /// Collector configuration for Phase 1
     #[serde(default = "default_collector")]
     pub collector: CollectorConfig,
@@ -209,6 +214,9 @@ fn default_confirm_poll_ms() -> u64 {
 fn default_reconcile_interval() -> u64 {
     60
 }
+fn default_max_liquidity_age() -> u64 {
+    300
+}
 
 impl Default for ObservabilityConfig {
     fn default() -> Self {
@@ -224,6 +232,7 @@ impl Default for RuntimeConfig {
             poll_interval_secs: default_poll(),
             paper_fill_haircut_bps: default_paper_haircut(),
             reconcile_interval_secs: default_reconcile_interval(),
+            max_liquidity_age_secs: default_max_liquidity_age(),
             collector: default_collector(),
         }
     }

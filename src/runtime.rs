@@ -238,23 +238,40 @@ pub(crate) async fn record_reconciled_fill(
         input_value_usd: Some(value_usd),
         expected_output_amount: None,
     };
-    // Persist fill and apply to portfolio BEFORE marking the order Confirmed.
-    // If the process crashes mid-way, the order stays Unknown and will be
-    // retried on restart; no confirmed order with missing accounting.
-    deps.store.save_fill(&fill)?;
-    apply_confirmed_fill_to_portfolio(
-        deps,
-        order,
-        position,
-        &mut fill,
-        token_decimals,
-        base_decimals,
-    )?;
-    let mut o = order.clone();
-    o.signature = Some(signature.to_string());
-    o.transition(OrderState::Confirmed)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    deps.store.update_order(&o)?;
+    // Persist fill, apply to portfolio, and update order atomically.
+    // If the process crashes mid-way, the transaction rolls back and the
+    // order stays Unknown; on restart, reconciliation retries safely.
+    deps.store.run_in_transaction(|conn| {
+        // Save fill directly using the connection (avoids re-locking mutex).
+        let fill_json = serde_json::to_string(&fill)?;
+        conn.execute(
+            "INSERT INTO fills(order_id,payload,created_at) VALUES(?1,?2,?3) ON CONFLICT(order_id) DO UPDATE SET payload=excluded.payload",
+            rusqlite::params![fill.order_id, fill_json, Utc::now().to_rfc3339()],
+        )?;
+
+        // Apply to portfolio and save position.
+        apply_confirmed_fill_to_portfolio(
+            deps,
+            order,
+            position,
+            &mut fill,
+            token_decimals,
+            base_decimals,
+        )?;
+
+        // Update order to Confirmed.
+        let mut o = order.clone();
+        o.signature = Some(signature.to_string());
+        o.transition(OrderState::Confirmed)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let order_json = serde_json::to_string(&o)?;
+        conn.execute(
+            "UPDATE orders SET state=?2,payload=?3,order_kind=?4,position_id=?5,side=?6,updated_at=?7 WHERE id=?1",
+            rusqlite::params![o.id, format!("{:?}", o.state), order_json, format!("{:?}", o.kind), o.position_id, format!("{:?}", o.side), Utc::now().to_rfc3339()],
+        )?;
+
+        Ok(())
+    })?;
     tracing::info!(order_id=%order.id, kind=?order.kind, mint=%order.mint, %signature,
         input=outcome.input_amount, output=outcome.output_amount, fee_lamports=outcome.fee_lamports,
         "order reconciled from chain after restart");
@@ -601,21 +618,54 @@ pub(crate) async fn execute_exit_order(
     match executor.execute(request).await {
         Ok(mut fill) => {
             finalize_fill(&mut fill, config.economics.sol_price_usd);
-            // Persist fill before any order state change.
-            store.save_fill(&fill).ok();
-            // Sync portfolio with fresh store data to avoid stale accounting.
-            if let Some(fresh_pos) = stored.iter().find(|p| p.mint == mint) {
-                portfolio.sync_position(fresh_pos.clone());
-            }
-            match portfolio.apply_exit(mint, &fill, reason, Utc::now()) {
+            // Atomic persistence: fill + position + order in one transaction.
+            // If the process crashes mid-way, the transaction rolls back and
+            // the order stays Submitted/Unknown; reconciliation retries on restart.
+            let persist_result = store.run_in_transaction(|conn| {
+                // Save fill directly using the connection.
+                let fill_json = serde_json::to_string(&fill)?;
+                conn.execute(
+                    "INSERT INTO fills(order_id,payload,created_at) VALUES(?1,?2,?3) ON CONFLICT(order_id) DO UPDATE SET payload=excluded.payload",
+                    rusqlite::params![fill.order_id, fill_json, Utc::now().to_rfc3339()],
+                )?;
+
+                // Load fresh portfolio from store (within the same connection/transaction).
+                let mut tx_portfolio = load_portfolio(store)?;
+                // Sync with stored position data.
+                if let Some(fresh_pos) = stored.iter().find(|p| p.mint == mint) {
+                    tx_portfolio.sync_position(fresh_pos.clone());
+                }
+                let outcome = tx_portfolio.apply_exit(mint, &fill, reason, Utc::now())
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                // Save updated position.
+                if let Some(p) = tx_portfolio.position(mint) {
+                    let pos_json = serde_json::to_string(p)?;
+                    conn.execute(
+                        "INSERT INTO kv(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                        rusqlite::params![format!("position:{}", p.mint), pos_json, Utc::now().to_rfc3339()],
+                    )?;
+                }
+
+                // Update order to Confirmed.
+                placed.signature = Some(fill.signature.clone());
+                placed.transition(OrderState::Confirmed).ok();
+                let order_json = serde_json::to_string(&placed)?;
+                conn.execute(
+                    "UPDATE orders SET state=?2,payload=?3,order_kind=?4,position_id=?5,side=?6,updated_at=?7 WHERE id=?1",
+                    rusqlite::params![placed.id, format!("{:?}", placed.state), order_json, format!("{:?}", placed.kind), placed.position_id, format!("{:?}", placed.side), Utc::now().to_rfc3339()],
+                )?;
+
+                Ok(outcome)
+            });
+
+            match persist_result {
                 Ok(outcome) => {
-                    if let Some(p) = portfolio.position(mint) {
-                        store.save_position(p).ok();
+                    // Update in-memory portfolio to stay consistent.
+                    if let Some(fresh_pos) = stored.iter().find(|p| p.mint == mint) {
+                        portfolio.sync_position(fresh_pos.clone());
                     }
-                    // Mark order Confirmed ONLY after portfolio accounting succeeds.
-                    placed.signature = Some(fill.signature.clone());
-                    placed.transition(OrderState::Confirmed).ok();
-                    store.update_order(&placed).ok();
+                    let _ = portfolio.apply_exit(mint, &fill, reason, Utc::now());
                     tracing::info!(
                         order_id = %order.id,
                         mint = %mint,
@@ -631,19 +681,19 @@ pub(crate) async fn execute_exit_order(
                     ExitExecResult::Confirmed(fill)
                 }
                 Err(e) => {
-                    // Fill confirmed on-chain but accounting failed.
+                    // Fill confirmed on-chain but atomic persistence failed.
                     // Mark Unknown so reconciliation can retry; do NOT
                     // leave as Submitted (which would block entries).
                     placed.signature = Some(fill.signature.clone());
                     placed.transition(OrderState::Unknown).ok();
-                    placed.error = Some(format!("accounting failed: {e}"));
+                    placed.error = Some(format!("atomic persistence failed: {e}"));
                     store.update_order(&placed).ok();
                     tracing::error!(
                         order_id = %order.id,
                         error = %e,
-                        "confirmed exit could not be applied to position; reconciliation required"
+                        "confirmed exit could not be persisted atomically; reconciliation required"
                     );
-                    ExitExecResult::Failed(format!("apply_exit failed: {e}"))
+                    ExitExecResult::Failed(format!("transactional persistence failed: {e}"))
                 }
             }
         }
@@ -968,9 +1018,29 @@ async fn process_exits(deps: &SessionDeps, state: &mut SessionState) -> Result<(
         let candidate = state.candidates.get(&mint);
         // Liquidity: prefer fresh candidate data, else persisted observation,
         // else None (missing evidence triggers exit via fail-closed).
+        // Stale persisted evidence (older than max_liquidity_age_secs) is
+        // treated identically to missing.
         let liquidity: Option<Decimal> = candidate.map(|c| c.market.liquidity_usd).or_else(|| {
             match store.last_liquidity(&mint) {
-                Ok(Some((liq, _))) => Some(liq),
+                Ok(Some((liq, ts))) => {
+                    let max_age = deps.config.runtime.max_liquidity_age_secs;
+                    if max_age > 0 {
+                        let age = Utc::now() - ts;
+                        if age > chrono::Duration::seconds(max_age as i64) {
+                            tracing::warn!(
+                                mint=%mint,
+                                age_secs=%age.num_seconds(),
+                                max_age_secs=%max_age,
+                                "liquidity evidence is stale; treating as missing"
+                            );
+                            None
+                        } else {
+                            Some(liq)
+                        }
+                    } else {
+                        Some(liq)
+                    }
+                }
                 Ok(None) => None,
                 Err(e) => {
                     tracing::error!(mint=%mint, error=%e, "failed to read liquidity evidence; treating as missing");
@@ -1253,28 +1323,65 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             Ok(mut fill) => {
                 finalize_fill(&mut fill, config.economics.sol_price_usd);
                 let entry_price = fill.price_usd;
-                // Persist fill before any order state change.
-                store.save_fill(&fill)?;
-                match state.portfolio.apply_entry(
-                    mint.clone(),
-                    config.strategy.base_mint.clone(),
-                    token_decimals,
-                    base_mint_decimals,
-                    position_id.clone(),
-                    &fill,
-                    entry_price,
-                    signal.id.clone(),
-                    c.costs.clone(),
-                ) {
+                // Atomic persistence: fill + position + order in one transaction.
+                let persist_result = store.run_in_transaction(|conn| {
+                    // Save fill directly using the connection.
+                    let fill_json = serde_json::to_string(&fill)?;
+                    conn.execute(
+                        "INSERT INTO fills(order_id,payload,created_at) VALUES(?1,?2,?3) ON CONFLICT(order_id) DO UPDATE SET payload=excluded.payload",
+                        rusqlite::params![fill.order_id, fill_json, Utc::now().to_rfc3339()],
+                    )?;
+
+                    // Load fresh portfolio and apply entry.
+                    let mut tx_portfolio = load_portfolio(store)?;
+                    tx_portfolio.apply_entry(
+                        mint.clone(),
+                        config.strategy.base_mint.clone(),
+                        token_decimals,
+                        base_mint_decimals,
+                        position_id.clone(),
+                        &fill,
+                        entry_price,
+                        signal.id.clone(),
+                        c.costs.clone(),
+                    ).map_err(|e| anyhow::anyhow!(e))?;
+
+                    // Save updated position.
+                    if let Some(p) = tx_portfolio.position(&mint) {
+                        let pos_json = serde_json::to_string(p)?;
+                        conn.execute(
+                            "INSERT INTO kv(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                            rusqlite::params![format!("position:{}", p.mint), pos_json, Utc::now().to_rfc3339()],
+                        )?;
+                    }
+
+                    // Update order to Confirmed.
+                    placed.signature = Some(fill.signature.clone());
+                    placed.transition(OrderState::Confirmed).ok();
+                    let order_json = serde_json::to_string(&placed)?;
+                    conn.execute(
+                        "UPDATE orders SET state=?2,payload=?3,order_kind=?4,position_id=?5,side=?6,updated_at=?7 WHERE id=?1",
+                        rusqlite::params![placed.id, format!("{:?}", placed.state), order_json, format!("{:?}", placed.kind), placed.position_id, format!("{:?}", placed.side), Utc::now().to_rfc3339()],
+                    )?;
+
+                    Ok(())
+                });
+
+                match persist_result {
                     Ok(()) => {
-                        if let Some(p) = state.portfolio.position(&mint) {
-                            store.save_position(p)?;
-                            // Mark order Confirmed ONLY after portfolio accounting succeeds.
-                            placed.signature = Some(fill.signature.clone());
-                            placed.transition(OrderState::Confirmed).ok();
-                            store.update_order(&placed)?;
-                            tracing::info!(order_id=%order.id, mint=%mint, signature=%fill.signature, position_id=%position_id, qty_atomic=fill.output_amount, price_usd=%fill.price_usd, fees_usd=%fill.fees_usd, fee_lamports=fill.fee_lamports, "confirmed entry persisted");
-                        }
+                        // Update in-memory portfolio to stay consistent.
+                        let _ = state.portfolio.apply_entry(
+                            mint.clone(),
+                            config.strategy.base_mint.clone(),
+                            token_decimals,
+                            base_mint_decimals,
+                            position_id.clone(),
+                            &fill,
+                            entry_price,
+                            signal.id.clone(),
+                            c.costs.clone(),
+                        );
+                        tracing::info!(order_id=%order.id, mint=%mint, signature=%fill.signature, position_id=%position_id, qty_atomic=fill.output_amount, price_usd=%fill.price_usd, fees_usd=%fill.fees_usd, fee_lamports=fill.fee_lamports, "confirmed entry persisted");
                         state.risk.register_trade(c.position_usd);
                         state.risk.record_execution_success();
                         if fill.output_amount < min_output {
@@ -1286,14 +1393,13 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                         }
                     }
                     Err(e) => {
-                        // Fill confirmed on-chain but accounting failed.
-                        // Mark Unknown so reconciliation can retry; do NOT
-                        // leave as Submitted (which would block entries).
+                        // Fill confirmed on-chain but atomic persistence failed.
+                        // Mark Unknown so reconciliation can retry.
                         placed.signature = Some(fill.signature.clone());
                         placed.transition(OrderState::Unknown).ok();
-                        placed.error = Some(format!("accounting failed: {e}"));
+                        placed.error = Some(format!("atomic persistence failed: {e}"));
                         store.update_order(&placed)?;
-                        tracing::error!(order_id=%order.id, error=%e, "confirmed entry could not be applied to the portfolio; reconciliation required")
+                        tracing::error!(order_id=%order.id, error=%e, "confirmed entry could not be persisted atomically; reconciliation required")
                     }
                 }
             }

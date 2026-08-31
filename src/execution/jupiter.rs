@@ -104,6 +104,21 @@ impl JupiterExecutor {
         }
         Ok(())
     }
+    /// Pre-submission fee estimate: priority fee + base fee (5000 lamports).
+    /// Catches excessive fees before the transaction is signed and submitted.
+    fn verify_presubmission_fee(
+        priority_fee_lamports: u64,
+        max_fee_lamports: u64,
+    ) -> Result<(), ExecutionError> {
+        const BASE_FEE_LAMPORTS: u64 = 5_000;
+        let estimated_total = priority_fee_lamports + BASE_FEE_LAMPORTS;
+        if estimated_total > max_fee_lamports {
+            return Err(ExecutionError::Policy(format!(
+                "estimated transaction fee {estimated_total} lamports (priority {priority_fee_lamports} + base {BASE_FEE_LAMPORTS}) exceeds configured maximum {max_fee_lamports}"
+            )));
+        }
+        Ok(())
+    }
     /// RPC submission errors that are deterministic refusals. The node has
     /// not relayed the transaction, so treating these as `Failed` cannot
     /// double-spend; everything else stays `Unknown`.
@@ -296,6 +311,10 @@ impl Executor for JupiterExecutor {
         if let Some(key) = self.api_key()? {
             body["apiKey"] = json!(key);
         }
+        // Pre-submission fee cap: estimated priority fee + base fee (5000 lamports).
+        // This catches excessive fees before signing; the post-confirmation
+        // verify_onchain_fee() provides an additional safety net.
+        Self::verify_presubmission_fee(self.priority_fee_lamports, self.max_fee_lamports)?;
         let swap: Value = self
             .client
             .post(format!("{}/swap/v1/swap", self.api_url))
@@ -497,5 +516,17 @@ mod tests {
         assert!(JupiterExecutor::verify_onchain_fee(10_000, 500_000).is_ok());
         // Zero fee: allowed
         assert!(JupiterExecutor::verify_onchain_fee(0, 500_000).is_ok());
+    }
+
+    #[test]
+    fn presubmission_fee_cap_is_enforced_before_signing() {
+        // priority 45_000 + base 5_000 = 50_000, cap 50_000: allowed
+        assert!(JupiterExecutor::verify_presubmission_fee(45_000, 50_000).is_ok());
+        // priority 45_001 + base 5_000 = 50_001, cap 50_000: rejected
+        assert!(JupiterExecutor::verify_presubmission_fee(45_001, 50_000).is_err());
+        // priority 0 + base 5_000 = 5_000, cap 50_000: allowed
+        assert!(JupiterExecutor::verify_presubmission_fee(0, 50_000).is_ok());
+        // priority 10_000 + base 5_000 = 15_000, cap 10_000: rejected
+        assert!(JupiterExecutor::verify_presubmission_fee(10_000, 10_000).is_err());
     }
 }

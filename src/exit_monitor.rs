@@ -159,9 +159,28 @@ impl ExitMonitor {
             }
 
             // Load persisted liquidity evidence (None = missing → exit,
-            // never invent a value).
+            // never invent a value). Stale evidence (older than
+            // max_liquidity_age_secs) is treated identically to missing.
             let liquidity: Option<Decimal> = match store.last_liquidity(&mint) {
-                Ok(Some((liq, _ts))) => Some(liq),
+                Ok(Some((liq, ts))) => {
+                    let max_age = config.runtime.max_liquidity_age_secs;
+                    if max_age > 0 {
+                        let age = Utc::now() - ts;
+                        if age > chrono::Duration::seconds(max_age as i64) {
+                            tracing::warn!(
+                                mint=%mint,
+                                age_secs=%age.num_seconds(),
+                                max_age_secs=%max_age,
+                                "exit monitor: liquidity evidence is stale; treating as missing"
+                            );
+                            None
+                        } else {
+                            Some(liq)
+                        }
+                    } else {
+                        Some(liq)
+                    }
+                }
                 Ok(None) => None,
                 Err(e) => {
                     tracing::error!(mint=%mint, error=%e, "exit monitor: failed to read liquidity evidence; treating as missing");

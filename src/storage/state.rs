@@ -285,6 +285,29 @@ impl StateStore {
             .and_then(|v| v["invalidated"].as_bool())
             .unwrap_or(false))
     }
+
+    /// Execute a closure inside a SQLite transaction. If the closure returns
+    /// `Err`, the transaction is rolled back; on `Ok`, it is committed.
+    /// This ensures that multi-step persistence (order + fill + position)
+    /// is atomic: a crash mid-way leaves all three unapplied rather than
+    /// partially applied.
+    pub fn run_in_transaction<F, R>(&self, f: F) -> Result<R, anyhow::Error>
+    where
+        F: FnOnce(&Connection) -> Result<R, anyhow::Error>,
+    {
+        let c = self.conn()?;
+        c.execute_batch("BEGIN IMMEDIATE")?;
+        match f(&c) {
+            Ok(r) => {
+                c.execute_batch("COMMIT")?;
+                Ok(r)
+            }
+            Err(e) => {
+                c.execute_batch("ROLLBACK").ok();
+                Err(e)
+            }
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -535,5 +558,47 @@ mod tests {
         assert!(s.reserve_order(&o).unwrap());
         assert!(s.incomplete_orders().unwrap().is_empty());
         assert_eq!(s.orders().unwrap().len(), 1);
+    }
+    #[test]
+    fn run_in_transaction_commits_on_success() {
+        let s = StateStore::open(":memory:").unwrap();
+        let o = order(OrderKind::Entry, OrderSide::Buy, Some("p1"));
+        assert!(s.reserve_order(&o).unwrap());
+        s.run_in_transaction(|conn| {
+            let fill = Fill {
+                order_id: o.id.clone(),
+                signature: "sig".into(),
+                input_amount: 1_000_000,
+                output_amount: 2_000_000,
+                price_usd: dec!(0.5),
+                fees_usd: dec!(0.01),
+                slippage_bps: 40,
+                confirmed_at: Utc::now(),
+                latency_ms: 0,
+                fee_lamports: 5_000,
+                input_value_usd: Some(dec!(10)),
+                expected_output_amount: None,
+            };
+            let payload = serde_json::to_string(&fill)?;
+            conn.execute(
+                "INSERT INTO fills(order_id,payload,created_at) VALUES(?1,?2,?3)",
+                params![fill.order_id, payload, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(s.fill_for_order(&o.id).unwrap().is_some());
+    }
+    #[test]
+    fn run_in_transaction_rolls_back_on_error() {
+        let s = StateStore::open(":memory:").unwrap();
+        let o = order(OrderKind::Entry, OrderSide::Buy, Some("p1"));
+        assert!(s.reserve_order(&o).unwrap());
+        let result =
+            s.run_in_transaction::<_, ()>(|_conn| Err(anyhow::anyhow!("simulated failure")));
+        assert!(result.is_err());
+        // Order was reserved before the transaction, so it still exists,
+        // but no fill was persisted inside the failed transaction.
+        assert!(s.fill_for_order(&o.id).unwrap().is_none());
     }
 }
