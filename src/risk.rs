@@ -135,6 +135,15 @@ impl RiskEngine {
                 "position exceeds equity/liquidity limit".into(),
             ));
         }
+        // Aggregate exposure: new position must not push total exposure past
+        // max_live_capital_usd.
+        let projected = self.state.total_exposure_usd + position_usd;
+        if projected >= self.config.max_live_capital_usd {
+            return Err(RiskError::Rejected(format!(
+                "aggregate exposure {} would exceed max live capital {}",
+                projected, self.config.max_live_capital_usd
+            )));
+        }
         if expected_slippage_bps > self.config.max_slippage_bps {
             return Err(RiskError::Rejected("slippage limit".into()));
         }
@@ -169,11 +178,25 @@ impl RiskEngine {
         self.state.equity_usd = equity;
         self.kill_switch.observe_equity(equity);
     }
-    pub fn register_trade(&mut self) {
-        self.state.trades_today = self.state.trades_today.saturating_add(1);
+    /// Rebuild aggregate exposure from the actual portfolio. Called on startup
+    /// and after every position change to keep risk state consistent.
+    pub fn set_total_exposure(&mut self, exposure: Decimal) {
+        self.state.total_exposure_usd = exposure;
     }
-    pub fn register_exit(&mut self) {
+    /// Rebuild open-position count from the actual portfolio. Called on startup
+    /// and after every position change.
+    pub fn set_open_positions(&mut self, count: usize) {
+        self.state.open_positions = count;
+    }
+    pub fn register_trade(&mut self, exposure_usd: Decimal) {
+        self.state.trades_today = self.state.trades_today.saturating_add(1);
+        self.state.total_exposure_usd += exposure_usd;
+        self.state.open_positions = self.state.open_positions.saturating_add(1);
+    }
+    pub fn register_exit(&mut self, exposure_usd: Decimal) {
         self.state.open_positions = self.state.open_positions.saturating_sub(1);
+        self.state.total_exposure_usd =
+            (self.state.total_exposure_usd - exposure_usd).max(Decimal::ZERO);
     }
     /// Losses impose a trade cooldown; successes clear the failure streak.
     pub fn record_execution_success(&mut self) {
@@ -291,5 +314,317 @@ mod tests {
             .authorize(dec!(5), dec!(100000), 10, 10, now())
             .is_err());
         assert!(engine.authorize_exit(1).is_ok());
+    }
+
+    // --- Aggregate exposure tests ---
+
+    #[test]
+    fn aggregate_exposure_blocks_when_exceeding_max_live_capital() {
+        let mut cfg = config();
+        cfg.max_concurrent_positions = 10;
+        cfg.max_position_percent_of_equity = dec!(100);
+        cfg.max_position_percent_of_liquidity = dec!(100);
+        let mut engine = RiskEngine::new(cfg, dec!(1000));
+        engine.set_total_exposure(dec!(20));
+        engine.set_open_positions(1);
+        assert!(
+            engine
+                .authorize(dec!(10), dec!(1000000), 10, 10, now())
+                .is_err(),
+            "20+10=30 > 25 max live capital must be rejected"
+        );
+    }
+
+    #[test]
+    fn aggregate_exposure_allows_within_limit() {
+        let mut cfg = config();
+        cfg.max_concurrent_positions = 10;
+        cfg.max_position_percent_of_equity = dec!(100);
+        cfg.max_position_percent_of_liquidity = dec!(100);
+        let mut engine = RiskEngine::new(cfg, dec!(1000));
+        engine.set_total_exposure(dec!(12));
+        engine.set_open_positions(1);
+        assert!(engine
+            .authorize(dec!(5), dec!(1000000), 10, 10, now())
+            .is_ok());
+    }
+
+    #[test]
+    fn aggregate_exposure_exact_limit_is_rejected() {
+        let mut cfg = config();
+        cfg.max_concurrent_positions = 10;
+        cfg.max_position_percent_of_equity = dec!(100);
+        cfg.max_position_percent_of_liquidity = dec!(100);
+        let mut engine = RiskEngine::new(cfg, dec!(1000));
+        engine.set_total_exposure(dec!(20));
+        engine.set_open_positions(1);
+        assert!(
+            engine
+                .authorize(dec!(5), dec!(1000000), 10, 10, now())
+                .is_err(),
+            "20+5=25 equals the cap and must be rejected"
+        );
+    }
+
+    #[test]
+    fn register_trade_increments_exposure() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        assert_eq!(engine.state.total_exposure_usd, Decimal::ZERO);
+        engine.register_trade(dec!(10));
+        assert_eq!(engine.state.total_exposure_usd, dec!(10));
+        assert_eq!(engine.state.open_positions, 1);
+        engine.register_trade(dec!(5));
+        assert_eq!(engine.state.total_exposure_usd, dec!(15));
+        assert_eq!(engine.state.open_positions, 2);
+    }
+
+    #[test]
+    fn register_exit_decrements_exposure() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.set_total_exposure(dec!(20));
+        engine.set_open_positions(2);
+        engine.register_exit(dec!(10));
+        assert_eq!(engine.state.total_exposure_usd, dec!(10));
+        assert_eq!(engine.state.open_positions, 1);
+    }
+
+    #[test]
+    fn register_exit_clamps_exposure_at_zero() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.set_total_exposure(dec!(5));
+        engine.register_exit(dec!(10));
+        assert_eq!(
+            engine.state.total_exposure_usd,
+            Decimal::ZERO,
+            "exposure must clamp at zero, not go negative"
+        );
+    }
+
+    #[test]
+    fn set_total_exposure_syncs_from_portfolio() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        assert_eq!(engine.state.total_exposure_usd, Decimal::ZERO);
+        engine.set_total_exposure(dec!(18.5));
+        assert_eq!(engine.state.total_exposure_usd, dec!(18.5));
+    }
+
+    #[test]
+    fn partial_exit_exposure_tracks_correctly() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        // Simulate two positions: 12 + 10 = 22 exposure
+        engine.register_trade(dec!(12));
+        engine.register_trade(dec!(10));
+        assert_eq!(engine.state.total_exposure_usd, dec!(22));
+        assert_eq!(engine.state.open_positions, 2);
+        // Partial exit of first position (entry cost was 12)
+        engine.register_exit(dec!(12));
+        assert_eq!(engine.state.total_exposure_usd, dec!(10));
+        assert_eq!(engine.state.open_positions, 1);
+        // Remaining position exits
+        engine.register_exit(dec!(10));
+        assert_eq!(engine.state.total_exposure_usd, Decimal::ZERO);
+        assert_eq!(engine.state.open_positions, 0);
+    }
+
+    // --- Daily loss tests ---
+
+    #[test]
+    fn daily_loss_blocks_at_threshold() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.state.day_start_equity_usd = dec!(100);
+        // 2% of 100 = 2. At 98 equity the loss is exactly 2%.
+        engine.state.equity_usd = dec!(98);
+        assert!(
+            engine
+                .authorize(dec!(1), dec!(100000), 10, 10, now())
+                .is_err(),
+            "exactly 2% daily loss must be rejected"
+        );
+    }
+
+    #[test]
+    fn daily_loss_allows_just_under_threshold() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.state.day_start_equity_usd = dec!(100);
+        engine.state.equity_usd = dec!(98.01);
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_ok());
+    }
+
+    #[test]
+    fn daily_loss_resets_on_new_day() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.state.day_start_equity_usd = dec!(100);
+        engine.state.equity_usd = dec!(97);
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_err());
+        // Simulate day rollover
+        engine.state.day_start_equity_usd = dec!(97);
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_ok());
+    }
+
+    // --- Drawdown kill switch tests ---
+
+    #[test]
+    fn drawdown_kill_switch_blocks_entries() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        // 5% drawdown from 100 = 95. At 95 the kill switch trips.
+        engine.observe_equity(dec!(95));
+        assert!(engine.kill_switch.is_tripped());
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_err());
+    }
+
+    #[test]
+    fn drawdown_kill_switch_allows_exits() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.observe_equity(dec!(95));
+        assert!(engine.kill_switch.is_tripped());
+        assert!(engine.authorize_exit(1000).is_ok());
+    }
+
+    #[test]
+    fn drawdown_kill_switch_persists_after_restart() {
+        // Simulate: engine tripped during session, process restarts,
+        // kill switch reason is persisted, new engine must be tripped.
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.observe_equity(dec!(95));
+        assert!(engine.kill_switch.is_tripped());
+        // Simulate restart: create new engine, force_trip from persisted state
+        let mut engine2 = RiskEngine::new(config(), dec!(100));
+        assert!(!engine2.kill_switch.is_tripped());
+        engine2.kill_switch.force_trip();
+        assert!(engine2.kill_switch.is_tripped());
+        assert!(engine2
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_err());
+    }
+
+    // --- Consecutive failures tests ---
+
+    #[test]
+    fn consecutive_failures_trip_at_config_threshold() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        // max_consecutive_failures = 3
+        assert!(!engine.record_execution_failure(now()));
+        assert!(!engine.record_execution_failure(now()));
+        assert!(engine.record_execution_failure(now()));
+        assert!(engine.kill_switch.is_tripped());
+    }
+
+    #[test]
+    fn success_clears_failure_streak() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.record_execution_failure(now());
+        engine.record_execution_failure(now());
+        engine.record_execution_success();
+        assert_eq!(engine.consecutive_failures(), 0);
+        // After success, two more failures needed to trip (3 total)
+        assert!(!engine.record_execution_failure(now()));
+        assert!(!engine.record_execution_failure(now()));
+        assert!(engine.record_execution_failure(now()));
+    }
+
+    #[test]
+    fn failure_streak_does_not_double_count() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        // After 3 failures the kill switch trips
+        engine.record_execution_failure(now());
+        engine.record_execution_failure(now());
+        assert!(engine.record_execution_failure(now()));
+        // Kill switch is now tripped; additional failures still increment
+        // the counter but the switch is already latched (monotonic).
+        engine.record_execution_failure(now());
+        assert_eq!(engine.consecutive_failures(), 4);
+    }
+
+    // --- Emergency stop interaction tests ---
+
+    #[test]
+    fn emergency_stop_blocks_all_entry_paths() {
+        // Emergency stop is managed externally (state store) and checked in
+        // runtime before calling authorize(). This test verifies authorize()
+        // itself does not accidentally weaken fail-closed behaviour.
+        let engine = RiskEngine::new(config(), dec!(100));
+        // authorize() checks kill switch, position size, liquidity, concurrent
+        // positions, trade count, equity/liquidity limits, slippage, cooldown,
+        // daily loss. All must fail-closed.
+        assert!(engine
+            .authorize(Decimal::ZERO, dec!(100000), 10, 10, now())
+            .is_err());
+        assert!(engine
+            .authorize(dec!(5), Decimal::ZERO, 10, 10, now())
+            .is_err());
+    }
+
+    #[test]
+    fn authorize_exit_only_requires_positive_qty() {
+        let engine = RiskEngine::new(config(), dec!(100));
+        assert!(engine.authorize_exit(0).is_err());
+        assert!(engine.authorize_exit(1).is_ok());
+        assert!(engine.authorize_exit(u64::MAX).is_ok());
+    }
+
+    // --- Position limit tests ---
+
+    #[test]
+    fn concurrent_position_limit_enforced() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.set_open_positions(1);
+        assert!(engine
+            .authorize(dec!(5), dec!(100000), 10, 10, now())
+            .is_err());
+    }
+
+    #[test]
+    fn per_position_equity_limit_enforced() {
+        let engine = RiskEngine::new(config(), dec!(100));
+        // max_position_percent_of_equity = 5%, equity = 100, so max = 5
+        assert!(engine
+            .authorize(dec!(6), dec!(100000), 10, 10, now())
+            .is_err());
+        assert!(engine
+            .authorize(dec!(5), dec!(100000), 10, 10, now())
+            .is_ok());
+    }
+
+    #[test]
+    fn per_position_liquidity_limit_enforced() {
+        let mut cfg = config();
+        cfg.max_concurrent_positions = 10;
+        cfg.max_position_percent_of_equity = dec!(100);
+        cfg.max_live_capital_usd = dec!(10000);
+        let engine = RiskEngine::new(cfg, dec!(1000));
+        // max_position_percent_of_liquidity = 0.1%, liquidity = 50000, max = 50
+        assert!(engine
+            .authorize(dec!(51), dec!(50000), 10, 10, now())
+            .is_err());
+        assert!(engine
+            .authorize(dec!(50), dec!(50000), 10, 10, now())
+            .is_ok());
+    }
+
+    // --- Trade count tests ---
+
+    #[test]
+    fn daily_trade_count_enforced() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.state.trades_today = 3;
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_err());
+    }
+
+    #[test]
+    fn register_trade_increments_count() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        assert_eq!(engine.state.trades_today, 0);
+        engine.register_trade(dec!(5));
+        assert_eq!(engine.state.trades_today, 1);
     }
 }

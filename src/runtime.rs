@@ -328,6 +328,14 @@ fn load_portfolio(store: &StateStore) -> Result<Portfolio> {
     Ok(portfolio)
 }
 
+/// Compute aggregate exposure (sum of entry_cost_usd) across all open positions.
+fn aggregate_exposure(positions: &[&Position]) -> Decimal {
+    positions
+        .iter()
+        .filter_map(|p| p.entry_cost_usd)
+        .fold(Decimal::ZERO, |acc, c| acc + c)
+}
+
 /// Compares persisted open positions with actual wallet token balances.
 /// Only runs with a live signer; paper positions keep their recorded state.
 pub async fn reconcile_positions_onchain(deps: &SessionDeps) -> Result<ReconcileSummary> {
@@ -449,7 +457,9 @@ pub async fn run_session(
     let store = &deps.store;
     let mut risk = RiskEngine::new(config.risk.clone(), config.risk.starting_capital_usd);
     let portfolio = load_portfolio(store)?;
-    risk.state.open_positions = portfolio.open_positions().len();
+    let open = portfolio.open_positions();
+    risk.set_open_positions(open.len());
+    risk.set_total_exposure(aggregate_exposure(&open));
     let mut state = SessionState {
         portfolio,
         risk,
@@ -652,7 +662,8 @@ async fn tick(
         store.latch_kill_switch("drawdown limit reached")?;
         tracing::error!("KILL SWITCH latched: drawdown limit reached; entries disabled");
     }
-    state.risk.state.open_positions = open.len();
+    state.risk.set_open_positions(open.len());
+    state.risk.set_total_exposure(aggregate_exposure(&open));
 
     // 3. Exits first: risk-reducing, allowed under interlocks.
     process_exits(deps, state).await?;
@@ -911,6 +922,8 @@ async fn attempt_exit(
                     if let Some(p) = state.portfolio.position(mint) {
                         store.save_position(p)?;
                     }
+                    let exposure = position.entry_cost_usd.unwrap_or_default();
+                    state.risk.register_exit(exposure);
                     state.risk.record_execution_success();
                     if realized_pnl_usd < Decimal::ZERO {
                         state.risk.apply_loss_cooldown(Utc::now());
@@ -1008,7 +1021,9 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             tracing::warn!(mint=%mint, "position exceeds configured live-capital cap or is invalid");
             continue;
         }
-        state.risk.state.open_positions = state.portfolio.open_positions().len();
+        state
+            .risk
+            .set_open_positions(state.portfolio.open_positions().len());
         // Fresh quote before every entry: price impact and viability are
         // evaluated on live data, never on the feed's assertion.
         let quote = match deps
@@ -1108,7 +1123,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                             store.save_position(p)?;
                             tracing::info!(order_id=%order.id, mint=%mint, signature=%fill.signature, position_id=%position_id, qty_atomic=fill.output_amount, price_usd=%fill.price_usd, fees_usd=%fill.fees_usd, fee_lamports=fill.fee_lamports, "confirmed entry persisted");
                         }
-                        state.risk.register_trade();
+                        state.risk.register_trade(c.position_usd);
                         state.risk.record_execution_success();
                         if fill.output_amount < min_output {
                             tracing::error!(order_id=%order.id, actual=fill.output_amount, min_output, "entry fill fell below the minimum accepted output");
@@ -1422,7 +1437,7 @@ mod tests {
             .save_position(portfolio.position("T").unwrap())
             .unwrap();
         let mut risk = RiskEngine::new(config.risk.clone(), config.risk.starting_capital_usd);
-        risk.state.open_positions = 1;
+        risk.set_open_positions(1);
         let mut state = SessionState {
             portfolio,
             risk,
