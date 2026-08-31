@@ -1283,6 +1283,7 @@ mod tests {
                 confirm_timeout_secs: 90,
                 confirm_poll_ms: 500,
                 live_signer_env: None,
+                jupiter_api_key_env: None,
                 allowed_program_ids: vec![],
             },
             storage: StorageConfig {

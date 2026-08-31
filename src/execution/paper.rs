@@ -32,7 +32,12 @@ impl<E: Executor> Executor for PaperExecutor<E> {
         self.quotes.quote(a, b, c, d).await
     }
     async fn execute(&self, r: ExecutionRequest) -> Result<Fill, ExecutionError> {
-        if r.quote.price_impact_bps > r.max_price_impact_bps
+        let age = chrono::Utc::now() - r.quote.observed_at;
+        if age < chrono::Duration::zero() || age > chrono::Duration::seconds(300) {
+            return Err(ExecutionError::StaleQuote);
+        }
+        if r.quote.output_amount == 0
+            || r.quote.price_impact_bps > r.max_price_impact_bps
             || r.quote.output_amount < r.min_output_amount
         {
             return Err(ExecutionError::InvalidQuote);
@@ -201,5 +206,27 @@ mod tests {
         assert_eq!(fill.fee_lamports, 0);
         assert!(!paper.is_live());
         assert!(paper.signer_pubkey().is_none());
+    }
+
+    #[tokio::test]
+    async fn paper_rejects_stale_quote() {
+        let paper = PaperExecutor::new(FakeExecutor { fail: false }, 25);
+        let mut r = request();
+        r.quote.observed_at = Utc::now() - chrono::Duration::seconds(600);
+        assert!(matches!(
+            paper.execute(r).await,
+            Err(ExecutionError::StaleQuote)
+        ));
+    }
+
+    #[tokio::test]
+    async fn paper_rejects_zero_output() {
+        let paper = PaperExecutor::new(FakeExecutor { fail: false }, 0);
+        let mut r = request();
+        r.quote.output_amount = 0;
+        assert!(matches!(
+            paper.execute(r).await,
+            Err(ExecutionError::InvalidQuote)
+        ));
     }
 }

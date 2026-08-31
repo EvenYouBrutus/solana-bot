@@ -69,18 +69,125 @@ mod tests {
         instruction::Instruction, message::Message, signature::Keypair, signer::Signer,
         transaction::Transaction,
     };
+    fn make_tx(instructions: &[Instruction], payer: &Keypair) -> VersionedTransaction {
+        Transaction::new_unsigned(Message::new(instructions, Some(&payer.pubkey()))).into()
+    }
+    fn prog_instruction(prog: Pubkey) -> Instruction {
+        Instruction::new_with_bytes(prog, &[], vec![])
+    }
     #[test]
     fn refuses_unknown_program() {
         let payer = Keypair::new();
         let p = Pubkey::new_unique();
-        let tx = Transaction::new_unsigned(Message::new(
-            &[Instruction::new_with_bytes(p, &[], vec![])],
-            Some(&payer.pubkey()),
-        ));
-        let v: VersionedTransaction = tx.into();
+        let v = make_tx(&[prog_instruction(p)], &payer);
         assert!(matches!(
             validate_provider_transaction(&v, &payer.pubkey(), &[]),
             Err(PolicyError::Program(_))
         ));
+    }
+    #[test]
+    fn allows_program_in_allowlist() {
+        let payer = Keypair::new();
+        let p = Pubkey::new_unique();
+        let v = make_tx(&[prog_instruction(p)], &payer);
+        assert!(validate_provider_transaction(&v, &payer.pubkey(), &[p.to_string()]).is_ok());
+    }
+    #[test]
+    fn refuses_payer_mismatch() {
+        let payer = Keypair::new();
+        let wrong = Keypair::new();
+        let p = Pubkey::new_unique();
+        let v = make_tx(&[prog_instruction(p)], &payer);
+        assert!(matches!(
+            validate_provider_transaction(&v, &wrong.pubkey(), &[p.to_string()]),
+            Err(PolicyError::Payer)
+        ));
+    }
+    #[test]
+    fn refuses_multiple_signers() {
+        let payer = Keypair::new();
+        let extra = Keypair::new();
+        let p = Pubkey::new_unique();
+        let ix = Instruction::new_with_bytes(
+            p,
+            &[],
+            vec![
+                solana_sdk::instruction::AccountMeta::new(payer.pubkey(), true),
+                solana_sdk::instruction::AccountMeta::new(extra.pubkey(), true),
+            ],
+        );
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let v: VersionedTransaction = Transaction::new_unsigned(msg).into();
+        assert!(matches!(
+            validate_provider_transaction(&v, &payer.pubkey(), &[p.to_string()]),
+            Err(PolicyError::Signers)
+        ));
+    }
+    #[test]
+    fn refuses_address_lookup_table() {
+        let payer = Keypair::new();
+        let p = Pubkey::new_unique();
+        let v0 = solana_sdk::message::v0::Message::try_compile(
+            &payer.pubkey(),
+            &[Instruction::new_with_bytes(p, &[], vec![])],
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        let mut vt =
+            VersionedTransaction::try_new(solana_sdk::message::VersionedMessage::V0(v0), &[&payer])
+                .unwrap();
+        if let solana_sdk::message::VersionedMessage::V0(ref mut m) = vt.message {
+            m.address_table_lookups
+                .push(solana_sdk::message::v0::MessageAddressTableLookup {
+                    account_key: Pubkey::new_unique(),
+                    writable_indexes: vec![0],
+                    readonly_indexes: vec![],
+                });
+        }
+        assert!(matches!(
+            validate_provider_transaction(&vt, &payer.pubkey(), &[p.to_string()]),
+            Err(PolicyError::AddressLookup)
+        ));
+    }
+    #[test]
+    fn refuses_invalid_account_index() {
+        let payer = Keypair::new();
+        let p = Pubkey::new_unique();
+        // Instruction references account index 255, but message only has 2 keys
+        let ix = solana_sdk::instruction::Instruction {
+            program_id: p,
+            accounts: vec![solana_sdk::instruction::AccountMeta::new(
+                Pubkey::new_unique(),
+                false,
+            )],
+            data: vec![],
+        };
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let mut v: VersionedTransaction = Transaction::new_unsigned(msg).into();
+        // Tamper: set program_id_index to point beyond account_keys
+        if let solana_sdk::message::VersionedMessage::Legacy(ref mut m) = v.message {
+            // Overwrite the program_id_index byte to 0xFF (beyond bounds)
+            for inst in &mut m.instructions {
+                inst.program_id_index = 0xFF;
+            }
+        }
+        assert!(matches!(
+            validate_provider_transaction(&v, &payer.pubkey(), &[p.to_string()]),
+            Err(PolicyError::AccountIndex)
+        ));
+    }
+    #[test]
+    fn allows_multiple_instructions_all_in_allowlist() {
+        let payer = Keypair::new();
+        let p1 = Pubkey::new_unique();
+        let p2 = Pubkey::new_unique();
+        let v = make_tx(&[prog_instruction(p1), prog_instruction(p2)], &payer);
+        assert!(validate_provider_transaction(
+            &v,
+            &payer.pubkey(),
+            &[p1.to_string(), p2.to_string()]
+        )
+        .is_ok());
     }
 }

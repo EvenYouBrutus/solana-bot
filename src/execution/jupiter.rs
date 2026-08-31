@@ -26,7 +26,9 @@ pub struct JupiterExecutor {
     api_url: String,
     rpc: RpcPool,
     signer_env: Option<String>,
+    api_key_env: Option<String>,
     max_quote_age_secs: i64,
+    max_fee_lamports: u64,
     allowed_program_ids: Vec<String>,
     priority_fee_lamports: u64,
     confirm_timeout: StdDuration,
@@ -38,7 +40,9 @@ impl JupiterExecutor {
         api_url: String,
         rpc: RpcPool,
         signer_env: Option<String>,
+        api_key_env: Option<String>,
         max_quote_age_secs: i64,
+        max_fee_lamports: u64,
         allowed_program_ids: Vec<String>,
         priority_fee_lamports: u64,
         confirm_timeout_secs: u64,
@@ -53,7 +57,9 @@ impl JupiterExecutor {
             api_url: api_url.trim_end_matches('/').into(),
             rpc,
             signer_env,
+            api_key_env,
             max_quote_age_secs,
+            max_fee_lamports,
             allowed_program_ids,
             priority_fee_lamports,
             confirm_timeout: StdDuration::from_secs(confirm_timeout_secs),
@@ -71,6 +77,36 @@ impl JupiterExecutor {
         })?;
         Keypair::try_from(bytes.as_slice())
             .map_err(|_| ExecutionError::Unavailable("invalid signer keypair".into()))
+    }
+    /// Resolves the Jupiter API key from the configured environment variable.
+    /// Returns Ok(None) when no env var is configured or the variable is unset.
+    fn api_key(&self) -> Result<Option<String>, ExecutionError> {
+        let variable = match self.api_key_env.as_deref() {
+            Some(v) if !v.is_empty() => v,
+            _ => return Ok(None),
+        };
+        match env::var(variable) {
+            Ok(val) if !val.is_empty() => Ok(Some(val)),
+            Ok(_) => Ok(None),
+            Err(env::VarError::NotPresent) => Ok(None),
+            Err(e) => Err(ExecutionError::Unavailable(format!(
+                "Jupiter API key env var error: {e}"
+            ))),
+        }
+    }
+    /// Extracts the network fee (base + priority) encoded in the first bytes
+    /// of a legacy transaction message.  The fee is a little-endian u64
+    /// starting at byte 1 of the serialized message; only the first 3 bytes
+    /// carry the fee (max ~16.7 M lamports).
+    fn message_fee_lamports(message_bytes: &[u8]) -> Option<u64> {
+        if message_bytes.len() < 4 {
+            return None;
+        }
+        Some(
+            message_bytes[1] as u64
+                | (message_bytes[2] as u64) << 8
+                | (message_bytes[3] as u64) << 16,
+        )
     }
     /// RPC submission errors that are deterministic refusals. The node has
     /// not relayed the transaction, so treating these as `Failed` cannot
@@ -187,17 +223,23 @@ impl Executor for JupiterExecutor {
         amount: u64,
         slippage: u16,
     ) -> Result<Quote, ExecutionError> {
+        if amount == 0 {
+            return Err(ExecutionError::Quote(
+                "quote amount must be non-zero".into(),
+            ));
+        }
         let url = format!("{}/swap/v1/quote", self.api_url);
-        let v: Value = self
-            .client
-            .get(url)
-            .query(&[
-                ("inputMint", input),
-                ("outputMint", output),
-                ("amount", &amount.to_string()),
-                ("slippageBps", &slippage.to_string()),
-                ("asLegacyTransaction", "true"),
-            ])
+        let mut req = self.client.get(url).query(&[
+            ("inputMint", input),
+            ("outputMint", output),
+            ("amount", &amount.to_string()),
+            ("slippageBps", &slippage.to_string()),
+            ("asLegacyTransaction", "true"),
+        ]);
+        if let Some(key) = self.api_key()? {
+            req = req.header("x-api-key", key);
+        }
+        let v: Value = req
             .send()
             .await
             .map_err(|e| ExecutionError::Quote(e.to_string()))?
@@ -242,12 +284,12 @@ impl Executor for JupiterExecutor {
         if r.quote.price_impact_bps > r.max_price_impact_bps {
             return Err(ExecutionError::InvalidQuote);
         }
-        if r.quote.output_amount < r.min_output_amount {
+        if r.quote.output_amount == 0 || r.quote.output_amount < r.min_output_amount {
             return Err(ExecutionError::InvalidQuote);
         }
         let signer = self.signer()?;
         let owner = signer.pubkey().to_string();
-        let body = json!({
+        let mut body = json!({
             "quoteResponse": r.quote.route,
             "userPublicKey": owner,
             "wrapAndUnwrapSol": true,
@@ -255,6 +297,9 @@ impl Executor for JupiterExecutor {
             "asLegacyTransaction": true,
             "prioritizationFeeLamports": self.priority_fee_lamports,
         });
+        if let Some(key) = self.api_key()? {
+            body["apiKey"] = json!(key);
+        }
         let swap: Value = self
             .client
             .post(format!("{}/swap/v1/swap", self.api_url))
@@ -277,6 +322,19 @@ impl Executor for JupiterExecutor {
             .map_err(|_| ExecutionError::Transaction("invalid provider transaction".into()))?;
         validate_provider_transaction(&unsigned, &signer.pubkey(), &self.allowed_program_ids)
             .map_err(|e| ExecutionError::Policy(e.to_string()))?;
+        let message_bytes = match &unsigned.message {
+            solana_sdk::message::VersionedMessage::Legacy(m) => m.serialize(),
+            solana_sdk::message::VersionedMessage::V0(m) => m.serialize(),
+        };
+        let fee = Self::message_fee_lamports(&message_bytes).ok_or_else(|| {
+            ExecutionError::Policy("transaction message too short to read fee".into())
+        })?;
+        if fee > self.max_fee_lamports {
+            return Err(ExecutionError::Policy(format!(
+                "transaction fee {fee} lamports exceeds configured maximum {max}",
+                max = self.max_fee_lamports
+            )));
+        }
         let signed = VersionedTransaction::try_new(unsigned.message, &[&signer]).map_err(|_| {
             ExecutionError::Transaction("could not sign provider transaction".into())
         })?;
@@ -387,3 +445,77 @@ pub async fn reconcile_signature(
 }
 /// Timestamp type re-export used by runtime logging of quote age.
 pub type QuoteObservedAt = DateTime<Utc>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_fee_lamports_parses_legacy_bytes() {
+        // Fee = 5000 lamports = 0x1388 in little-endian: [0x88, 0x13, 0x00]
+        let mut msg = vec![1u8; 32]; // byte 0 = 1 required signature
+        msg[1] = 0x88; // fee low byte
+        msg[2] = 0x13; // fee mid byte
+        msg[3] = 0x00; // fee high byte
+        assert_eq!(JupiterExecutor::message_fee_lamports(&msg), Some(5000));
+    }
+
+    #[test]
+    fn message_fee_lamports_rejects_short_buffer() {
+        assert_eq!(JupiterExecutor::message_fee_lamports(&[0, 1]), None);
+        assert_eq!(JupiterExecutor::message_fee_lamports(&[]), None);
+    }
+
+    #[test]
+    fn message_fee_lamports_max_u24() {
+        // Max 3-byte value = 16_777_215
+        let mut msg = vec![0u8; 32];
+        msg[1] = 0xFF;
+        msg[2] = 0xFF;
+        msg[3] = 0xFF;
+        assert_eq!(
+            JupiterExecutor::message_fee_lamports(&msg),
+            Some(16_777_215)
+        );
+    }
+
+    #[test]
+    fn api_key_returns_none_when_env_unconfigured() {
+        let rpc = crate::data::rpc::RpcPool::with_attempts(
+            vec!["http://localhost:1".into()],
+            StdDuration::from_millis(100),
+            1,
+        )
+        .unwrap();
+        let jup = JupiterExecutor {
+            client: Client::new(),
+            api_url: "https://api.jup.ag".into(),
+            rpc,
+            signer_env: None,
+            api_key_env: None,
+            max_quote_age_secs: 3,
+            max_fee_lamports: 500_000,
+            allowed_program_ids: vec![],
+            priority_fee_lamports: 10_000,
+            confirm_timeout: StdDuration::from_secs(90),
+            confirm_poll: StdDuration::from_millis(500),
+        };
+        assert!(jup.api_key().unwrap().is_none());
+    }
+
+    #[test]
+    fn classify_submit_error_preserves_unknown_for_network() {
+        matches!(
+            JupiterExecutor::classify_submit_error("connection reset"),
+            ExecutionError::Unknown { .. }
+        );
+    }
+
+    #[test]
+    fn classify_submit_error_deterministic_for_simulation() {
+        matches!(
+            JupiterExecutor::classify_submit_error("Simulation Failed: custom error"),
+            ExecutionError::Transaction(_)
+        );
+    }
+}

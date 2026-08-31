@@ -107,6 +107,11 @@ pub struct ExecutionConfig {
     pub confirm_poll_ms: u64,
     #[serde(default)]
     pub live_signer_env: Option<String>,
+    /// Environment variable holding a Jupiter API key for authenticated
+    /// requests. When set the key is sent as a header; when absent the
+    /// public endpoint is used without authentication.
+    #[serde(default)]
+    pub jupiter_api_key_env: Option<String>,
     #[serde(default)]
     pub allowed_program_ids: Vec<String>,
 }
