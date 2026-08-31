@@ -7,7 +7,7 @@ use solana_smart_money_bot::{
     },
     data::rpc::RpcPool,
     economics::{break_even_calculator, BreakEvenInputs},
-    execution::{Executor, JupiterExecutor},
+    execution::{Executor, JupiterExecutor, PaperExecutor},
     observability,
     runtime::{self, SessionDeps},
     storage::StateStore,
@@ -65,25 +65,46 @@ enum Command {
     },
 }
 
-fn build_executor(c: &Config, rpc: RpcPool) -> anyhow::Result<JupiterExecutor> {
-    if c.mode == Mode::Live {
-        let name = c
-            .execution
-            .live_signer_env
-            .as_deref()
-            .context("missing live signer env")?;
-        std::env::var(name).context("live signer secret unavailable")?;
+fn build_executor(c: &Config, rpc: RpcPool) -> anyhow::Result<Arc<dyn Executor>> {
+    match c.mode {
+        Mode::Live => {
+            let name = c
+                .execution
+                .live_signer_env
+                .as_deref()
+                .context("missing live signer env")?;
+            std::env::var(name).context("live signer secret unavailable")?;
+            let jup = JupiterExecutor::new(
+                c.execution.jupiter_api_url.clone(),
+                rpc,
+                c.execution.live_signer_env.clone(),
+                c.economics.max_quote_age_secs,
+                c.execution.allowed_program_ids.clone(),
+                c.execution.priority_fee_lamports,
+                c.execution.confirm_timeout_secs,
+                c.execution.confirm_poll_ms,
+            )?;
+            Ok(Arc::new(jup))
+        }
+        Mode::Paper | Mode::Replay => {
+            // Paper and replay wrap Jupiter for quotes only; signer_env is
+            // explicitly None so no signing key is ever loaded.
+            let jup = JupiterExecutor::new(
+                c.execution.jupiter_api_url.clone(),
+                rpc,
+                None,
+                c.economics.max_quote_age_secs,
+                c.execution.allowed_program_ids.clone(),
+                c.execution.priority_fee_lamports,
+                c.execution.confirm_timeout_secs,
+                c.execution.confirm_poll_ms,
+            )?;
+            Ok(Arc::new(PaperExecutor::new(
+                jup,
+                c.runtime.paper_fill_haircut_bps,
+            )))
+        }
     }
-    Ok(JupiterExecutor::new(
-        c.execution.jupiter_api_url.clone(),
-        rpc,
-        c.execution.live_signer_env.clone(),
-        c.economics.max_quote_age_secs,
-        c.execution.allowed_program_ids.clone(),
-        c.execution.priority_fee_lamports,
-        c.execution.confirm_timeout_secs,
-        c.execution.confirm_poll_ms,
-    )?)
 }
 
 fn base_setup(path: &PathBuf) -> anyhow::Result<(Config, StateStore, RpcPool)> {
@@ -116,8 +137,8 @@ async fn check(path: PathBuf) -> anyhow::Result<()> {
         let _: Vec<u8> = serde_json::from_str(&value)
             .context("live signer is not JSON byte-array keypair material")?;
     }
-    let execution = build_executor(&c, rpc)?;
-    execution.health().await.context("execution health check")?;
+    let executor = build_executor(&c, rpc)?;
+    executor.health().await.context("execution health check")?;
     println!(
         "configuration, persistence, RPC, and execution health are valid; mode={:?}",
         c.mode
@@ -135,12 +156,12 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         tracing::warn!(%reason, "persisted emergency stop active; entries stay disabled, manual exits available");
     }
     rpc.health().await.context("RPC health check")?;
-    let execution = build_executor(&c, rpc.clone())?;
-    execution.health().await.context("execution health check")?;
+    let executor = build_executor(&c, rpc.clone())?;
+    executor.health().await.context("execution health check")?;
     if c.mode == Mode::Live {
         tracing::warn!(cap = %c.risk.max_live_capital_usd, "live mode explicitly armed");
     } else {
-        tracing::info!("paper mode: identical strategy/risk/pipeline, no transactions submitted");
+        tracing::info!(mode = ?c.mode, "paper/replay mode: no transactions submitted");
     }
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -150,7 +171,6 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
     let config = Arc::new(c);
     let store = Arc::new(state);
     let rpc = Arc::new(rpc);
-    let executor = Arc::new(execution);
     let deps = session_deps(config, store, executor, rpc);
     runtime::run_session(deps, rx).await
 }
@@ -159,11 +179,10 @@ async fn reconcile(path: PathBuf) -> anyhow::Result<()> {
     let (c, state, rpc) = base_setup(&path)?;
     observability::init(c.observability.log_format == "json");
     rpc.health().await.context("RPC health check")?;
-    let execution = build_executor(&c, rpc.clone())?;
+    let executor = build_executor(&c, rpc.clone())?;
     let config = Arc::new(c);
     let store = Arc::new(state);
     let rpc = Arc::new(rpc);
-    let executor = Arc::new(execution);
     let deps = session_deps(config, store, executor, rpc);
     let summary = runtime::run_reconciliation(&deps).await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -177,11 +196,10 @@ async fn exit_all(path: PathBuf) -> anyhow::Result<()> {
     let (c, state, rpc) = base_setup(&path)?;
     observability::init(c.observability.log_format == "json");
     rpc.health().await.context("RPC health check")?;
-    let execution = build_executor(&c, rpc.clone())?;
+    let executor = build_executor(&c, rpc.clone())?;
     let config = Arc::new(c);
     let store = Arc::new(state);
     let rpc = Arc::new(rpc);
-    let executor = Arc::new(execution);
     let deps = session_deps(config, store, executor, rpc);
     let summary = runtime::run_reconciliation(&deps).await?;
     if summary.unresolved_orders > 0 {
@@ -195,7 +213,7 @@ async fn exit_all(path: PathBuf) -> anyhow::Result<()> {
 fn session_deps(
     config: Arc<Config>,
     store: Arc<StateStore>,
-    executor: Arc<JupiterExecutor>,
+    executor: Arc<dyn Executor>,
     rpc: Arc<RpcPool>,
 ) -> SessionDeps {
     SessionDeps {
@@ -305,11 +323,10 @@ sqlite_path = ":memory:"
         let placeholder =
             RpcPool::with_attempts(vec!["http://127.0.0.1:1".into()], Duration::from_secs(2), 1)
                 .unwrap();
-        let execution = build_executor(&config, rpc.clone()).unwrap();
+        let executor = build_executor(&config, rpc.clone()).unwrap();
         let config = Arc::new(config);
         let store = Arc::new(store);
         let rpc = Arc::new(rpc);
-        let executor = Arc::new(execution);
         let deps = session_deps(config, store, executor, rpc.clone());
         assert!(
             std::ptr::eq(deps.rpc.as_ref(), rpc.as_ref()),
@@ -325,5 +342,56 @@ sqlite_path = ":memory:"
             .endpoints()
             .iter()
             .any(|endpoint| endpoint.contains("127.0.0.1:1")));
+    }
+
+    #[test]
+    fn paper_mode_builds_non_live_executor() {
+        let mut config = sample_config();
+        config.mode = Mode::Paper;
+        let rpc =
+            RpcPool::with_attempts(config.rpc.http_endpoints.clone(), Duration::from_secs(2), 1)
+                .unwrap();
+        let executor = build_executor(&config, rpc).unwrap();
+        assert!(!executor.is_live());
+        assert!(executor.signer_pubkey().is_none());
+    }
+
+    #[test]
+    fn replay_mode_builds_non_live_executor() {
+        let mut config = sample_config();
+        config.mode = Mode::Replay;
+        let rpc =
+            RpcPool::with_attempts(config.rpc.http_endpoints.clone(), Duration::from_secs(2), 1)
+                .unwrap();
+        let executor = build_executor(&config, rpc).unwrap();
+        assert!(!executor.is_live());
+        assert!(executor.signer_pubkey().is_none());
+    }
+
+    #[test]
+    fn live_mode_requires_signer_env() {
+        let mut config = sample_config();
+        config.mode = Mode::Live;
+        config.execution.live_signer_env = None;
+        let rpc =
+            RpcPool::with_attempts(config.rpc.http_endpoints.clone(), Duration::from_secs(2), 1)
+                .unwrap();
+        assert!(
+            build_executor(&config, rpc).is_err(),
+            "live mode without signer env must fail"
+        );
+    }
+
+    #[test]
+    fn paper_mode_ignores_signer_env_in_config() {
+        let mut config = sample_config();
+        config.mode = Mode::Paper;
+        config.execution.live_signer_env = Some("SOLANA_BOT_KEYPAIR_JSON".into());
+        let rpc =
+            RpcPool::with_attempts(config.rpc.http_endpoints.clone(), Duration::from_secs(2), 1)
+                .unwrap();
+        let executor = build_executor(&config, rpc).unwrap();
+        assert!(!executor.is_live());
+        assert!(executor.signer_pubkey().is_none());
     }
 }

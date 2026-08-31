@@ -163,4 +163,43 @@ mod tests {
         )
         .is_ok());
     }
+
+    struct PanicExecutor;
+    #[async_trait::async_trait]
+    impl Executor for PanicExecutor {
+        async fn quote(
+            &self,
+            _a: &str,
+            _b: &str,
+            _amount: u64,
+            _s: u16,
+        ) -> Result<Quote, ExecutionError> {
+            Ok(Quote {
+                input_mint: "SOL".into(),
+                output_mint: "T".into(),
+                input_amount: 1_000_000,
+                output_amount: 10_000_000,
+                price_impact_bps: 10,
+                route: serde_json::json!({}),
+                observed_at: Utc::now(),
+            })
+        }
+        async fn execute(&self, _r: ExecutionRequest) -> Result<Fill, ExecutionError> {
+            panic!("PaperExecutor must never delegate execute to inner executor")
+        }
+        async fn health(&self) -> Result<(), ExecutionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn paper_execute_never_delegates_to_inner_executor() {
+        let paper = PaperExecutor::new(PanicExecutor, 25);
+        let r = request();
+        let fill = paper.execute(r).await.expect("paper execute must succeed");
+        assert!(fill.signature.starts_with("paper:"));
+        assert_eq!(fill.fee_lamports, 0);
+        assert!(!paper.is_live());
+        assert!(paper.signer_pubkey().is_none());
+    }
 }

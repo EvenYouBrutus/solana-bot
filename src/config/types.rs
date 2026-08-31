@@ -308,6 +308,11 @@ impl Config {
         {
             return Err(ConfigError::Invalid("live mode requires signer and a positive capital cap no greater than starting capital".into()));
         }
+        if self.mode == Mode::Live && self.execution.jupiter_api_url.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "live mode requires a non-empty jupiter_api_url".into(),
+            ));
+        }
         if self.mode == Mode::Live && self.execution.allowed_program_ids.is_empty() {
             return Err(ConfigError::Invalid(
                 "live mode requires a non-empty execution program allowlist".into(),
@@ -410,6 +415,21 @@ sqlite_path = ":memory:"
         assert!(c.validate().is_err());
         c.runtime.reconcile_interval_secs = 60;
         assert!(c.validate().is_ok());
+    }
+    #[test]
+    fn live_mode_requires_jupiter_api_url() {
+        let mut c = config();
+        c.mode = Mode::Live;
+        c.execution.live_signer_env = Some("KEY".into());
+        c.execution.allowed_program_ids =
+            vec!["JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".into()];
+        c.runtime.reconcile_interval_secs = 60;
+        assert!(c.validate().is_ok());
+        c.execution.jupiter_api_url = "".into();
+        assert!(
+            c.validate().is_err(),
+            "live mode must reject empty jupiter_api_url"
+        );
     }
     #[test]
     fn negative_sol_price_is_rejected() {
