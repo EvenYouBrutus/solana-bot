@@ -94,19 +94,15 @@ impl JupiterExecutor {
             ))),
         }
     }
-    /// Extracts the network fee (base + priority) encoded in the first bytes
-    /// of a legacy transaction message.  The fee is a little-endian u64
-    /// starting at byte 1 of the serialized message; only the first 3 bytes
-    /// carry the fee (max ~16.7 M lamports).
-    fn message_fee_lamports(message_bytes: &[u8]) -> Option<u64> {
-        if message_bytes.len() < 4 {
-            return None;
+    /// Verifies the actual on-chain fee against the configured cap.
+    /// Returns an error if the fee exceeds the cap.
+    fn verify_onchain_fee(fee_lamports: u64, max_fee_lamports: u64) -> Result<(), ExecutionError> {
+        if fee_lamports > max_fee_lamports {
+            return Err(ExecutionError::Policy(format!(
+                "on-chain transaction fee {fee_lamports} lamports exceeds configured maximum {max_fee_lamports}"
+            )));
         }
-        Some(
-            message_bytes[1] as u64
-                | (message_bytes[2] as u64) << 8
-                | (message_bytes[3] as u64) << 16,
-        )
+        Ok(())
     }
     /// RPC submission errors that are deterministic refusals. The node has
     /// not relayed the transaction, so treating these as `Failed` cannot
@@ -322,19 +318,6 @@ impl Executor for JupiterExecutor {
             .map_err(|_| ExecutionError::Transaction("invalid provider transaction".into()))?;
         validate_provider_transaction(&unsigned, &signer.pubkey(), &self.allowed_program_ids)
             .map_err(|e| ExecutionError::Policy(e.to_string()))?;
-        let message_bytes = match &unsigned.message {
-            solana_sdk::message::VersionedMessage::Legacy(m) => m.serialize(),
-            solana_sdk::message::VersionedMessage::V0(m) => m.serialize(),
-        };
-        let fee = Self::message_fee_lamports(&message_bytes).ok_or_else(|| {
-            ExecutionError::Policy("transaction message too short to read fee".into())
-        })?;
-        if fee > self.max_fee_lamports {
-            return Err(ExecutionError::Policy(format!(
-                "transaction fee {fee} lamports exceeds configured maximum {max}",
-                max = self.max_fee_lamports
-            )));
-        }
         let signed = VersionedTransaction::try_new(unsigned.message, &[&signer]).map_err(|_| {
             ExecutionError::Transaction("could not sign provider transaction".into())
         })?;
@@ -357,6 +340,7 @@ impl Executor for JupiterExecutor {
                 r.quote.input_amount,
             )
             .await?;
+        Self::verify_onchain_fee(outcome.fee_lamports, self.max_fee_lamports)?;
         let (value_usd, price_usd) = r.value_basis.price_fill(
             outcome.input_amount,
             r.input_decimals,
@@ -451,32 +435,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_fee_lamports_parses_legacy_bytes() {
-        // Fee = 5000 lamports = 0x1388 in little-endian: [0x88, 0x13, 0x00]
-        let mut msg = vec![1u8; 32]; // byte 0 = 1 required signature
-        msg[1] = 0x88; // fee low byte
-        msg[2] = 0x13; // fee mid byte
-        msg[3] = 0x00; // fee high byte
-        assert_eq!(JupiterExecutor::message_fee_lamports(&msg), Some(5000));
+    fn verify_onchain_fee_allows_within_cap() {
+        assert!(JupiterExecutor::verify_onchain_fee(5_000, 500_000).is_ok());
+        assert!(JupiterExecutor::verify_onchain_fee(0, 500_000).is_ok());
+        assert!(JupiterExecutor::verify_onchain_fee(500_000, 500_000).is_ok());
     }
 
     #[test]
-    fn message_fee_lamports_rejects_short_buffer() {
-        assert_eq!(JupiterExecutor::message_fee_lamports(&[0, 1]), None);
-        assert_eq!(JupiterExecutor::message_fee_lamports(&[]), None);
-    }
-
-    #[test]
-    fn message_fee_lamports_max_u24() {
-        // Max 3-byte value = 16_777_215
-        let mut msg = vec![0u8; 32];
-        msg[1] = 0xFF;
-        msg[2] = 0xFF;
-        msg[3] = 0xFF;
-        assert_eq!(
-            JupiterExecutor::message_fee_lamports(&msg),
-            Some(16_777_215)
-        );
+    fn verify_onchain_fee_rejects_above_cap() {
+        assert!(JupiterExecutor::verify_onchain_fee(500_001, 500_000).is_err());
+        assert!(JupiterExecutor::verify_onchain_fee(1_000_000, 500_000).is_err());
     }
 
     #[test]
@@ -517,5 +485,17 @@ mod tests {
             JupiterExecutor::classify_submit_error("Simulation Failed: custom error"),
             ExecutionError::Transaction(_)
         );
+    }
+
+    #[test]
+    fn onchain_fee_cap_is_enforced_after_confirmation() {
+        // Fee exactly at cap: allowed
+        assert!(JupiterExecutor::verify_onchain_fee(500_000, 500_000).is_ok());
+        // Fee one lamport over cap: rejected
+        assert!(JupiterExecutor::verify_onchain_fee(500_001, 500_000).is_err());
+        // Fee well under cap: allowed
+        assert!(JupiterExecutor::verify_onchain_fee(10_000, 500_000).is_ok());
+        // Zero fee: allowed
+        assert!(JupiterExecutor::verify_onchain_fee(0, 500_000).is_ok());
     }
 }

@@ -37,6 +37,12 @@ impl Portfolio {
             self.positions.insert(p.mint.clone(), p);
         }
     }
+    /// Syncs a single position from external (authoritative) data.
+    /// Used to ensure in-memory state matches the persistent store before
+    /// applying accounting changes.
+    pub fn sync_position(&mut self, position: Position) {
+        self.positions.insert(position.mint.clone(), position);
+    }
 
     /// Records a verified entry fill. `price` is the fill's verified execution
     /// price; the USD cost basis comes from `fill.input_value_usd`.

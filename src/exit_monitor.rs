@@ -158,19 +158,26 @@ impl ExitMonitor {
                 let _ = store.save_position(p);
             }
 
-            // Load persisted liquidity evidence (None = missing → skip check,
-            // never invent a value).  Freshness is enforced by the caller
-            // persisting observations only when the candidate feed is active.
-            let liquidity: Option<Decimal> = store
-                .last_liquidity(&mint)
-                .ok()
-                .flatten()
-                .map(|(liq, _ts)| liq);
+            // Load persisted liquidity evidence (None = missing → exit,
+            // never invent a value).
+            let liquidity: Option<Decimal> = match store.last_liquidity(&mint) {
+                Ok(Some((liq, _ts))) => Some(liq),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::error!(mint=%mint, error=%e, "exit monitor: failed to read liquidity evidence; treating as missing");
+                    None
+                }
+            };
 
             // Load persisted signal invalidation from store.
-            let invalidated = store
-                .is_signal_invalidated(&position.signal_id)
-                .unwrap_or(false);
+            // SQLite errors fail closed: treat as invalidated.
+            let invalidated = match store.is_signal_invalidated(&position.signal_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(mint=%mint, error=%e, "exit monitor: failed to read invalidation state; treating as invalidated");
+                    true
+                }
+            };
 
             let Some(reason) = exit_reason(
                 &position,
@@ -275,11 +282,12 @@ async fn reconcile_stale_orders(deps: &ExitDeps) {
                         match record_reconciled_fill(&session_deps, &order, outcome, sig).await {
                             Ok(true) => {}
                             Ok(false) => {
-                                // Fill already accounted or position missing;
-                                // mark terminal so the order doesn't block.
-                                let mut o = order.clone();
-                                o.transition(OrderState::Confirmed).ok();
-                                deps.store.update_order(&o).ok();
+                                // Accounting incomplete: order stays unresolved
+                                // so reconciliation can retry on the next tick.
+                                tracing::warn!(
+                                    order_id = %order.id,
+                                    "exit monitor: reconciled fill could not be fully accounted; will retry"
+                                );
                             }
                             Err(e) => {
                                 tracing::error!(order_id=%order.id, error=%e, "exit monitor: reconciled fill could not be accounted");
@@ -728,8 +736,8 @@ mod tests {
     #[test]
     fn independent_exit_without_signal_feed_still_evaluates_price_exits() {
         let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
-        // No liquidity evidence (None) → skip liquidity check
-        // but stop loss still triggers at -10%
+        // No liquidity evidence (None) → treated as unhealthy → LiquidityDeterioration.
+        // Even though price is at -10% (stop loss), liquidity check fires first.
         let reason = exit_reason(
             &pos,
             dec!(0.000009),
@@ -739,7 +747,11 @@ mod tests {
             Utc::now(),
             &strategy(),
         );
-        assert_eq!(reason, Some(crate::strategy::ExitReason::StopLoss));
+        assert_eq!(
+            reason,
+            Some(crate::strategy::ExitReason::LiquidityDeterioration),
+            "missing liquidity evidence must trigger exit, not be treated as healthy"
+        );
     }
 
     #[test]
@@ -761,9 +773,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_liquidity_evidence_does_not_trigger_liquidity_exit() {
+    fn missing_liquidity_evidence_triggers_liquidity_exit() {
         let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
-        // None → skip liquidity check, no exit
+        // None → treated as unhealthy → LiquidityDeterioration
         let reason = exit_reason(
             &pos,
             dec!(0.00001), // same as entry → no SL/TP/TS
@@ -773,7 +785,11 @@ mod tests {
             Utc::now(),
             &strategy(),
         );
-        assert_eq!(reason, None);
+        assert_eq!(
+            reason,
+            Some(crate::strategy::ExitReason::LiquidityDeterioration),
+            "missing liquidity evidence must not be treated as healthy"
+        );
     }
 
     #[test]

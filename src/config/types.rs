@@ -318,6 +318,21 @@ impl Config {
                 "live mode requires a non-empty jupiter_api_url".into(),
             ));
         }
+        if self.mode == Mode::Live {
+            match self.execution.jupiter_api_key_env.as_deref() {
+                None => {
+                    return Err(ConfigError::Invalid(
+                        "live mode requires jupiter_api_key_env to be configured".into(),
+                    ));
+                }
+                Some(v) if v.trim().is_empty() => {
+                    return Err(ConfigError::Invalid(
+                        "live mode requires jupiter_api_key_env to be non-empty".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
         if self.mode == Mode::Live && self.execution.allowed_program_ids.is_empty() {
             return Err(ConfigError::Invalid(
                 "live mode requires a non-empty execution program allowlist".into(),
@@ -419,6 +434,11 @@ sqlite_path = ":memory:"
         c.runtime.reconcile_interval_secs = 0;
         assert!(c.validate().is_err());
         c.runtime.reconcile_interval_secs = 60;
+        assert!(
+            c.validate().is_err(),
+            "live mode still needs jupiter_api_key_env"
+        );
+        c.execution.jupiter_api_key_env = Some("JUPITER_API_KEY".into());
         assert!(c.validate().is_ok());
     }
     #[test]
@@ -428,6 +448,7 @@ sqlite_path = ":memory:"
         c.execution.live_signer_env = Some("KEY".into());
         c.execution.allowed_program_ids =
             vec!["JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".into()];
+        c.execution.jupiter_api_key_env = Some("JUPITER_API_KEY".into());
         c.runtime.reconcile_interval_secs = 60;
         assert!(c.validate().is_ok());
         c.execution.jupiter_api_url = "".into();
@@ -436,6 +457,47 @@ sqlite_path = ":memory:"
             "live mode must reject empty jupiter_api_url"
         );
     }
+    #[test]
+    fn live_mode_requires_jupiter_api_key_env() {
+        let mut c = config();
+        c.mode = Mode::Live;
+        c.execution.live_signer_env = Some("KEY".into());
+        c.execution.allowed_program_ids =
+            vec!["JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".into()];
+        c.runtime.reconcile_interval_secs = 60;
+        // Without jupiter_api_key_env, live mode must fail.
+        c.execution.jupiter_api_key_env = None;
+        assert!(
+            c.validate().is_err(),
+            "live mode must require jupiter_api_key_env"
+        );
+        // With empty jupiter_api_key_env, live mode must fail.
+        c.execution.jupiter_api_key_env = Some("".into());
+        assert!(
+            c.validate().is_err(),
+            "live mode must reject empty jupiter_api_key_env"
+        );
+        // With valid jupiter_api_key_env, live mode must pass.
+        c.execution.jupiter_api_key_env = Some("JUPITER_API_KEY".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn paper_mode_does_not_require_jupiter_api_key_env() {
+        let mut c = config();
+        c.mode = Mode::Paper;
+        c.execution.jupiter_api_key_env = None;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn replay_mode_does_not_require_jupiter_api_key_env() {
+        let mut c = config();
+        c.mode = Mode::Replay;
+        c.execution.jupiter_api_key_env = None;
+        assert!(c.validate().is_ok());
+    }
+
     #[test]
     fn negative_sol_price_is_rejected() {
         let mut c = config();

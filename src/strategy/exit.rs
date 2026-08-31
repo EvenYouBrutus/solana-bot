@@ -36,8 +36,14 @@ pub fn exit_reason(
     now: DateTime<Utc>,
     c: &StrategyConfig,
 ) -> Option<ExitReason> {
-    if let Some(liq) = liquidity {
-        if liq < min_liquidity {
+    // Missing liquidity evidence is treated as unhealthy: fail-closed.
+    match liquidity {
+        Some(liq) => {
+            if liq < min_liquidity {
+                return Some(ExitReason::LiquidityDeterioration);
+            }
+        }
+        None => {
             return Some(ExitReason::LiquidityDeterioration);
         }
     }

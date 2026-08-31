@@ -188,13 +188,13 @@ pub(crate) async fn record_reconciled_fill(
             .find(|p| p.position_id.as_deref() == Some(pid))
     });
     let (Some(position), Some(input_value_usd)) = (&position, order.input_value_usd) else {
-        let mut o = order.clone();
-        o.error = Some(
-            "reconciled on-chain but position/value basis is missing; no accounting applied".into(),
+        // Position or value basis missing: accounting cannot be completed.
+        // Leave the order as Unknown (incomplete) so reconciliation can retry;
+        // do NOT transition to a terminal state that would block retry.
+        tracing::warn!(
+            order_id = %order.id,
+            "reconciled on-chain but position/value basis is missing; order stays unresolved"
         );
-        o.transition(OrderState::Reconciled)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        deps.store.update_order(&o)?;
         return Ok(false);
     };
     let (Some(token_decimals), Some(base_decimals)) =
@@ -238,11 +238,9 @@ pub(crate) async fn record_reconciled_fill(
         input_value_usd: Some(value_usd),
         expected_output_amount: None,
     };
-    let mut o = order.clone();
-    o.signature = Some(signature.to_string());
-    o.transition(OrderState::Confirmed)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    deps.store.update_order(&o)?;
+    // Persist fill and apply to portfolio BEFORE marking the order Confirmed.
+    // If the process crashes mid-way, the order stays Unknown and will be
+    // retried on restart; no confirmed order with missing accounting.
     deps.store.save_fill(&fill)?;
     apply_confirmed_fill_to_portfolio(
         deps,
@@ -252,6 +250,11 @@ pub(crate) async fn record_reconciled_fill(
         token_decimals,
         base_decimals,
     )?;
+    let mut o = order.clone();
+    o.signature = Some(signature.to_string());
+    o.transition(OrderState::Confirmed)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    deps.store.update_order(&o)?;
     tracing::info!(order_id=%order.id, kind=?order.kind, mint=%order.mint, %signature,
         input=outcome.input_amount, output=outcome.output_amount, fee_lamports=outcome.fee_lamports,
         "order reconciled from chain after restart");
@@ -598,17 +601,21 @@ pub(crate) async fn execute_exit_order(
     match executor.execute(request).await {
         Ok(mut fill) => {
             finalize_fill(&mut fill, config.economics.sol_price_usd);
-            placed.signature = Some(fill.signature.clone());
-            placed.transition(OrderState::Confirmed).ok();
-            store.update_order(&placed).ok();
+            // Persist fill before any order state change.
             store.save_fill(&fill).ok();
-
-            // Apply exit to portfolio and persist atomically.
+            // Sync portfolio with fresh store data to avoid stale accounting.
+            if let Some(fresh_pos) = stored.iter().find(|p| p.mint == mint) {
+                portfolio.sync_position(fresh_pos.clone());
+            }
             match portfolio.apply_exit(mint, &fill, reason, Utc::now()) {
                 Ok(outcome) => {
                     if let Some(p) = portfolio.position(mint) {
                         store.save_position(p).ok();
                     }
+                    // Mark order Confirmed ONLY after portfolio accounting succeeds.
+                    placed.signature = Some(fill.signature.clone());
+                    placed.transition(OrderState::Confirmed).ok();
+                    store.update_order(&placed).ok();
                     tracing::info!(
                         order_id = %order.id,
                         mint = %mint,
@@ -624,10 +631,17 @@ pub(crate) async fn execute_exit_order(
                     ExitExecResult::Confirmed(fill)
                 }
                 Err(e) => {
+                    // Fill confirmed on-chain but accounting failed.
+                    // Mark Unknown so reconciliation can retry; do NOT
+                    // leave as Submitted (which would block entries).
+                    placed.signature = Some(fill.signature.clone());
+                    placed.transition(OrderState::Unknown).ok();
+                    placed.error = Some(format!("accounting failed: {e}"));
+                    store.update_order(&placed).ok();
                     tracing::error!(
                         order_id = %order.id,
                         error = %e,
-                        "confirmed exit could not be applied to position"
+                        "confirmed exit could not be applied to position; reconciliation required"
                     );
                     ExitExecResult::Failed(format!("apply_exit failed: {e}"))
                 }
@@ -953,18 +967,28 @@ async fn process_exits(deps: &SessionDeps, state: &mut SessionState) -> Result<(
         };
         let candidate = state.candidates.get(&mint);
         // Liquidity: prefer fresh candidate data, else persisted observation,
-        // else None (missing evidence is never treated as healthy).
+        // else None (missing evidence triggers exit via fail-closed).
         let liquidity: Option<Decimal> = candidate.map(|c| c.market.liquidity_usd).or_else(|| {
-            store
-                .last_liquidity(&mint)
-                .ok()
-                .flatten()
-                .map(|(liq, _)| liq)
+            match store.last_liquidity(&mint) {
+                Ok(Some((liq, _))) => Some(liq),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::error!(mint=%mint, error=%e, "failed to read liquidity evidence; treating as missing");
+                    None
+                }
+            }
         });
 
         // Signal invalidation: read persisted evidence, never invent.
+        // SQLite errors fail closed: treat as invalidated.
         let invalidated: bool = match &*position.signal_id {
-            sid if !sid.is_empty() => store.is_signal_invalidated(sid).unwrap_or(false),
+            sid if !sid.is_empty() => match store.is_signal_invalidated(sid) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(mint=%mint, error=%e, "failed to read invalidation state; treating as invalidated");
+                    true
+                }
+            },
             _ => false,
         };
         let Some(mark) = derive_mark(
@@ -1228,11 +1252,9 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         match deps.executor.execute(request).await {
             Ok(mut fill) => {
                 finalize_fill(&mut fill, config.economics.sol_price_usd);
-                placed.signature = Some(fill.signature.clone());
-                placed.transition(OrderState::Confirmed).ok();
-                store.update_order(&placed)?;
-                store.save_fill(&fill)?;
                 let entry_price = fill.price_usd;
+                // Persist fill before any order state change.
+                store.save_fill(&fill)?;
                 match state.portfolio.apply_entry(
                     mint.clone(),
                     config.strategy.base_mint.clone(),
@@ -1247,6 +1269,10 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                     Ok(()) => {
                         if let Some(p) = state.portfolio.position(&mint) {
                             store.save_position(p)?;
+                            // Mark order Confirmed ONLY after portfolio accounting succeeds.
+                            placed.signature = Some(fill.signature.clone());
+                            placed.transition(OrderState::Confirmed).ok();
+                            store.update_order(&placed)?;
                             tracing::info!(order_id=%order.id, mint=%mint, signature=%fill.signature, position_id=%position_id, qty_atomic=fill.output_amount, price_usd=%fill.price_usd, fees_usd=%fill.fees_usd, fee_lamports=fill.fee_lamports, "confirmed entry persisted");
                         }
                         state.risk.register_trade(c.position_usd);
@@ -1260,7 +1286,14 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                         }
                     }
                     Err(e) => {
-                        tracing::error!(order_id=%order.id, error=%e, "confirmed entry could not be applied to the portfolio; operator review required")
+                        // Fill confirmed on-chain but accounting failed.
+                        // Mark Unknown so reconciliation can retry; do NOT
+                        // leave as Submitted (which would block entries).
+                        placed.signature = Some(fill.signature.clone());
+                        placed.transition(OrderState::Unknown).ok();
+                        placed.error = Some(format!("accounting failed: {e}"));
+                        store.update_order(&placed)?;
+                        tracing::error!(order_id=%order.id, error=%e, "confirmed entry could not be applied to the portfolio; reconciliation required")
                     }
                 }
             }
@@ -1857,5 +1890,84 @@ mod tests {
         assert_eq!(loaded.input_value_usd, Some(dec!(10)));
         assert_eq!(loaded.expected_output_amount, Some(5_200_000));
         assert_eq!(loaded.slippage_bps, 30);
+    }
+
+    #[tokio::test]
+    async fn reconciled_fill_stays_unresolved_when_position_missing() {
+        let config = test_config();
+        let store = Arc::new(crate::storage::StateStore::open(":memory:").unwrap());
+        // Create an Unknown order with a signature, but no position in the store.
+        let order = crate::domain::trade::OrderRecord {
+            id: "reconcile-no-pos".into(),
+            signal_id: "s".into(),
+            mint: "T".into(),
+            kind: OrderKind::Exit,
+            position_id: Some("missing-pos".into()),
+            side: OrderSide::Sell,
+            input_mint: Some("T".into()),
+            output_mint: Some("SOL".into()),
+            input_amount_atomic: Some(1_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(9),
+            state: OrderState::Unknown,
+            idempotency_key: "reconcile-no-pos-key".into(),
+            created_at: Utc::now(),
+            signature: Some("onchain-sig".into()),
+            error: None,
+        };
+        store.reserve_order(&order).unwrap();
+        let outcome = crate::execution::reconcile::ChainSwapOutcome {
+            input_amount: 1_000_000,
+            output_amount: 500_000_000,
+            fee_lamports: 5_000,
+            block_time: Some(1_700_000_000),
+        };
+        let rpc = Arc::new(
+            crate::data::rpc::RpcPool::with_attempts(
+                vec!["http://localhost:1".into()],
+                Duration::from_secs(1),
+                1,
+            )
+            .unwrap(),
+        );
+        let executor = Arc::new(MockExecutor);
+        let deps = SessionDeps {
+            config,
+            store: store.clone(),
+            executor,
+            rpc,
+        };
+        let result = record_reconciled_fill(&deps, &order, outcome, "onchain-sig").await;
+        assert!(result.is_ok());
+        assert!(
+            !result.unwrap(),
+            "should return Ok(false) when position missing"
+        );
+        // Order must remain Unknown (incomplete), NOT transition to Confirmed/Reconciled.
+        let incomplete = store.incomplete_orders().unwrap();
+        assert!(
+            incomplete.iter().any(|o| o.id == "reconcile-no-pos"),
+            "order must stay incomplete when accounting cannot be completed"
+        );
+    }
+
+    #[test]
+    fn sync_position_updates_portfolio_from_store() {
+        let mut portfolio = Portfolio::default();
+        let pos = position(1_000, dec!(0.00001));
+        portfolio.load(vec![pos]);
+        assert_eq!(
+            portfolio.position("T").unwrap().remaining_quantity_atomic,
+            Some(1_000)
+        );
+        // Sync with updated position (simulating fresh store read).
+        let mut updated = position(1_000, dec!(0.00001));
+        updated.remaining_quantity_atomic = Some(500);
+        portfolio.sync_position(updated);
+        assert_eq!(
+            portfolio.position("T").unwrap().remaining_quantity_atomic,
+            Some(500),
+            "sync_position must replace the in-memory state with fresh store data"
+        );
     }
 }
