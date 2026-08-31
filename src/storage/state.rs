@@ -3,7 +3,7 @@ use crate::domain::{
     trade::{Fill, OrderRecord},
     wallet::WalletStats,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{fs, path::Path, sync::Mutex};
 use thiserror::Error;
@@ -224,6 +224,66 @@ impl StateStore {
     }
     pub fn kill_switch_reason(&self) -> Result<Option<String>, StorageError> {
         self.get("risk:kill_switch")
+    }
+
+    /// Persist the latest known liquidity observation for a position so the
+    /// independent exit monitor can evaluate liquidity deterioration without
+    /// access to the signal feed.
+    pub fn set_last_liquidity(
+        &self,
+        mint: &str,
+        liquidity_usd: rust_decimal::Decimal,
+    ) -> Result<(), StorageError> {
+        self.put(
+            &format!("liquidity:{mint}"),
+            &serde_json::json!({
+                "liquidity_usd": liquidity_usd.to_string(),
+                "observed_at": Utc::now().to_rfc3339(),
+            }),
+        )
+    }
+
+    /// Return the most recently persisted liquidity observation for a mint.
+    /// `None` means no observation has been recorded (evidence is missing).
+    pub fn last_liquidity(
+        &self,
+        mint: &str,
+    ) -> Result<Option<(rust_decimal::Decimal, DateTime<Utc>)>, StorageError> {
+        let raw: Option<serde_json::Value> = self.get(&format!("liquidity:{mint}"))?;
+        match raw {
+            Some(v) => {
+                let liq = v["liquidity_usd"]
+                    .as_str()
+                    .and_then(|s| s.parse::<rust_decimal::Decimal>().ok());
+                let ts = v["observed_at"]
+                    .as_str()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
+                match (liq, ts) {
+                    (Some(l), Some(t)) => Ok(Some((l, t))),
+                    _ => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Mark a signal as invalidated (e.g. token rug, creator flagged).
+    /// The exit monitor reads this to trigger SignalInvalidated exits.
+    pub fn set_signal_invalidated(&self, signal_id: &str) -> Result<(), StorageError> {
+        self.put(
+            &format!("invalidated:{signal_id}"),
+            &serde_json::json!({"invalidated": true, "at": Utc::now().to_rfc3339()}),
+        )
+    }
+
+    /// Check whether a signal has been persisted as invalidated.
+    pub fn is_signal_invalidated(&self, signal_id: &str) -> Result<bool, StorageError> {
+        let raw: Option<serde_json::Value> = self.get(&format!("invalidated:{signal_id}"))?;
+        Ok(raw
+            .as_ref()
+            .and_then(|v| v["invalidated"].as_bool())
+            .unwrap_or(false))
     }
 }
 #[cfg(test)]

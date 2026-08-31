@@ -30,14 +30,16 @@ impl std::fmt::Display for ExitReason {
 pub fn exit_reason(
     p: &Position,
     price: Decimal,
-    liquidity: Decimal,
+    liquidity: Option<Decimal>,
     min_liquidity: Decimal,
     invalidated: bool,
     now: DateTime<Utc>,
     c: &StrategyConfig,
 ) -> Option<ExitReason> {
-    if liquidity < min_liquidity {
-        return Some(ExitReason::LiquidityDeterioration);
+    if let Some(liq) = liquidity {
+        if liq < min_liquidity {
+            return Some(ExitReason::LiquidityDeterioration);
+        }
     }
     if invalidated {
         return Some(ExitReason::SignalInvalidated);

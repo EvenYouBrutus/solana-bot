@@ -11,12 +11,9 @@ use crate::{
     data::rpc::RpcPool,
     domain::{
         position::{Position, PositionState},
-        trade::{OrderKind, OrderRecord, OrderSide, OrderState},
+        trade::{OrderKind, OrderState},
     },
-    execution::{
-        finalize_fill, reconcile_signature, units, ExecutionError, ExecutionRequest, Executor,
-        ValueBasis,
-    },
+    execution::{reconcile_signature, units, ExecutionError, Executor},
     portfolio::Portfolio,
     storage::StateStore,
     strategy::exit_reason,
@@ -24,7 +21,6 @@ use crate::{
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use rust_decimal::Decimal;
-use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration as StdDuration};
 
 /// Shared, `Send + Sync` dependencies for the exit monitor.  All inner types
@@ -161,11 +157,20 @@ impl ExitMonitor {
                 let _ = store.save_position(p);
             }
 
-            // Liquidity from candidates is unavailable to the exit monitor; use
-            // MAX so LiquidityDeterioration is never triggered here – the main
-            // session's candidate-aware tick handles that case.
-            let liquidity = Decimal::MAX;
-            let invalidated = false;
+            // Load persisted liquidity evidence (None = missing → skip check,
+            // never invent a value).  Freshness is enforced by the caller
+            // persisting observations only when the candidate feed is active.
+            let liquidity: Option<Decimal> = store
+                .last_liquidity(&mint)
+                .ok()
+                .flatten()
+                .map(|(liq, _ts)| liq);
+
+            // Load persisted signal invalidation from store.
+            let invalidated = store
+                .is_signal_invalidated(&position.signal_id)
+                .unwrap_or(false);
+
             let Some(reason) = exit_reason(
                 &position,
                 mark,
@@ -179,221 +184,29 @@ impl ExitMonitor {
             };
 
             tracing::info!(mint=%mint, %reason, remaining, mark=%mark, "exit monitor: exit triggered");
-            execute_exit(
-                &self.deps,
-                &mut portfolio,
+
+            // Use the shared execution path.
+            let result = crate::runtime::execute_exit_order(
+                executor,
+                store,
+                config,
                 &mint,
-                remaining,
                 reason.as_str(),
-                token_decimals,
-                base_decimals,
-                base_mint,
-                base_price,
+                &mut portfolio,
             )
             .await;
+            if let crate::runtime::ExitExecResult::Failed(e) = &result {
+                tracing::error!(mint=%mint, error=%e, "exit monitor: exit execution failed");
+            }
         }
         Ok(())
     }
-}
-
-// ---------------------------------------------------------------------------
-// Exit execution (mirrors runtime::attempt_exit but operates on standalone state)
-// ---------------------------------------------------------------------------
-
-fn exit_idempotency_key(position_id: &str, remaining: u64, reason: &str, attempt: u32) -> String {
-    let mut hash = Sha256::new();
-    hash.update(position_id.as_bytes());
-    hash.update(remaining.to_le_bytes());
-    hash.update(reason.as_bytes());
-    hash.update(attempt.to_le_bytes());
-    format!("{:x}", hash.finalize())
 }
 
 fn has_inflight_exit(store: &StateStore, position: &Position) -> Result<bool> {
     Ok(store.incomplete_orders()?.iter().any(|o| {
         o.kind == OrderKind::Exit && o.position_id.as_deref() == position.position_id.as_deref()
     }))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_exit(
-    deps: &ExitDeps,
-    portfolio: &mut Portfolio,
-    mint: &str,
-    remaining: u64,
-    reason: &str,
-    token_decimals: u8,
-    base_decimals: u8,
-    base_mint: String,
-    base_price: Decimal,
-) {
-    let store = &*deps.store;
-    let executor = &*deps.executor;
-    let config = &*deps.config;
-    let now = Utc::now();
-
-    let Some(position) = portfolio.position(mint).cloned() else {
-        return;
-    };
-
-    // Count previous exit attempts for this position to build the idempotency key.
-    let attempt = store
-        .orders()
-        .unwrap_or_default()
-        .iter()
-        .filter(|o| {
-            o.kind == OrderKind::Exit && o.position_id.as_deref() == position.position_id.as_deref()
-        })
-        .count() as u32;
-
-    let position_id = position.position_id.as_deref().unwrap_or(mint);
-    let key = exit_idempotency_key(position_id, remaining, reason, attempt);
-
-    let mark_value = match units(remaining, token_decimals) {
-        Ok(q) => q * base_price,
-        Err(_) => return,
-    };
-
-    let order = OrderRecord {
-        id: uuid::Uuid::new_v4().to_string(),
-        signal_id: position.signal_id.clone(),
-        mint: mint.to_string(),
-        kind: OrderKind::Exit,
-        position_id: position.position_id.clone(),
-        side: OrderSide::Sell,
-        input_mint: Some(mint.to_string()),
-        output_mint: Some(base_mint.clone()),
-        input_amount_atomic: Some(remaining),
-        input_value_usd: Some(mark_value),
-        output_mint_decimals: Some(base_decimals),
-        state: OrderState::Pending,
-        idempotency_key: key,
-        created_at: now,
-        signature: None,
-        error: Some(reason.to_string()),
-    };
-
-    if !store.reserve_order(&order).unwrap_or(false) {
-        tracing::debug!(mint=%mint, "exit monitor: duplicate exit blocked by idempotency");
-        return;
-    }
-
-    // Fresh quote for execution.
-    let quote = match executor
-        .quote(mint, &base_mint, remaining, config.execution.slippage_bps)
-        .await
-    {
-        Ok(q) => q,
-        Err(e) => {
-            tracing::error!(mint=%mint, error=%e, "exit monitor: exit quote unavailable");
-            let mut o = order.clone();
-            o.error = Some(format!("quote failed: {e}"));
-            o.transition(OrderState::Failed).ok();
-            store.update_order(&o).ok();
-            return;
-        }
-    };
-
-    if quote.price_impact_bps > config.execution.max_price_impact_bps {
-        tracing::error!(
-            mint=%mint,
-            impact_bps=quote.price_impact_bps,
-            cap=config.execution.max_price_impact_bps,
-            "exit monitor: price impact exceeds limit"
-        );
-        let mut o = order.clone();
-        o.error = Some("price impact limit".into());
-        o.transition(OrderState::Failed).ok();
-        store.update_order(&o).ok();
-        return;
-    }
-
-    let min_output = quote
-        .output_amount
-        .saturating_mul(10_000 - config.execution.slippage_bps as u64)
-        / 10_000;
-
-    let mut placed = order.clone();
-    placed.transition(OrderState::Submitted).ok();
-    store.update_order(&placed).ok();
-
-    tracing::info!(
-        order_id=%order.id,
-        mint=%mint,
-        reason=%reason,
-        qty_atomic=remaining,
-        expected_out=quote.output_amount,
-        impact_bps=quote.price_impact_bps,
-        "exit monitor: exit order submitted"
-    );
-
-    let request = ExecutionRequest {
-        order_id: order.id.clone(),
-        quote,
-        max_slippage_bps: config.risk.max_slippage_bps,
-        max_price_impact_bps: config.execution.max_price_impact_bps,
-        min_output_amount: min_output,
-        input_decimals: token_decimals,
-        output_decimals: base_decimals,
-        value_basis: ValueBasis::OutputUnitPriceUsd(base_price),
-    };
-
-    match executor.execute(request).await {
-        Ok(mut fill) => {
-            finalize_fill(&mut fill, config.economics.sol_price_usd);
-            placed.signature = Some(fill.signature.clone());
-            placed.transition(OrderState::Confirmed).ok();
-            store.update_order(&placed).ok();
-            store.save_fill(&fill).ok();
-            match portfolio.apply_exit(mint, &fill, reason, Utc::now()) {
-                Ok(outcome) => {
-                    if let Some(p) = portfolio.position(mint) {
-                        store.save_position(p).ok();
-                    }
-                    tracing::info!(
-                        order_id=%order.id,
-                        mint=%mint,
-                        %reason,
-                        signature=%fill.signature,
-                        sold=fill.input_amount,
-                        received=fill.output_amount,
-                        fees_usd=%fill.fees_usd,
-                        realized_pnl_usd=%outcome.realized_pnl_usd,
-                        closed=outcome.closed,
-                        "exit monitor: exit confirmed"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(order_id=%order.id, error=%e, "exit monitor: confirmed exit could not be applied");
-                }
-            }
-        }
-        Err(ExecutionError::Unknown { signature, detail }) => {
-            if let Some(sig) = &signature {
-                placed.signature = Some(sig.clone());
-            }
-            placed.transition(OrderState::Unknown).ok();
-            placed.error = Some(detail.clone());
-            store.update_order(&placed).ok();
-            tracing::error!(
-                order_id=%order.id,
-                ?signature,
-                %detail,
-                "exit monitor: outcome unknown; reconciliation required"
-            );
-        }
-        Err(e) => {
-            placed.transition(OrderState::Failed).ok();
-            placed.error = Some(e.to_string());
-            store.update_order(&placed).ok();
-            tracing::error!(
-                order_id=%order.id,
-                mint=%mint,
-                error=%e,
-                "exit monitor: exit failed; order marked failed"
-            );
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -482,8 +295,12 @@ mod tests {
     use super::*;
     use crate::{
         config::types::StrategyConfig,
-        domain::position::{PositionState, ReconciliationStatus},
+        domain::{
+            position::{PositionState, ReconciliationStatus},
+            trade::{OrderRecord, OrderSide},
+        },
         portfolio::Portfolio,
+        runtime::exit_idempotency_key,
     };
     use chrono::Utc;
     use rust_decimal_macros::dec;
@@ -782,7 +599,7 @@ mod tests {
         let reason = exit_reason(
             &pos,
             dec!(0.000009), // 10% below entry
-            Decimal::MAX,
+            Some(Decimal::MAX),
             dec!(50000),
             false,
             Utc::now(),
@@ -800,7 +617,7 @@ mod tests {
         let reason = exit_reason(
             &pos,
             dec!(0.000011),
-            Decimal::MAX,
+            Some(Decimal::MAX),
             dec!(50000),
             false,
             Utc::now(),
@@ -816,7 +633,7 @@ mod tests {
         let reason = exit_reason(
             &pos,
             dec!(0.00001), // same as entry -> no SL/TP/TS
-            Decimal::MAX,
+            Some(Decimal::MAX),
             dec!(50000),
             false,
             Utc::now(),
@@ -832,7 +649,7 @@ mod tests {
         let reason = exit_reason(
             &pos,
             dec!(0.0000115),
-            Decimal::MAX,
+            Some(Decimal::MAX),
             dec!(50000),
             false,
             Utc::now(),
@@ -847,7 +664,7 @@ mod tests {
         let reason = exit_reason(
             &pos,
             dec!(0.00001), // exactly at entry
-            Decimal::MAX,
+            Some(Decimal::MAX),
             dec!(50000),
             false,
             Utc::now(),
@@ -885,5 +702,250 @@ mod tests {
         assert_eq!(paper_order.len(), 1);
         assert_eq!(paper_order[0].state, OrderState::Pending);
         // Paper signature orders get marked Failed.
+    }
+
+    // --- Regression tests for exit architecture requirements ---
+
+    #[test]
+    fn independent_exit_without_signal_feed_still_evaluates_price_exits() {
+        let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        // No liquidity evidence (None) → skip liquidity check
+        // but stop loss still triggers at -10%
+        let reason = exit_reason(
+            &pos,
+            dec!(0.000009),
+            None, // no liquidity evidence
+            dec!(50000),
+            false,
+            Utc::now(),
+            &strategy(),
+        );
+        assert_eq!(reason, Some(crate::strategy::ExitReason::StopLoss));
+    }
+
+    #[test]
+    fn liquidity_deterioration_triggers_exit_when_evidence_present() {
+        let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        let reason = exit_reason(
+            &pos,
+            dec!(0.00001),
+            Some(dec!(30000)), // below min_liquidity_usd = 50000
+            dec!(50000),
+            false,
+            Utc::now(),
+            &strategy(),
+        );
+        assert_eq!(
+            reason,
+            Some(crate::strategy::ExitReason::LiquidityDeterioration)
+        );
+    }
+
+    #[test]
+    fn missing_liquidity_evidence_does_not_trigger_liquidity_exit() {
+        let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        // None → skip liquidity check, no exit
+        let reason = exit_reason(
+            &pos,
+            dec!(0.00001), // same as entry → no SL/TP/TS
+            None,
+            dec!(50000),
+            false,
+            Utc::now(),
+            &strategy(),
+        );
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn signal_invalidation_triggers_exit() {
+        let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        let reason = exit_reason(
+            &pos,
+            dec!(0.00001),
+            Some(Decimal::MAX),
+            dec!(50000),
+            true, // invalidated
+            Utc::now(),
+            &strategy(),
+        );
+        assert_eq!(reason, Some(crate::strategy::ExitReason::SignalInvalidated));
+    }
+
+    #[test]
+    fn duplicate_concurrent_exits_blocked_by_idempotency() {
+        let store = StateStore::open(":memory:").unwrap();
+        let order = OrderRecord {
+            id: "o1".into(),
+            signal_id: "s".into(),
+            mint: "TOKEN".into(),
+            kind: OrderKind::Exit,
+            position_id: Some("pos-1".into()),
+            side: OrderSide::Sell,
+            input_mint: Some("TOKEN".into()),
+            output_mint: Some("SOL".into()),
+            input_amount_atomic: Some(1_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(9),
+            state: OrderState::Pending,
+            idempotency_key: "concurrent-key".into(),
+            created_at: Utc::now(),
+            signature: None,
+            error: None,
+        };
+        // First reservation succeeds.
+        assert!(store.reserve_order(&order).unwrap());
+        // Second reservation with same key fails (duplicate prevention).
+        let order2 = OrderRecord {
+            id: "o2".into(),
+            ..order
+        };
+        assert!(!store.reserve_order(&order2).unwrap());
+    }
+
+    #[test]
+    fn stale_position_not_overwritten_after_exit() {
+        let store = StateStore::open(":memory:").unwrap();
+        let mut pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        store.save_position(&pos).unwrap();
+        // Simulate another task updating the position (reducing remaining).
+        pos.remaining_quantity_atomic = Some(500_000);
+        store.save_position(&pos).unwrap();
+        // Fresh load gets the updated state.
+        let loaded = store.positions().unwrap();
+        assert_eq!(loaded[0].remaining_quantity_atomic, Some(500_000));
+    }
+
+    #[test]
+    fn partial_exit_preserves_remaining() {
+        let store = StateStore::open(":memory:").unwrap();
+        let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        store.save_position(&pos).unwrap();
+        let mut portfolio = Portfolio::default();
+        portfolio.load(store.positions().unwrap());
+        let fill = crate::domain::trade::Fill {
+            order_id: "o1".into(),
+            signature: "sig1".into(),
+            input_amount: 300_000, // sell 30% of position
+            output_amount: 100_000_000,
+            price_usd: dec!(0.00001),
+            fees_usd: dec!(0.01),
+            slippage_bps: 0,
+            confirmed_at: Utc::now(),
+            latency_ms: 0,
+            fee_lamports: 0,
+            input_value_usd: Some(dec!(3)),
+            expected_output_amount: Some(100_000_000),
+        };
+        let outcome = portfolio.apply_exit("TOKEN", &fill, "take_profit", Utc::now());
+        assert!(outcome.is_ok());
+        let out = outcome.unwrap();
+        assert!(!out.closed);
+        assert_eq!(
+            portfolio
+                .position("TOKEN")
+                .unwrap()
+                .remaining_quantity_atomic,
+            Some(700_000)
+        );
+    }
+
+    #[test]
+    fn full_exit_closes_position() {
+        let store = StateStore::open(":memory:").unwrap();
+        let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        store.save_position(&pos).unwrap();
+        let mut portfolio = Portfolio::default();
+        portfolio.load(store.positions().unwrap());
+        let fill = crate::domain::trade::Fill {
+            order_id: "o1".into(),
+            signature: "sig1".into(),
+            input_amount: 1_000_000, // sell everything
+            output_amount: 500_000_000,
+            price_usd: dec!(0.00001),
+            fees_usd: dec!(0.01),
+            slippage_bps: 0,
+            confirmed_at: Utc::now(),
+            latency_ms: 0,
+            fee_lamports: 0,
+            input_value_usd: Some(dec!(10)),
+            expected_output_amount: Some(500_000_000),
+        };
+        let outcome = portfolio.apply_exit("TOKEN", &fill, "take_profit", Utc::now());
+        assert!(outcome.is_ok());
+        let out = outcome.unwrap();
+        assert!(out.closed);
+        assert_eq!(
+            portfolio
+                .position("TOKEN")
+                .unwrap()
+                .remaining_quantity_atomic,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn restart_after_confirmed_exit_reflects_in_store() {
+        let store = StateStore::open(":memory:").unwrap();
+        let mut pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        store.save_position(&pos).unwrap();
+        // Simulate a confirmed exit by updating the position.
+        pos.remaining_quantity_atomic = Some(0);
+        pos.state = PositionState::Closed;
+        pos.exit_reason = Some("take_profit".into());
+        pos.exit_signature = Some("sig-exit".into());
+        store.save_position(&pos).unwrap();
+        // On restart, load from store — exit is persisted.
+        let loaded = store.positions().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].state, PositionState::Closed);
+        assert_eq!(loaded[0].exit_reason.as_deref(), Some("take_profit"));
+        assert_eq!(loaded[0].remaining_quantity_atomic, Some(0));
+    }
+
+    #[test]
+    fn exits_allowed_while_kill_switch_blocks_entries() {
+        let store = StateStore::open(":memory:").unwrap();
+        store.latch_kill_switch("drawdown").unwrap();
+        assert!(store.kill_switch_reason().unwrap().is_some());
+        // Verify exit order can be reserved even with kill switch active.
+        let order = OrderRecord {
+            id: "exit-during-kill".into(),
+            signal_id: "s".into(),
+            mint: "TOKEN".into(),
+            kind: OrderKind::Exit,
+            position_id: Some("pos-1".into()),
+            side: OrderSide::Sell,
+            input_mint: Some("TOKEN".into()),
+            output_mint: Some("SOL".into()),
+            input_amount_atomic: Some(1_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(9),
+            state: OrderState::Pending,
+            idempotency_key: "kill-switch-exit".into(),
+            created_at: Utc::now(),
+            signature: None,
+            error: Some("take_profit".into()),
+        };
+        assert!(store.reserve_order(&order).unwrap());
+    }
+
+    #[test]
+    fn liquidity_persistence_round_trip() {
+        let store = StateStore::open(":memory:").unwrap();
+        assert!(store.last_liquidity("TOKEN").unwrap().is_none());
+        store.set_last_liquidity("TOKEN", dec!(75000)).unwrap();
+        let (liq, _ts) = store.last_liquidity("TOKEN").unwrap().unwrap();
+        assert_eq!(liq, dec!(75000));
+    }
+
+    #[test]
+    fn signal_invalidation_persistence_round_trip() {
+        let store = StateStore::open(":memory:").unwrap();
+        assert!(!store.is_signal_invalidated("sig-1").unwrap());
+        store.set_signal_invalidated("sig-1").unwrap();
+        assert!(store.is_signal_invalidated("sig-1").unwrap());
+        // Different signal is not invalidated.
+        assert!(!store.is_signal_invalidated("sig-2").unwrap());
     }
 }
