@@ -51,7 +51,7 @@ mod tests {
             wallet: "x".into(),
             entity_id: None,
             realized_pnl_usd: dec!(50),
-            win_rate: dec!(80),
+            win_rate: dec!(3),
             avg_return_pct: dec!(15),
             median_return_pct: dec!(10),
             max_drawdown_pct: dec!(5),

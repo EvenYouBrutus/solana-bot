@@ -138,12 +138,12 @@ pub fn parse_swap_transaction(
         expected_input
     } else {
         let d = delta_for(input_mint);
-        if d <= 0 {
+        if d == 0 {
             return SwapOutcome::Unverifiable(format!(
-                "no positive owner delta for input mint {input_mint}"
+                "no owner delta for input mint {input_mint}"
             ));
         }
-        match u64::try_from(d) {
+        match u64::try_from(d.unsigned_abs()) {
             Ok(v) => v,
             Err(_) => return SwapOutcome::Unverifiable("input delta overflow".into()),
         }

@@ -179,7 +179,7 @@ impl RiskEngine {
     pub fn record_execution_success(&mut self) {
         self.consecutive_failures = 0;
     }
-    pub fn record_execution_failure(&mut self, now: DateTime<Utc>) -> bool {
+    pub fn record_execution_failure(&mut self, _now: DateTime<Utc>) -> bool {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         if self.consecutive_failures >= self.config.max_consecutive_failures {
             self.kill_switch.force_trip();

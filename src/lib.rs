@@ -5,6 +5,7 @@ pub mod data;
 pub mod domain;
 pub mod economics;
 pub mod execution;
+pub mod exit_monitor;
 pub mod observability;
 pub mod portfolio;
 pub mod risk;

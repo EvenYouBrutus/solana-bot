@@ -7,12 +7,12 @@ use solana_smart_money_bot::{
     },
     data::rpc::RpcPool,
     economics::{break_even_calculator, BreakEvenInputs},
-    execution::JupiterExecutor,
+    execution::{Executor, JupiterExecutor},
     observability,
     runtime::{self, SessionDeps},
     storage::StateStore,
 };
-use std::{fs, path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Parser)]
 #[command(
@@ -74,7 +74,7 @@ fn build_executor(c: &Config, rpc: RpcPool) -> anyhow::Result<JupiterExecutor> {
             .context("missing live signer env")?;
         std::env::var(name).context("live signer secret unavailable")?;
     }
-    JupiterExecutor::new(
+    Ok(JupiterExecutor::new(
         c.execution.jupiter_api_url.clone(),
         rpc,
         c.execution.live_signer_env.clone(),
@@ -83,7 +83,7 @@ fn build_executor(c: &Config, rpc: RpcPool) -> anyhow::Result<JupiterExecutor> {
         c.execution.priority_fee_lamports,
         c.execution.confirm_timeout_secs,
         c.execution.confirm_poll_ms,
-    )
+    )?)
 }
 
 fn base_setup(path: &PathBuf) -> anyhow::Result<(Config, StateStore, RpcPool)> {
@@ -147,7 +147,11 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         let _ = tokio::signal::ctrl_c().await;
         let _ = tx.send(());
     });
-    let deps = session_deps(&c, &state, &execution, &rpc);
+    let config = Arc::new(c);
+    let store = Arc::new(state);
+    let rpc = Arc::new(rpc);
+    let executor = Arc::new(execution);
+    let deps = session_deps(config, store, executor, rpc);
     runtime::run_session(deps, rx).await
 }
 
@@ -156,8 +160,12 @@ async fn reconcile(path: PathBuf) -> anyhow::Result<()> {
     observability::init(c.observability.log_format == "json");
     rpc.health().await.context("RPC health check")?;
     let execution = build_executor(&c, rpc.clone())?;
-    let deps = session_deps(&c, &state, &execution, &rpc);
-    let summary = runtime::run_reconciliation(deps).await?;
+    let config = Arc::new(c);
+    let store = Arc::new(state);
+    let rpc = Arc::new(rpc);
+    let executor = Arc::new(execution);
+    let deps = session_deps(config, store, executor, rpc);
+    let summary = runtime::run_reconciliation(&deps).await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     if summary.unresolved_orders > 0 || summary.onchain_errors > 0 {
         anyhow::bail!("reconciliation incomplete; operator review required");
@@ -170,7 +178,11 @@ async fn exit_all(path: PathBuf) -> anyhow::Result<()> {
     observability::init(c.observability.log_format == "json");
     rpc.health().await.context("RPC health check")?;
     let execution = build_executor(&c, rpc.clone())?;
-    let deps = session_deps(&c, &state, &execution, &rpc);
+    let config = Arc::new(c);
+    let store = Arc::new(state);
+    let rpc = Arc::new(rpc);
+    let executor = Arc::new(execution);
+    let deps = session_deps(config, store, executor, rpc);
     let summary = runtime::run_reconciliation(&deps).await?;
     if summary.unresolved_orders > 0 {
         anyhow::bail!("unresolved orders remain; run Reconcile and review before exiting");
@@ -180,12 +192,12 @@ async fn exit_all(path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn session_deps<'a>(
-    config: &'a Config,
-    store: &'a StateStore,
-    executor: &'a JupiterExecutor,
-    rpc: &'a RpcPool,
-) -> SessionDeps<'a> {
+fn session_deps(
+    config: Arc<Config>,
+    store: Arc<StateStore>,
+    executor: Arc<JupiterExecutor>,
+    rpc: Arc<RpcPool>,
+) -> SessionDeps {
     SessionDeps {
         config,
         store,
@@ -294,16 +306,20 @@ sqlite_path = ":memory:"
             RpcPool::with_attempts(vec!["http://127.0.0.1:1".into()], Duration::from_secs(2), 1)
                 .unwrap();
         let execution = build_executor(&config, rpc.clone()).unwrap();
-        let deps = session_deps(&config, &store, &execution, &rpc);
+        let config = Arc::new(config);
+        let store = Arc::new(store);
+        let rpc = Arc::new(rpc);
+        let executor = Arc::new(execution);
+        let deps = session_deps(config, store, executor, rpc.clone());
         assert!(
-            std::ptr::eq(deps.rpc, &rpc),
+            std::ptr::eq(deps.rpc.as_ref(), rpc.as_ref()),
             "session must use the configured RPC pool from base_setup"
         );
         assert!(
-            !std::ptr::eq(deps.rpc, &placeholder),
+            !std::ptr::eq(deps.rpc.as_ref(), &placeholder),
             "session must not substitute a loopback placeholder RPC"
         );
-        assert_eq!(deps.rpc.endpoints(), config.rpc.http_endpoints.as_slice());
+        assert_eq!(deps.rpc.endpoints(), rpc.endpoints());
         assert!(!deps
             .rpc
             .endpoints()

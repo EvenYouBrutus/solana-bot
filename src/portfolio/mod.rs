@@ -40,6 +40,7 @@ impl Portfolio {
 
     /// Records a verified entry fill. `price` is the fill's verified execution
     /// price; the USD cost basis comes from `fill.input_value_usd`.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_entry(
         &mut self,
         mint: String,
@@ -314,6 +315,7 @@ mod tests {
                 9,
                 "pos-1".into(),
                 &f,
+                input_value / Decimal::from(out),
                 "sig-1".into(),
                 cost_model(),
             )
@@ -420,6 +422,8 @@ mod tests {
     fn legacy_position_with_no_remaining_is_not_open_for_exits() {
         let mut pf = Portfolio::default();
         pf.load(vec![serde_json::from_str(&serde_json::json!({"mint":"legacy","quantity":"1","entry_price_usd":"1","entry_time":Utc::now(),"entry_signature":"sig","high_water_price_usd":"1","realized_pnl_usd":"0","unrealized_pnl_usd":"0","fees_usd":"0","current_value_usd":"1","signal_id":"signal","exit_reason":null}).to_string()).unwrap()]);
-        assert!(pf.open_positions().is_empty());
+        let p = pf.position("legacy").unwrap();
+        assert!(p.is_open());
+        assert!(p.trusted_remaining().is_none());
     }
 }

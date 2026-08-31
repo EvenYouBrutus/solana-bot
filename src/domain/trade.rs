@@ -61,7 +61,7 @@ impl OrderState {
     /// Fail-closed state machine: an order may only move forward along
     /// auditable paths. Unknown orders may never be silently replaced by a
     /// new submission; they must first become Confirmed/Failed/Expired/Reconciled.
-    pub fn can_transition(self, next: OrderState) -> bool {
+    pub fn can_transition(&self, next: &OrderState) -> bool {
         use OrderState::*;
         matches!(
             (self, next),
@@ -135,7 +135,7 @@ impl OrderRecord {
         if self.state == next {
             return Ok(());
         }
-        if self.state.can_transition(next) {
+        if self.state.can_transition(&next) {
             self.state = next;
             Ok(())
         } else {
@@ -182,7 +182,8 @@ mod tests {
         assert!(o.transition(OrderState::Confirmed).is_ok());
         let mut u = order(OrderState::Unknown);
         assert!(u.transition(OrderState::Failed).is_ok());
-        assert!(u.transition(OrderState::Reconciled).is_ok());
+        let mut u2 = order(OrderState::Unknown);
+        assert!(u2.transition(OrderState::Reconciled).is_ok());
     }
     #[test]
     fn terminal_states_never_transition_and_confirmed_cannot_go_back() {

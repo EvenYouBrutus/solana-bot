@@ -6,7 +6,7 @@
 //! recovered without duplicate trades.
 
 use crate::{
-    config::types::{Config, Mode},
+    config::types::Config,
     data::rpc::RpcPool,
     domain::{
         position::Position,
@@ -18,22 +18,23 @@ use crate::{
         finalize_fill, reconcile_signature, units, ExecutionError, ExecutionRequest, Executor,
         ValueBasis,
     },
+    exit_monitor::{ExitDeps, ExitMonitor},
     portfolio::{ExitOutcome, Portfolio},
-    risk::RiskEngine,
+    risk::{authorize_entry, RiskEngine},
     storage::StateStore,
     strategy::{evaluate_signal, exit_reason, StrategyDecision},
 };
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Explicit, timestamped boundary between a verified collector and this trading
 /// process. A missing/incomplete record is rejected; it is never synthesized.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CandidateInput {
     pub mint: String,
     #[serde(default)]
@@ -49,11 +50,11 @@ pub struct CandidateInput {
     pub costs: CostModel,
 }
 
-pub struct SessionDeps<'a> {
-    pub config: &'a Config,
-    pub store: &'a StateStore,
-    pub executor: &'a dyn Executor,
-    pub rpc: &'a RpcPool,
+pub struct SessionDeps {
+    pub config: Arc<Config>,
+    pub store: Arc<StateStore>,
+    pub executor: Arc<dyn Executor>,
+    pub rpc: Arc<RpcPool>,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -76,7 +77,7 @@ pub fn entries_blocked_by(store: &StateStore) -> Result<bool> {
 /// Marks stale signature-less orders as failed (they were never submitted)
 /// and reconciles orders that carry a signature against the chain. Never
 /// sends a new transaction; it only resolves what already happened.
-pub async fn reconcile_pending_orders(deps: &SessionDeps<'_>) -> Result<ReconcileSummary> {
+pub async fn reconcile_pending_orders(deps: &SessionDeps) -> Result<ReconcileSummary> {
     let mut summary = ReconcileSummary::default();
     let now = Utc::now();
     let live = deps.executor.is_live();
@@ -121,7 +122,7 @@ pub async fn reconcile_pending_orders(deps: &SessionDeps<'_>) -> Result<Reconcil
                     continue;
                 };
                 match reconcile_signature(
-                    deps.rpc,
+                    &deps.rpc,
                     sig,
                     input_mint,
                     output_mint,
@@ -174,7 +175,7 @@ pub async fn reconcile_pending_orders(deps: &SessionDeps<'_>) -> Result<Reconcil
 /// Applies a verified on-chain outcome to an order created in a previous
 /// process. Returns Ok(false) when accounting cannot be completed safely.
 async fn record_reconciled_fill(
-    deps: &SessionDeps<'_>,
+    deps: &SessionDeps,
     order: &OrderRecord,
     outcome: crate::execution::reconcile::ChainSwapOutcome,
     signature: &str,
@@ -246,7 +247,7 @@ async fn record_reconciled_fill(
     apply_confirmed_fill_to_portfolio(
         deps,
         order,
-        &position,
+        position,
         &mut fill,
         token_decimals,
         base_decimals,
@@ -260,14 +261,14 @@ async fn record_reconciled_fill(
 /// Shared accounting for a confirmed fill, whether executed live this session
 /// or reconciled after a restart.
 fn apply_confirmed_fill_to_portfolio(
-    deps: &SessionDeps<'_>,
+    deps: &SessionDeps,
     order: &OrderRecord,
     position: &Position,
     fill: &mut Fill,
     token_decimals: u8,
     base_decimals: u8,
 ) -> Result<()> {
-    let mut portfolio = load_portfolio(deps.store)?;
+    let mut portfolio = load_portfolio(&deps.store)?;
     let result = match order.kind {
         OrderKind::Entry => {
             let cost_model = position
@@ -329,7 +330,7 @@ fn load_portfolio(store: &StateStore) -> Result<Portfolio> {
 
 /// Compares persisted open positions with actual wallet token balances.
 /// Only runs with a live signer; paper positions keep their recorded state.
-pub async fn reconcile_positions_onchain(deps: &SessionDeps<'_>) -> Result<ReconcileSummary> {
+pub async fn reconcile_positions_onchain(deps: &SessionDeps) -> Result<ReconcileSummary> {
     let mut summary = ReconcileSummary::default();
     let Some(owner) = deps.executor.signer_pubkey() else {
         return Ok(summary);
@@ -344,9 +345,10 @@ pub async fn reconcile_positions_onchain(deps: &SessionDeps<'_>) -> Result<Recon
     };
     let by_mint: HashMap<&str, &crate::data::rpc::TokenBalance> =
         balances.iter().map(|b| (b.mint.as_str(), b)).collect();
-    let mut portfolio = load_portfolio(deps.store)?;
+    let mut portfolio = load_portfolio(&deps.store)?;
     for position in portfolio
         .open_positions()
+        .into_iter()
         .map(|p| p.mint.clone())
         .collect::<Vec<_>>()
     {
@@ -392,14 +394,14 @@ pub async fn reconcile_positions_onchain(deps: &SessionDeps<'_>) -> Result<Recon
 }
 
 /// Marks every open position to the price implied by a fresh sell quote.
-fn mark_price_from_quote(
+pub(crate) fn mark_price_from_quote(
     quote_output_atomic: u64,
     base_decimals: u8,
     base_price_usd: Decimal,
     token_remaining_atomic: u64,
     token_decimals: u8,
 ) -> Option<Decimal> {
-    if token_remaining_atomic == 0 {
+    if token_remaining_atomic == 0 || quote_output_atomic == 0 {
         return None;
     }
     let base_units = units(quote_output_atomic, base_decimals).ok()?;
@@ -440,13 +442,13 @@ struct SessionState {
 /// reconciliation, and interlocks all execute here; the executor cannot
 /// bypass the risk layer because it is only ever invoked from this loop.
 pub async fn run_session(
-    deps: SessionDeps<'_>,
+    deps: SessionDeps,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<()> {
-    let config = deps.config;
-    let store = deps.store;
+    let config = &deps.config;
+    let store = &deps.store;
     let mut risk = RiskEngine::new(config.risk.clone(), config.risk.starting_capital_usd);
-    let mut portfolio = load_portfolio(store)?;
+    let portfolio = load_portfolio(store)?;
     risk.state.open_positions = portfolio.open_positions().len();
     let mut state = SessionState {
         portfolio,
@@ -478,18 +480,35 @@ pub async fn run_session(
         tracing::warn!(%reason, "persisted emergency stop is active; entries disabled, manual exits remain available");
     }
 
-    let mut startup = ReconcileSummary::default();
-    if deps.executor.is_live() {
-        startup = run_reconciliation(deps).await?;
+    let startup = if deps.executor.is_live() {
+        run_reconciliation(&deps).await?
     } else {
-        startup = reconcile_pending_orders(deps).await?;
-    }
+        reconcile_pending_orders(&deps).await?
+    };
     if startup.unresolved_orders > 0 || startup.onchain_errors > 0 {
         tracing::error!(
             ?startup,
             "startup reconciliation incomplete; new entries stay blocked until resolved"
         );
     }
+
+    // Spawn the independent exit monitor.  It runs on its own cadence and
+    // loads positions from SQLite, so it is completely decoupled from signal
+    // ingestion and the main session tick.
+    let (exit_shutdown_tx, exit_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let exit_deps = ExitDeps {
+        config: config.clone(),
+        store: store.clone(),
+        executor: deps.executor.clone(),
+        rpc: deps.rpc.clone(),
+    };
+    let exit_interval = config.runtime.poll_interval_secs;
+    let exit_monitor = ExitMonitor::new(exit_deps, exit_interval);
+    let exit_handle = tokio::spawn(async move {
+        if let Err(e) = exit_monitor.run(exit_shutdown_rx).await {
+            tracing::error!(error = %e, "exit monitor terminated with error");
+        }
+    });
 
     let mut shutdown = shutdown;
     let mut last_position_reconcile = std::time::Instant::now();
@@ -503,9 +522,14 @@ pub async fn run_session(
         }
         persist_session_state(store, &state)?;
     }
+
+    // Shut down the exit monitor.
+    let _ = exit_shutdown_tx.send(());
+    let _ = exit_handle.await;
+
     // Final reconciliation pass so shutdown state is auditable.
     if deps.executor.is_live() {
-        match reconcile_pending_orders(deps).await {
+        match reconcile_pending_orders(&deps).await {
             Ok(s) => tracing::info!(?s, "final order reconciliation complete"),
             Err(e) => tracing::error!(error = %e, "final reconciliation failed"),
         }
@@ -513,7 +537,7 @@ pub async fn run_session(
     Ok(())
 }
 
-pub async fn run_reconciliation(deps: &SessionDeps<'_>) -> Result<ReconcileSummary> {
+pub async fn run_reconciliation(deps: &SessionDeps) -> Result<ReconcileSummary> {
     let mut summary = reconcile_pending_orders(deps).await?;
     let pos = reconcile_positions_onchain(deps).await?;
     summary.positions_reconciled += pos.positions_reconciled;
@@ -524,12 +548,12 @@ pub async fn run_reconciliation(deps: &SessionDeps<'_>) -> Result<ReconcileSumma
 }
 
 async fn tick(
-    deps: &SessionDeps<'_>,
+    deps: &SessionDeps,
     state: &mut SessionState,
     last_position_reconcile: &mut std::time::Instant,
 ) -> Result<()> {
-    let config = deps.config;
-    let store = deps.store;
+    let config = &deps.config;
+    let store = &deps.store;
     let now = Utc::now();
 
     // Daily-loss window rollover.
@@ -654,8 +678,8 @@ async fn tick(
     Ok(())
 }
 
-async fn process_exits(deps: &SessionDeps<'_>, state: &mut SessionState) -> Result<()> {
-    let config = deps.config;
+async fn process_exits(deps: &SessionDeps, state: &mut SessionState) -> Result<()> {
+    let config = &deps.config;
     let open: Vec<String> = state
         .portfolio
         .open_positions()
@@ -706,7 +730,10 @@ async fn process_exits(deps: &SessionDeps<'_>, state: &mut SessionState) -> Resu
         else {
             continue;
         };
-        state.portfolio.mark_to_market(&mint, mark)?;
+        state
+            .portfolio
+            .mark_to_market(&mint, mark)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let Some(reason) = exit_reason(
             &position,
             mark,
@@ -718,14 +745,14 @@ async fn process_exits(deps: &SessionDeps<'_>, state: &mut SessionState) -> Resu
         ) else {
             continue;
         };
-        attempt_exit(deps, state, &mint, remaining, &reason, false).await?;
+        attempt_exit(deps, state, &mint, remaining, reason.as_str(), false).await?;
     }
     Ok(())
 }
 
 /// Fresh sell quote establishes the current mark price; no synthetic prices.
 async fn derive_mark(
-    deps: &SessionDeps<'_>,
+    deps: &SessionDeps,
     state: &SessionState,
     mint: &str,
     remaining: u64,
@@ -760,15 +787,15 @@ async fn derive_mark(
 
 #[allow(clippy::too_many_arguments)]
 async fn attempt_exit(
-    deps: &SessionDeps<'_>,
+    deps: &SessionDeps,
     state: &mut SessionState,
     mint: &str,
     remaining: u64,
     reason: &str,
     manual: bool,
 ) -> Result<()> {
-    let config = deps.config;
-    let store = deps.store;
+    let config = &deps.config;
+    let store = &deps.store;
     let now = Utc::now();
     if let Err(e) = state.risk.authorize_exit(remaining) {
         tracing::warn!(mint=%mint, error=%e, "exit refused by risk engine");
@@ -853,7 +880,7 @@ async fn attempt_exit(
     }
     let min_output = quote
         .output_amount
-        .saturating_mul((10_000 - config.execution.slippage_bps as u64) as u64)
+        .saturating_mul(10_000 - config.execution.slippage_bps as u64)
         / 10_000;
     let mut placed = order.clone();
     placed.transition(OrderState::Submitted).ok();
@@ -922,9 +949,9 @@ async fn attempt_exit(
     Ok(())
 }
 
-async fn process_entries(deps: &SessionDeps<'_>, state: &mut SessionState) -> Result<()> {
-    let config = deps.config;
-    let store = deps.store;
+async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result<()> {
+    let config = &deps.config;
+    let store = &deps.store;
     let now = Utc::now();
     let mints: Vec<String> = state.candidates.keys().cloned().collect();
     for mint in mints {
@@ -1041,7 +1068,7 @@ async fn process_entries(deps: &SessionDeps<'_>, state: &mut SessionState) -> Re
         }
         let min_output = quote
             .output_amount
-            .saturating_mul((10_000 - config.execution.slippage_bps as u64) as u64)
+            .saturating_mul(10_000 - config.execution.slippage_bps as u64)
             / 10_000;
         let mut placed = order.clone();
         placed.transition(OrderState::Submitted).ok();
@@ -1134,8 +1161,8 @@ fn persist_session_state(store: &StateStore, state: &SessionState) -> Result<()>
 /// Manual operator exit of every open position with a trusted quantity.
 /// Permitted while the emergency stop is active; still uses the full
 /// execution pipeline and reconciliation.
-pub async fn exit_all_positions(deps: &SessionDeps<'_>) -> Result<usize> {
-    let mut portfolio = load_portfolio(deps.store)?;
+pub async fn exit_all_positions(deps: &SessionDeps) -> Result<usize> {
+    let portfolio = load_portfolio(&deps.store)?;
     let mut exited = 0;
     let open: Vec<String> = portfolio
         .open_positions()
@@ -1188,8 +1215,83 @@ pub fn day_rollover_check(now: DateTime<Utc>, stored_day: &str) -> bool {
 mod tests {
     use super::*;
     use crate::domain::position::{PositionState, ReconciliationStatus};
+    use crate::execution::executor::Quote;
+    use crate::strategy::ExitReason;
     use chrono::Utc;
     use rust_decimal_macros::dec;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn strategy_config() -> crate::config::types::StrategyConfig {
+        crate::config::types::StrategyConfig {
+            base_mint: "SOL".into(),
+            min_wallet_score: dec!(60),
+            min_wallet_samples: 25,
+            min_consensus_wallets: 2,
+            min_signal_score: dec!(65),
+            min_token_age_secs: 86400,
+            stop_loss_pct: dec!(5),
+            take_profit_pct: dec!(12),
+            trailing_stop_pct: dec!(4),
+            max_holding_minutes: 240,
+        }
+    }
+
+    fn test_config() -> Arc<crate::config::types::Config> {
+        use crate::config::types::*;
+        use rust_decimal_macros::dec;
+        Arc::new(Config {
+            mode: Mode::Paper,
+            rpc: RpcConfig {
+                http_endpoints: vec!["https://api.test".into()],
+                websocket_endpoints: vec![],
+                max_data_age_secs: 15,
+                request_timeout_secs: 8,
+                max_attempts: 2,
+                unknown_after_secs: 180,
+            },
+            strategy: strategy_config(),
+            economics: EconomicsConfig {
+                round_trip_cost_threshold_pct: dec!(3),
+                min_expected_net_return_pct: dec!(2),
+                max_quote_age_secs: 3,
+                uncertainty_haircut_pct: dec!(1),
+                sol_price_usd: None,
+            },
+            risk: RiskConfig {
+                starting_capital_usd: dec!(100),
+                max_live_capital_usd: dec!(25),
+                max_concurrent_positions: 1,
+                max_position_percent_of_equity: dec!(5),
+                max_position_percent_of_liquidity: dec!(0.10),
+                max_risk_per_trade_percent: dec!(0.5),
+                max_daily_loss_percent: dec!(2),
+                max_total_drawdown_before_kill_switch_pct: dec!(5),
+                cooldown_after_loss_minutes: 30,
+                max_slippage_bps: 100,
+                min_liquidity_usd: dec!(50000),
+                max_trades_per_day: 3,
+                max_consecutive_failures: 3,
+            },
+            execution: ExecutionConfig {
+                provider: ExecutionProvider::Jupiter,
+                jupiter_api_url: "https://api.jup.ag".into(),
+                slippage_bps: 75,
+                priority_fee_lamports: 10_000,
+                max_fee_lamports: 500_000,
+                max_price_impact_bps: 300,
+                confirm_timeout_secs: 90,
+                confirm_poll_ms: 500,
+                live_signer_env: None,
+                allowed_program_ids: vec![],
+            },
+            storage: StorageConfig {
+                sqlite_path: ":memory:".into(),
+            },
+            runtime: RuntimeConfig::default(),
+            observability: ObservabilityConfig::default(),
+        })
+    }
 
     fn position(remaining: u64, base_price: Decimal) -> Position {
         Position {
@@ -1229,9 +1331,9 @@ mod tests {
     #[test]
     fn mark_price_derives_from_quote_and_base_price() {
         // 1_000_000 tokens (6dp) remaining; sell quote returns 0.5 SOL (9dp);
-        // base (SOL) priced at 150 USD -> token mark = 75 USD / 1000 tokens.
+        // base (SOL) priced at 150 USD -> token mark = 75 USD per token.
         let mark = mark_price_from_quote(500_000_000, 9, dec!(150), 1_000_000, 6).unwrap();
-        assert_eq!(mark, dec!(0.075));
+        assert_eq!(mark, dec!(75));
         assert!(mark_price_from_quote(0, 9, dec!(150), 1_000_000, 6).is_none());
         assert!(mark_price_from_quote(500_000_000, 9, dec!(150), 0, 6).is_none());
     }
@@ -1262,45 +1364,62 @@ mod tests {
     fn exit_reason_with_invalidated_false_evaluates_exit_conditions() {
         let p = position(1_000, dec!(0.00001));
         let now = Utc::now();
-        // Price well below entry -> should trigger stop loss, not SignalInvalidated
+        let strat = strategy_config();
         let reason = exit_reason(
             &p,
-            dec!(0.000005), // 50% below entry
+            dec!(0.000005),
             Decimal::MAX,
-            config::types::Config::default().risk.min_liquidity_usd,
+            dec!(50000),
             false,
             now,
-            &crate::config::types::StrategyConfig::default(),
+            &strat,
         );
         assert_eq!(reason, Some(ExitReason::StopLoss));
     }
-    #[test]
-    fn process_exits_with_empty_candidate_queue_runs_successfully() {
-        use crate::config::types::Config;
-        use crate::domain::position::PositionState;
-        use crate::risk::RiskEngine;
-        use chrono::Utc;
-        use rust_decimal_macros::dec;
-        let config = Config::default();
-        let mock_executor = crate::execution::paper::FakeExecutor::new(
-            |_a: &str, _b: &str, _c: u64, _d: u16| {
-                Ok(crate::execution::executor::Quote {
-                    input_mint: "SOL".into(),
-                    output_mint: "T".into(),
-                    input_amount: _c,
-                    output_amount: 5_000_000u64,
-                    price_impact_bps: 10,
-                    route: serde_json::json!({}),
-                    observed_at: Utc::now(),
-                })
-            },
-            0,
-        );
-        let mut store = crate::storage::StateStore::mock();
+
+    struct MockExecutor;
+    #[async_trait::async_trait]
+    impl Executor for MockExecutor {
+        async fn quote(
+            &self,
+            _input: &str,
+            _output: &str,
+            amount: u64,
+            _slippage: u16,
+        ) -> Result<Quote, ExecutionError> {
+            Ok(Quote {
+                input_mint: "SOL".into(),
+                output_mint: "T".into(),
+                input_amount: amount,
+                output_amount: 5_000_000u64,
+                price_impact_bps: 10,
+                route: serde_json::json!({}),
+                observed_at: Utc::now(),
+            })
+        }
+        async fn execute(
+            &self,
+            _r: ExecutionRequest,
+        ) -> Result<crate::domain::trade::Fill, ExecutionError> {
+            Err(ExecutionError::Unavailable("mock".into()))
+        }
+        async fn health(&self) -> Result<(), ExecutionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn process_exits_with_empty_candidate_queue_runs_successfully() {
+        let config = test_config();
+        let mock_executor = Arc::new(MockExecutor);
+        let store = Arc::new(crate::storage::StateStore::open(":memory:").unwrap());
         let mut portfolio = Portfolio::default();
         let p = position(1_000, dec!(0.00001));
-        portfolio.add_position(p);
-        store.save_position(&portfolio.position("T".into()).unwrap()).unwrap();
+        let stored = vec![p];
+        portfolio.load(stored.clone());
+        store
+            .save_position(portfolio.position("T").unwrap())
+            .unwrap();
         let mut risk = RiskEngine::new(config.risk.clone(), config.risk.starting_capital_usd);
         risk.state.open_positions = 1;
         let mut state = SessionState {
@@ -1311,14 +1430,25 @@ mod tests {
             day_key: Utc::now().date_naive().to_string(),
             emergency_active: false,
         };
+        let rpc = Arc::new(
+            crate::data::rpc::RpcPool::with_attempts(
+                vec!["http://localhost:1".into()],
+                Duration::from_secs(1),
+                1,
+            )
+            .unwrap(),
+        );
         let deps = SessionDeps {
-            config: &config,
-            store: &store,
-            executor: &mock_executor,
-            rpc: &crate::data::rpc::RpcPool,
+            config,
+            store,
+            executor: mock_executor,
+            rpc,
         };
-        let result = process_exits(&deps, &mut state);
-        assert!(result.is_ok(), "process_exits should succeed with empty candidate queue");
+        let result = process_exits(&deps, &mut state).await;
+        assert!(
+            result.is_ok(),
+            "process_exits should succeed with empty candidate queue"
+        );
     }
     #[test]
     fn day_rollover_detects_new_utc_day() {

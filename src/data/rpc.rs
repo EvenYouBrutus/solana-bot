@@ -24,6 +24,7 @@ impl RpcError {
 pub struct RpcPool {
     client: Client,
     endpoints: Vec<String>,
+    #[allow(dead_code)]
     timeout: Duration,
     max_attempts: u32,
 }
@@ -68,7 +69,7 @@ impl RpcPool {
     }
     pub fn with_attempts(
         endpoints: Vec<String>,
-        timeout: Duration,
+        #[allow(dead_code)] timeout: Duration,
         max_attempts: u32,
     ) -> Result<Self, RpcError> {
         let client = Client::builder().timeout(timeout).build()?;
@@ -200,7 +201,7 @@ mod tests {
     #[test]
     fn availability_errors_are_not_failure_evidence() {
         assert!(RpcError::Unavailable("x".into()).is_availability());
-        assert!(RpcError::Invalid("x".into()).is_availability() == false);
+        assert!(!RpcError::Invalid("x".into()).is_availability());
     }
     #[test]
     fn clone_preserves_configured_endpoints() {

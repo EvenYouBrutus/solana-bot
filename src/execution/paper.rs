@@ -1,4 +1,4 @@
-use super::{ExecutionError, ExecutionRequest, Executor, Quote, ValueBasis};
+use super::{ExecutionError, ExecutionRequest, Executor, Quote};
 use crate::domain::trade::Fill;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -37,7 +37,7 @@ impl<E: Executor> Executor for PaperExecutor<E> {
         {
             return Err(ExecutionError::InvalidQuote);
         }
-        let haircut = (10_000u64.saturating_sub(self.fill_haircut_bps as u64)) as u64;
+        let haircut = 10_000u64.saturating_sub(self.fill_haircut_bps as u64);
         let output = r.quote.output_amount.saturating_mul(haircut) / 10_000;
         if output < r.min_output_amount {
             return Err(ExecutionError::InvalidQuote);

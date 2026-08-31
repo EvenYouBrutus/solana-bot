@@ -10,6 +10,23 @@ pub enum ExitReason {
     LiquidityDeterioration,
     SignalInvalidated,
 }
+impl ExitReason {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::StopLoss => "stop_loss",
+            Self::TakeProfit => "take_profit",
+            Self::TrailingStop => "trailing_stop",
+            Self::TimeLimit => "time_limit",
+            Self::LiquidityDeterioration => "liquidity_deterioration",
+            Self::SignalInvalidated => "signal_invalidated",
+        }
+    }
+}
+impl std::fmt::Display for ExitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 pub fn exit_reason(
     p: &Position,
     price: Decimal,

@@ -14,7 +14,7 @@ use rust_decimal_macros::dec;
 use uuid::Uuid;
 #[derive(Debug)]
 pub enum StrategyDecision {
-    Accepted(TradeSignal),
+    Accepted(Box<TradeSignal>),
     Rejected(String),
 }
 pub fn evaluate_signal(
@@ -88,7 +88,7 @@ pub fn evaluate_signal(
     if score.final_signal_score < config.strategy.min_signal_score {
         return StrategyDecision::Rejected("signal confidence below threshold".into());
     }
-    StrategyDecision::Accepted(TradeSignal {
+    StrategyDecision::Accepted(Box::new(TradeSignal {
         id: Uuid::new_v4().to_string(),
         mint: mint.into(),
         wallets: wallets.iter().map(|w| w.wallet.clone()).collect(),
@@ -97,5 +97,5 @@ pub fn evaluate_signal(
         expected_gross_return_pct: expected.gross_return_pct,
         created_at: now,
         reason: "qualified-wallet accumulation with liquid safe market".into(),
-    })
+    }))
 }

@@ -1,7 +1,6 @@
 use super::reconcile::parse_swap_transaction;
 use super::{
     policy::validate_provider_transaction, ExecutionError, ExecutionRequest, Executor, Quote,
-    ValueBasis,
 };
 use crate::{data::rpc::RpcPool, domain::trade::Fill};
 use async_trait::async_trait;
@@ -34,6 +33,7 @@ pub struct JupiterExecutor {
     confirm_poll: StdDuration,
 }
 impl JupiterExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         api_url: String,
         rpc: RpcPool,
@@ -69,7 +69,7 @@ impl JupiterExecutor {
         let bytes: Vec<u8> = serde_json::from_str(&raw).map_err(|_| {
             ExecutionError::Unavailable("live signer must be a JSON byte array".into())
         })?;
-        Keypair::from_bytes(&bytes)
+        Keypair::try_from(bytes.as_slice())
             .map_err(|_| ExecutionError::Unavailable("invalid signer keypair".into()))
     }
     /// RPC submission errors that are deterministic refusals. The node has

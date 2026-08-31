@@ -1,6 +1,6 @@
 use crate::domain::{
     position::Position,
-    trade::{Fill, OrderRecord, OrderState},
+    trade::{Fill, OrderRecord},
     wallet::WalletStats,
 };
 use chrono::Utc;
@@ -65,8 +65,11 @@ impl StateStore {
     pub fn positions(&self) -> Result<Vec<Position>, StorageError> {
         let c = self.conn()?;
         let mut st = c.prepare("SELECT value FROM kv WHERE key LIKE 'position:%'")?;
-        st.query_map([], |r| r.get::<_, String>(0))?
-            .map(|v| serde_json::from_str(&v?).map_err(StorageError::from))
+        let rows: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|v| serde_json::from_str(&v).map_err(StorageError::from))
             .collect()
     }
     pub fn save_fill(&self, fill: &Fill) -> Result<(), StorageError> {
@@ -157,15 +160,21 @@ impl StateStore {
         let mut st = c.prepare(
             "SELECT payload FROM orders WHERE state IN ('Pending','Submitted','Unknown')",
         )?;
-        st.query_map([], |r| r.get::<_, String>(0))?
-            .map(|x| serde_json::from_str(&x?).map_err(StorageError::from))
+        let rows: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|x| serde_json::from_str(&x).map_err(StorageError::from))
             .collect()
     }
     pub fn orders(&self) -> Result<Vec<OrderRecord>, StorageError> {
         let c = self.conn()?;
         let mut st = c.prepare("SELECT payload FROM orders ORDER BY updated_at")?;
-        st.query_map([], |r| r.get::<_, String>(0))?
-            .map(|x| serde_json::from_str(&x?).map_err(StorageError::from))
+        let rows: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|x| serde_json::from_str(&x).map_err(StorageError::from))
             .collect()
     }
     pub fn fill_for_order(&self, order_id: &str) -> Result<Option<Fill>, StorageError> {
@@ -223,7 +232,7 @@ mod tests {
     use crate::{
         domain::{
             position::Position,
-            trade::{OrderKind, OrderSide},
+            trade::{OrderKind, OrderSide, OrderState},
         },
         economics::{BreakEvenInputs, CostModel},
     };
