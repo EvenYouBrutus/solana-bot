@@ -64,7 +64,13 @@ impl StateStore {
     }
     pub fn positions(&self) -> Result<Vec<Position>, StorageError> {
         let c = self.conn()?;
-        let mut st = c.prepare("SELECT value FROM kv WHERE key LIKE 'position:%'")?;
+        Self::positions_from_conn(&c)
+    }
+    /// Read all positions directly from a raw connection.  Used inside
+    /// `run_in_transaction` where the mutex is already held and re-entrancy
+    /// would deadlock.
+    pub fn positions_from_conn(conn: &Connection) -> Result<Vec<Position>, StorageError> {
+        let mut st = conn.prepare("SELECT value FROM kv WHERE key LIKE 'position:%'")?;
         let rows: Vec<String> = st
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;

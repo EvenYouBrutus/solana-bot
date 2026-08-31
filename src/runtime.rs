@@ -85,7 +85,17 @@ pub async fn reconcile_pending_orders(deps: &SessionDeps) -> Result<ReconcileSum
     for order in deps.store.incomplete_orders()? {
         let age = now - order.created_at;
         match (&order.signature, live) {
-            (None, _) => {
+            (None, false) => {
+                // Paper mode: orders without signatures were never submitted
+                // on-chain and can never appear there.  Fail them immediately
+                // so they don't block subsequent entries.
+                let mut o = order.clone();
+                o.error = Some("paper order never completed execution".into());
+                o.transition(OrderState::Failed).unwrap_or_else(|e| tracing::error!(order_id=%o.id, %e, "state machine blocked failure marking"));
+                deps.store.update_order(&o)?;
+                summary.failed_orders += 1;
+            }
+            (None, true) => {
                 if age > Duration::seconds(deps.config.rpc.unknown_after_secs) {
                     let mut o = order.clone();
                     o.error = Some("order expired without ever being submitted".into());
@@ -221,7 +231,7 @@ pub(crate) async fn record_reconciled_fill(
     ) else {
         return Ok(false);
     };
-    let mut fill = Fill {
+    let fill = Fill {
         order_id: order.id.clone(),
         signature: signature.to_string(),
         input_amount: outcome.input_amount,
@@ -249,15 +259,60 @@ pub(crate) async fn record_reconciled_fill(
             rusqlite::params![fill.order_id, fill_json, Utc::now().to_rfc3339()],
         )?;
 
-        // Apply to portfolio and save position.
-        apply_confirmed_fill_to_portfolio(
-            deps,
-            order,
-            position,
-            &mut fill,
-            token_decimals,
-            base_decimals,
-        )?;
+        // Load fresh portfolio directly from the connection (avoids deadlock).
+        let mut tx_portfolio = load_portfolio_from_conn(conn)?;
+        let result = match order.kind {
+            OrderKind::Entry => {
+                let cost_model = position
+                    .entry_cost_model
+                    .clone()
+                    .unwrap_or_else(|| CostModel {
+                        observed_at: Utc::now(),
+                        source: "reconciled".into(),
+                        is_live_snapshot: false,
+                        input: crate::economics::BreakEvenInputs {
+                            position_size_usd: Decimal::ONE,
+                            avg_priority_fee_usd: Decimal::ZERO,
+                            avg_swap_fee_bps: Decimal::ZERO,
+                            avg_slippage_bps: Decimal::ZERO,
+                            avg_price_impact_bps: Decimal::ZERO,
+                            failed_tx_rate: Decimal::ZERO,
+                            avg_failed_tx_cost_usd: Decimal::ZERO,
+                            assumed_win_loss_ratio: Decimal::ONE,
+                            assumed_avg_loss_pct: Decimal::ONE,
+                        },
+                    });
+                tx_portfolio.apply_entry(
+                    order.mint.clone(),
+                    position.base_mint.clone().unwrap_or_default(),
+                    token_decimals,
+                    base_decimals,
+                    order.position_id.clone().unwrap_or_default(),
+                    &fill,
+                    price_usd,
+                    order.signal_id.clone(),
+                    cost_model,
+                )
+            }
+            _ => tx_portfolio
+                .apply_exit(
+                    &order.mint,
+                    &fill,
+                    order.error.as_deref().unwrap_or("reconciled"),
+                    Utc::now(),
+                )
+                .map(|_| ()),
+        };
+        result.map_err(|e| anyhow::anyhow!(e))?;
+
+        // Save updated position directly via the connection.
+        if let Some(p) = tx_portfolio.position(&order.mint) {
+            let pos_json = serde_json::to_string(p)?;
+            conn.execute(
+                "INSERT INTO kv(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                rusqlite::params![format!("position:{}", p.mint), pos_json, Utc::now().to_rfc3339()],
+            )?;
+        }
 
         // Update order to Confirmed.
         let mut o = order.clone();
@@ -278,73 +333,17 @@ pub(crate) async fn record_reconciled_fill(
     Ok(true)
 }
 
-/// Shared accounting for a confirmed fill, whether executed live this session
-/// or reconciled after a restart.
-fn apply_confirmed_fill_to_portfolio(
-    deps: &SessionDeps,
-    order: &OrderRecord,
-    position: &Position,
-    fill: &mut Fill,
-    token_decimals: u8,
-    base_decimals: u8,
-) -> Result<()> {
-    let mut portfolio = load_portfolio(&deps.store)?;
-    let result = match order.kind {
-        OrderKind::Entry => {
-            let cost_model = position
-                .entry_cost_model
-                .clone()
-                .unwrap_or_else(|| CostModel {
-                    observed_at: Utc::now(),
-                    source: "reconciled".into(),
-                    is_live_snapshot: false,
-                    input: crate::economics::BreakEvenInputs {
-                        position_size_usd: Decimal::ONE,
-                        avg_priority_fee_usd: Decimal::ZERO,
-                        avg_swap_fee_bps: Decimal::ZERO,
-                        avg_slippage_bps: Decimal::ZERO,
-                        avg_price_impact_bps: Decimal::ZERO,
-                        failed_tx_rate: Decimal::ZERO,
-                        avg_failed_tx_cost_usd: Decimal::ZERO,
-                        assumed_win_loss_ratio: Decimal::ONE,
-                        assumed_avg_loss_pct: Decimal::ONE,
-                    },
-                });
-            portfolio.apply_entry(
-                order.mint.clone(),
-                position.base_mint.clone().unwrap_or_default(),
-                token_decimals,
-                base_decimals,
-                order.position_id.clone().unwrap_or_default(),
-                fill,
-                fill.price_usd,
-                order.signal_id.clone(),
-                cost_model,
-            )
-        }
-        _ => portfolio
-            .apply_exit(
-                &order.mint,
-                fill,
-                order.error.as_deref().unwrap_or("reconciled"),
-                Utc::now(),
-            )
-            .map(|_| ()),
-    };
-    match result {
-        Ok(()) => {
-            if let Some(p) = portfolio.position(&order.mint) {
-                deps.store.save_position(p)?;
-            }
-            Ok(())
-        }
-        Err(e) => Err(anyhow::anyhow!(e)),
-    }
-}
-
 fn load_portfolio(store: &StateStore) -> Result<Portfolio> {
     let mut portfolio = Portfolio::default();
     portfolio.load(store.positions()?);
+    Ok(portfolio)
+}
+
+/// Load portfolio directly from a raw SQLite connection.  Used inside
+/// `run_in_transaction` where the store mutex is already held.
+fn load_portfolio_from_conn(conn: &rusqlite::Connection) -> Result<Portfolio> {
+    let mut portfolio = Portfolio::default();
+    portfolio.load(StateStore::positions_from_conn(conn)?);
     Ok(portfolio)
 }
 
@@ -629,8 +628,8 @@ pub(crate) async fn execute_exit_order(
                     rusqlite::params![fill.order_id, fill_json, Utc::now().to_rfc3339()],
                 )?;
 
-                // Load fresh portfolio from store (within the same connection/transaction).
-                let mut tx_portfolio = load_portfolio(store)?;
+                // Load fresh portfolio directly from the connection (avoids deadlock).
+                let mut tx_portfolio = load_portfolio_from_conn(conn)?;
                 // Sync with stored position data.
                 if let Some(fresh_pos) = stored.iter().find(|p| p.mint == mint) {
                     tx_portfolio.sync_position(fresh_pos.clone());
@@ -1332,8 +1331,8 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                         rusqlite::params![fill.order_id, fill_json, Utc::now().to_rfc3339()],
                     )?;
 
-                    // Load fresh portfolio and apply entry.
-                    let mut tx_portfolio = load_portfolio(store)?;
+                    // Load fresh portfolio directly from the connection (avoids deadlock).
+                    let mut tx_portfolio = load_portfolio_from_conn(conn)?;
                     tx_portfolio.apply_entry(
                         mint.clone(),
                         config.strategy.base_mint.clone(),

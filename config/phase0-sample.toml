@@ -1,7 +1,8 @@
+mode = "paper"
+
 # A conservative provisional scenario, not a live-trading authorization.
 # rust_decimal's string encoding avoids binary floating-point money values.
 position_size_usd = "10"
-# Base + selected priority fee per submitted attempt. Refresh before each run.
 avg_priority_fee_usd = "0.002"
 avg_swap_fee_bps = "30"
 avg_slippage_bps = "100"
