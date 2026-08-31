@@ -142,6 +142,11 @@ pub struct RuntimeConfig {
     /// a LiquidityDeterioration exit). Zero disables staleness checks.
     #[serde(default = "default_max_liquidity_age")]
     pub max_liquidity_age_secs: u64,
+    /// How long (seconds) to reuse a sell quote for mark-to-market pricing
+    /// in the exit monitor before requesting a fresh one. Reduces Jupiter API
+    /// pressure and429 rate limiting. Zero means always fetch a fresh quote.
+    #[serde(default = "default_quote_cache_ttl")]
+    pub quote_cache_ttl_secs: u64,
     /// Collector configuration for Phase 1
     #[serde(default = "default_collector")]
     pub collector: CollectorConfig,
@@ -217,6 +222,9 @@ fn default_reconcile_interval() -> u64 {
 fn default_max_liquidity_age() -> u64 {
     300
 }
+fn default_quote_cache_ttl() -> u64 {
+    30
+}
 
 impl Default for ObservabilityConfig {
     fn default() -> Self {
@@ -233,6 +241,7 @@ impl Default for RuntimeConfig {
             paper_fill_haircut_bps: default_paper_haircut(),
             reconcile_interval_secs: default_reconcile_interval(),
             max_liquidity_age_secs: default_max_liquidity_age(),
+            quote_cache_ttl_secs: default_quote_cache_ttl(),
             collector: default_collector(),
         }
     }

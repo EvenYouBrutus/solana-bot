@@ -15,8 +15,20 @@ use solana_sdk::{
 };
 use std::{
     env,
+    sync::{Arc, Mutex},
     time::{Duration as StdDuration, Instant},
 };
+
+/// Rate-limit state shared across all quote/execute calls on the same
+/// executor instance.  Protected by a mutex so concurrent tasks (main
+/// session + exit monitor) observe a single backoff window.
+#[derive(Debug, Clone, Default)]
+struct RateLimitState {
+    /// If set, no requests should be attempted until this instant.
+    backoff_until: Option<Instant>,
+    /// Counter for exponential backoff: 2^consecutive seconds, capped at 64.
+    consecutive_429s: u32,
+}
 
 /// Real Jupiter v6 swap execution: fresh quote, provider transaction
 /// validation, signing, submission, bounded confirmation polling, and
@@ -33,6 +45,7 @@ pub struct JupiterExecutor {
     priority_fee_lamports: u64,
     confirm_timeout: StdDuration,
     confirm_poll: StdDuration,
+    rate_limit: Arc<Mutex<RateLimitState>>,
 }
 impl JupiterExecutor {
     #[allow(clippy::too_many_arguments)]
@@ -64,6 +77,7 @@ impl JupiterExecutor {
             priority_fee_lamports,
             confirm_timeout: StdDuration::from_secs(confirm_timeout_secs),
             confirm_poll: StdDuration::from_millis(confirm_poll_ms),
+            rate_limit: Arc::new(Mutex::new(RateLimitState::default())),
         })
     }
     fn signer(&self) -> Result<Keypair, ExecutionError> {
@@ -118,6 +132,31 @@ impl JupiterExecutor {
             )));
         }
         Ok(())
+    }
+    /// Check whether the rate limiter is currently active. If so, returns
+    /// the remaining backoff duration.
+    fn rate_limit_remaining(&self) -> Option<StdDuration> {
+        let rl = self.rate_limit.lock().ok()?;
+        rl.backoff_until
+            .and_then(|until| until.checked_duration_since(Instant::now()))
+    }
+    /// Record a 429 response and update the backoff state.  Returns the
+    /// backoff duration the caller should wait before retrying.
+    fn record_rate_limit(&self, retry_after: Option<u64>) -> StdDuration {
+        let mut rl = self.rate_limit.lock().unwrap_or_else(|e| e.into_inner());
+        rl.consecutive_429s = rl.consecutive_429s.saturating_add(1);
+        // Exponential backoff: 2^n seconds, capped at 64.
+        let base = 2u64.saturating_pow(rl.consecutive_429s.min(6));
+        let secs = retry_after.unwrap_or(base).min(120);
+        rl.backoff_until = Some(Instant::now() + StdDuration::from_secs(secs));
+        StdDuration::from_secs(secs)
+    }
+    /// Clear the rate limiter backoff (called after a successful request).
+    fn clear_rate_limit(&self) {
+        if let Ok(mut rl) = self.rate_limit.lock() {
+            rl.consecutive_429s = 0;
+            rl.backoff_until = None;
+        }
     }
     /// RPC submission errors that are deterministic refusals. The node has
     /// not relayed the transaction, so treating these as `Failed` cannot
@@ -239,6 +278,13 @@ impl Executor for JupiterExecutor {
                 "quote amount must be non-zero".into(),
             ));
         }
+        // Respect active rate-limit backoff.
+        if let Some(remaining) = self.rate_limit_remaining() {
+            return Err(ExecutionError::Unavailable(format!(
+                "Jupiter rate-limited; retry in {}s",
+                remaining.as_secs()
+            )));
+        }
         let url = format!("{}/swap/v1/quote", self.api_url);
         let mut req = self.client.get(url).query(&[
             ("inputMint", input),
@@ -250,15 +296,31 @@ impl Executor for JupiterExecutor {
         if let Some(key) = self.api_key()? {
             req = req.header("x-api-key", key);
         }
-        let v: Value = req
+        let resp = req
             .send()
             .await
-            .map_err(|e| ExecutionError::Quote(e.to_string()))?
+            .map_err(|e| ExecutionError::Quote(e.to_string()))?;
+        // Handle 429 Too Many Requests with exponential backoff.
+        if resp.status().as_u16() == 429 {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            let backoff = self.record_rate_limit(retry_after);
+            return Err(ExecutionError::Unavailable(format!(
+                "Jupiter HTTP 429 rate-limited; backing off {}s",
+                backoff.as_secs()
+            )));
+        }
+        let v: Value = resp
             .error_for_status()
             .map_err(|e| ExecutionError::Quote(e.to_string()))?
             .json()
             .await
             .map_err(|e| ExecutionError::Quote(e.to_string()))?;
+        // Successful request: clear any rate-limit backoff.
+        self.clear_rate_limit();
         let parse = |n: &str| {
             v[n].as_str()
                 .ok_or_else(|| ExecutionError::Quote(format!("missing {n}")))
@@ -315,18 +377,35 @@ impl Executor for JupiterExecutor {
         // This catches excessive fees before signing; the post-confirmation
         // verify_onchain_fee() provides an additional safety net.
         Self::verify_presubmission_fee(self.priority_fee_lamports, self.max_fee_lamports)?;
-        let swap: Value = self
-            .client
-            .post(format!("{}/swap/v1/swap", self.api_url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ExecutionError::Transaction(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| ExecutionError::Transaction(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| ExecutionError::Transaction(e.to_string()))?;
+        let swap: Value = {
+            let resp = self
+                .client
+                .post(format!("{}/swap/v1/swap", self.api_url))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ExecutionError::Transaction(e.to_string()))?;
+            // Handle 429 Too Many Requests with exponential backoff.
+            if resp.status().as_u16() == 429 {
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                let backoff = self.record_rate_limit(retry_after);
+                return Err(ExecutionError::Unavailable(format!(
+                    "Jupiter swap HTTP 429 rate-limited; backing off {}s",
+                    backoff.as_secs()
+                )));
+            }
+            resp.error_for_status()
+                .map_err(|e| ExecutionError::Transaction(e.to_string()))?
+                .json()
+                .await
+                .map_err(|e| ExecutionError::Transaction(e.to_string()))?
+        };
+        // Successful request: clear any rate-limit backoff.
+        self.clear_rate_limit();
         let encoded = swap["swapTransaction"]
             .as_str()
             .ok_or_else(|| ExecutionError::Transaction("provider omitted transaction".into()))?;
@@ -486,6 +565,7 @@ mod tests {
             priority_fee_lamports: 10_000,
             confirm_timeout: StdDuration::from_secs(90),
             confirm_poll: StdDuration::from_millis(500),
+            rate_limit: Arc::new(Mutex::new(RateLimitState::default())),
         };
         assert!(jup.api_key().unwrap().is_none());
     }
@@ -528,5 +608,127 @@ mod tests {
         assert!(JupiterExecutor::verify_presubmission_fee(0, 50_000).is_ok());
         // priority 10_000 + base 5_000 = 15_000, cap 10_000: rejected
         assert!(JupiterExecutor::verify_presubmission_fee(10_000, 10_000).is_err());
+    }
+
+    // --- Regression tests for HTTP 429 / rate-limit backoff ---
+
+    #[test]
+    fn rate_limit_backoff_increases_exponentially() {
+        let rpc = crate::data::rpc::RpcPool::with_attempts(
+            vec!["http://localhost:1".into()],
+            StdDuration::from_millis(100),
+            1,
+        )
+        .unwrap();
+        let jup = JupiterExecutor {
+            client: Client::new(),
+            api_url: "https://api.jup.ag".into(),
+            rpc,
+            signer_env: None,
+            api_key_env: None,
+            max_quote_age_secs: 3,
+            max_fee_lamports: 500_000,
+            allowed_program_ids: vec![],
+            priority_fee_lamports: 10_000,
+            confirm_timeout: StdDuration::from_secs(90),
+            confirm_poll: StdDuration::from_millis(500),
+            rate_limit: Arc::new(Mutex::new(RateLimitState::default())),
+        };
+        // No backoff initially.
+        assert!(jup.rate_limit_remaining().is_none());
+        // First 429: backoff = 2^1 = 2s.
+        let d1 = jup.record_rate_limit(None);
+        assert_eq!(d1.as_secs(), 2);
+        assert!(jup.rate_limit_remaining().is_some());
+        // Second 429: backoff = 2^2 = 4s.
+        let d2 = jup.record_rate_limit(None);
+        assert_eq!(d2.as_secs(), 4);
+        // Third 429: backoff = 2^3 = 8s.
+        let d3 = jup.record_rate_limit(None);
+        assert_eq!(d3.as_secs(), 8);
+    }
+
+    #[test]
+    fn rate_limit_respects_retry_after_header() {
+        let rpc = crate::data::rpc::RpcPool::with_attempts(
+            vec!["http://localhost:1".into()],
+            StdDuration::from_millis(100),
+            1,
+        )
+        .unwrap();
+        let jup = JupiterExecutor {
+            client: Client::new(),
+            api_url: "https://api.jup.ag".into(),
+            rpc,
+            signer_env: None,
+            api_key_env: None,
+            max_quote_age_secs: 3,
+            max_fee_lamports: 500_000,
+            allowed_program_ids: vec![],
+            priority_fee_lamports: 10_000,
+            confirm_timeout: StdDuration::from_secs(90),
+            confirm_poll: StdDuration::from_millis(500),
+            rate_limit: Arc::new(Mutex::new(RateLimitState::default())),
+        };
+        // Retry-After: 30 seconds overrides exponential backoff.
+        let d = jup.record_rate_limit(Some(30));
+        assert_eq!(d.as_secs(), 30);
+    }
+
+    #[test]
+    fn rate_limit_capped_at_120_seconds() {
+        let rpc = crate::data::rpc::RpcPool::with_attempts(
+            vec!["http://localhost:1".into()],
+            StdDuration::from_millis(100),
+            1,
+        )
+        .unwrap();
+        let jup = JupiterExecutor {
+            client: Client::new(),
+            api_url: "https://api.jup.ag".into(),
+            rpc,
+            signer_env: None,
+            api_key_env: None,
+            max_quote_age_secs: 3,
+            max_fee_lamports: 500_000,
+            allowed_program_ids: vec![],
+            priority_fee_lamports: 10_000,
+            confirm_timeout: StdDuration::from_secs(90),
+            confirm_poll: StdDuration::from_millis(500),
+            rate_limit: Arc::new(Mutex::new(RateLimitState::default())),
+        };
+        // Retry-After: 300 seconds should be capped at 120.
+        let d = jup.record_rate_limit(Some(300));
+        assert_eq!(d.as_secs(), 120);
+    }
+
+    #[test]
+    fn rate_limit_clears_on_success() {
+        let rpc = crate::data::rpc::RpcPool::with_attempts(
+            vec!["http://localhost:1".into()],
+            StdDuration::from_millis(100),
+            1,
+        )
+        .unwrap();
+        let jup = JupiterExecutor {
+            client: Client::new(),
+            api_url: "https://api.jup.ag".into(),
+            rpc,
+            signer_env: None,
+            api_key_env: None,
+            max_quote_age_secs: 3,
+            max_fee_lamports: 500_000,
+            allowed_program_ids: vec![],
+            priority_fee_lamports: 10_000,
+            confirm_timeout: StdDuration::from_secs(90),
+            confirm_poll: StdDuration::from_millis(500),
+            rate_limit: Arc::new(Mutex::new(RateLimitState::default())),
+        };
+        // Simulate rate limit.
+        jup.record_rate_limit(None);
+        assert!(jup.rate_limit_remaining().is_some());
+        // Clear on success.
+        jup.clear_rate_limit();
+        assert!(jup.rate_limit_remaining().is_none());
     }
 }

@@ -13,7 +13,7 @@ use crate::{
         position::{Position, PositionState},
         trade::{OrderKind, OrderState},
     },
-    execution::{reconcile_signature, units, ExecutionError, Executor},
+    execution::{reconcile_signature, units, ExecutionError, Executor, Quote},
     portfolio::Portfolio,
     runtime::{record_reconciled_fill, SessionDeps},
     storage::StateStore,
@@ -22,7 +22,11 @@ use crate::{
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use rust_decimal::Decimal;
-use std::{sync::Arc, time::Duration as StdDuration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration as StdDuration, Instant},
+};
 
 /// Shared, `Send + Sync` dependencies for the exit monitor.  All inner types
 /// are reference-counted so the monitor can own its copies while the main
@@ -39,6 +43,8 @@ pub struct ExitDeps {
 pub struct ExitMonitor {
     deps: ExitDeps,
     poll_interval: StdDuration,
+    /// Cache of sell quotes keyed by mint: (Quote, when_fetched).
+    quote_cache: HashMap<String, (Quote, Instant)>,
 }
 
 impl ExitMonitor {
@@ -46,12 +52,34 @@ impl ExitMonitor {
         Self {
             deps,
             poll_interval: StdDuration::from_secs(poll_interval_secs.max(1)),
+            quote_cache: HashMap::new(),
         }
+    }
+
+    /// Returns a cached quote if it is still fresh ( younger than
+    /// `quote_cache_ttl_secs` from the config).
+    fn cached_quote(&self, mint: &str) -> Option<&Quote> {
+        let ttl = self.deps.config.runtime.quote_cache_ttl_secs;
+        if ttl == 0 {
+            return None;
+        }
+        self.quote_cache.get(mint).and_then(|(q, when)| {
+            if when.elapsed() < StdDuration::from_secs(ttl) {
+                Some(q)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Store a fresh quote in the cache.
+    fn cache_quote(&mut self, mint: String, quote: Quote) {
+        self.quote_cache.insert(mint, (quote, Instant::now()));
     }
 
     /// Runs until `shutdown` fires.  Each cycle: load state → evaluate exits →
     /// execute triggered exits → reconcile stuck orders.
-    pub async fn run(&self, mut shutdown: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
+    pub async fn run(&mut self, mut shutdown: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
         tracing::info!("exit monitor started");
         loop {
             tokio::select! {
@@ -70,10 +98,12 @@ impl ExitMonitor {
 
     /// Single evaluation cycle: reconcile pending orders, load positions, mark
     /// to market, evaluate exit reasons, and execute any triggered exits.
-    async fn tick(&self) -> Result<()> {
-        let store = &*self.deps.store;
-        let executor = &*self.deps.executor;
-        let config = &*self.deps.config;
+    async fn tick(&mut self) -> Result<()> {
+        // Clone Arc references so we don't hold a borrow on `self` during
+        // the loop (needed for `self.cache_quote()` to work).
+        let store = self.deps.store.clone();
+        let executor = self.deps.executor.clone();
+        let config = self.deps.config.clone();
         let _now = Utc::now();
 
         // 1. Reconcile any orders stuck in Unknown/Pending before evaluating
@@ -110,7 +140,7 @@ impl ExitMonitor {
                 continue;
             };
             // Skip if an exit order is already in flight for this position.
-            if has_inflight_exit(store, &position)? {
+            if has_inflight_exit(&store, &position)? {
                 continue;
             }
             let Some(base_price) = position.base_entry_price_usd else {
@@ -121,33 +151,56 @@ impl ExitMonitor {
             else {
                 continue;
             };
-            // Derive mark price from a fresh sell quote.
+            // Derive mark price from a fresh sell quote (or cached one).
             let base_mint = match position.base_mint.as_deref() {
                 Some(m) => m.to_string(),
                 None => continue,
             };
-            let mark = match executor
-                .quote(&mint, &base_mint, remaining, config.execution.slippage_bps)
-                .await
-            {
-                Ok(q) => {
-                    let base_units = match units(q.output_amount, base_decimals) {
-                        Ok(u) => u,
-                        Err(_) => continue,
-                    };
-                    let token_units = match units(remaining, token_decimals) {
-                        Ok(u) => u,
-                        Err(_) => continue,
-                    };
-                    if token_units.is_zero() {
-                        continue;
-                    }
-                    base_units * base_price / token_units
-                }
-                Err(e) => {
-                    tracing::warn!(mint=%mint, error=%e, "exit monitor: quote unavailable; skipping");
+            let mut fresh_quote: Option<(String, Quote)> = None;
+            let mark = if let Some(cached) = self.cached_quote(&mint) {
+                // Use cached quote for mark-to-market.
+                let base_units = match units(cached.output_amount, base_decimals) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let token_units = match units(remaining, token_decimals) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                if token_units.is_zero() {
                     continue;
                 }
+                Some(base_units * base_price / token_units)
+            } else {
+                match executor
+                    .quote(&mint, &base_mint, remaining, config.execution.slippage_bps)
+                    .await
+                {
+                    Ok(q) => {
+                        let base_units = match units(q.output_amount, base_decimals) {
+                            Ok(u) => u,
+                            Err(_) => continue,
+                        };
+                        let token_units = match units(remaining, token_decimals) {
+                            Ok(u) => u,
+                            Err(_) => continue,
+                        };
+                        if token_units.is_zero() {
+                            continue;
+                        }
+                        let mark_price = base_units * base_price / token_units;
+                        // Save fresh quote to cache after store usage.
+                        fresh_quote = Some((mint.clone(), q));
+                        Some(mark_price)
+                    }
+                    Err(e) => {
+                        tracing::warn!(mint=%mint, error=%e, "exit monitor: quote unavailable; skipping");
+                        None
+                    }
+                }
+            };
+            let Some(mark) = mark else {
+                continue;
             };
 
             // Mark to market and persist.
@@ -156,6 +209,10 @@ impl ExitMonitor {
             }
             if let Some(p) = portfolio.position(&mint) {
                 let _ = store.save_position(p);
+            }
+            // Store the fresh quote in the cache now that the store borrow is released.
+            if let Some((mint_str, quote)) = fresh_quote {
+                self.cache_quote(mint_str, quote);
             }
 
             // Load persisted liquidity evidence (None = missing → exit,
@@ -214,9 +271,9 @@ impl ExitMonitor {
 
             // Use the shared execution path.
             let result = crate::runtime::execute_exit_order(
-                executor,
-                store,
-                config,
+                &*executor,
+                &store,
+                &config,
                 &mint,
                 reason.as_str(),
                 &mut portfolio,
@@ -1138,5 +1195,211 @@ mod tests {
         store.reserve_order(&order).unwrap();
         // has_inflight_exit detects the in-flight order.
         assert!(has_inflight_exit(&store, &pos).unwrap());
+    }
+
+    // --- Regression tests for quote caching and recovery ---
+
+    #[test]
+    fn quote_cache_returns_fresh_quote() {
+        let store = StateStore::open(":memory:").unwrap();
+        let deps = ExitDeps {
+            config: Arc::new(crate::config::types::Config {
+                mode: crate::config::types::Mode::Paper,
+                rpc: crate::config::types::RpcConfig {
+                    http_endpoints: vec!["https://api.test".into()],
+                    websocket_endpoints: vec![],
+                    max_data_age_secs: 15,
+                    request_timeout_secs: 8,
+                    max_attempts: 2,
+                    unknown_after_secs: 180,
+                },
+                strategy: strategy(),
+                economics: crate::config::types::EconomicsConfig {
+                    round_trip_cost_threshold_pct: dec!(3),
+                    min_expected_net_return_pct: dec!(2),
+                    max_quote_age_secs: 3,
+                    uncertainty_haircut_pct: dec!(1),
+                    sol_price_usd: None,
+                },
+                risk: crate::config::types::RiskConfig {
+                    starting_capital_usd: dec!(100),
+                    max_live_capital_usd: dec!(25),
+                    max_concurrent_positions: 2,
+                    max_position_percent_of_equity: dec!(5),
+                    max_position_percent_of_liquidity: dec!(0.10),
+                    max_risk_per_trade_percent: dec!(0.5),
+                    max_daily_loss_percent: dec!(2),
+                    max_total_drawdown_before_kill_switch_pct: dec!(5),
+                    cooldown_after_loss_minutes: 30,
+                    max_slippage_bps: 100,
+                    min_liquidity_usd: dec!(50000),
+                    max_trades_per_day: 3,
+                    max_consecutive_failures: 3,
+                },
+                execution: crate::config::types::ExecutionConfig {
+                    provider: crate::config::types::ExecutionProvider::Jupiter,
+                    jupiter_api_url: "https://api.jup.ag".into(),
+                    slippage_bps: 75,
+                    priority_fee_lamports: 10_000,
+                    max_fee_lamports: 500_000,
+                    max_price_impact_bps: 300,
+                    confirm_timeout_secs: 90,
+                    confirm_poll_ms: 500,
+                    live_signer_env: None,
+                    jupiter_api_key_env: None,
+                    allowed_program_ids: vec![],
+                },
+                storage: crate::config::types::StorageConfig {
+                    sqlite_path: ":memory:".into(),
+                },
+                runtime: crate::config::types::RuntimeConfig {
+                    quote_cache_ttl_secs: 30,
+                    ..Default::default()
+                },
+                observability: crate::config::types::ObservabilityConfig::default(),
+            }),
+            store: Arc::new(store),
+            executor: Arc::new(MockQuoteExecutor),
+            rpc: Arc::new(
+                crate::data::rpc::RpcPool::with_attempts(
+                    vec!["http://localhost:1".into()],
+                    std::time::Duration::from_secs(1),
+                    1,
+                )
+                .unwrap(),
+            ),
+        };
+        let mut monitor = ExitMonitor::new(deps, 5);
+        // Cache is empty initially.
+        assert!(monitor.cached_quote("TOKEN").is_none());
+        // Insert a quote.
+        let quote = crate::execution::Quote {
+            input_mint: "TOKEN".into(),
+            output_mint: "SOL".into(),
+            input_amount: 1_000_000,
+            output_amount: 500_000_000,
+            price_impact_bps: 10,
+            route: serde_json::json!({}),
+            observed_at: Utc::now(),
+        };
+        monitor.cache_quote("TOKEN".into(), quote);
+        // Should return the cached quote.
+        assert!(monitor.cached_quote("TOKEN").is_some());
+    }
+
+    #[test]
+    fn quote_cache_expires_after_ttl() {
+        let store = StateStore::open(":memory:").unwrap();
+        let deps = ExitDeps {
+            config: Arc::new(crate::config::types::Config {
+                mode: crate::config::types::Mode::Paper,
+                rpc: crate::config::types::RpcConfig {
+                    http_endpoints: vec!["https://api.test".into()],
+                    websocket_endpoints: vec![],
+                    max_data_age_secs: 15,
+                    request_timeout_secs: 8,
+                    max_attempts: 2,
+                    unknown_after_secs: 180,
+                },
+                strategy: strategy(),
+                economics: crate::config::types::EconomicsConfig {
+                    round_trip_cost_threshold_pct: dec!(3),
+                    min_expected_net_return_pct: dec!(2),
+                    max_quote_age_secs: 3,
+                    uncertainty_haircut_pct: dec!(1),
+                    sol_price_usd: None,
+                },
+                risk: crate::config::types::RiskConfig {
+                    starting_capital_usd: dec!(100),
+                    max_live_capital_usd: dec!(25),
+                    max_concurrent_positions: 2,
+                    max_position_percent_of_equity: dec!(5),
+                    max_position_percent_of_liquidity: dec!(0.10),
+                    max_risk_per_trade_percent: dec!(0.5),
+                    max_daily_loss_percent: dec!(2),
+                    max_total_drawdown_before_kill_switch_pct: dec!(5),
+                    cooldown_after_loss_minutes: 30,
+                    max_slippage_bps: 100,
+                    min_liquidity_usd: dec!(50000),
+                    max_trades_per_day: 3,
+                    max_consecutive_failures: 3,
+                },
+                execution: crate::config::types::ExecutionConfig {
+                    provider: crate::config::types::ExecutionProvider::Jupiter,
+                    jupiter_api_url: "https://api.jup.ag".into(),
+                    slippage_bps: 75,
+                    priority_fee_lamports: 10_000,
+                    max_fee_lamports: 500_000,
+                    max_price_impact_bps: 300,
+                    confirm_timeout_secs: 90,
+                    confirm_poll_ms: 500,
+                    live_signer_env: None,
+                    jupiter_api_key_env: None,
+                    allowed_program_ids: vec![],
+                },
+                storage: crate::config::types::StorageConfig {
+                    sqlite_path: ":memory:".into(),
+                },
+                runtime: crate::config::types::RuntimeConfig {
+                    quote_cache_ttl_secs: 0, // TTL=0 disables caching
+                    ..Default::default()
+                },
+                observability: crate::config::types::ObservabilityConfig::default(),
+            }),
+            store: Arc::new(store),
+            executor: Arc::new(MockQuoteExecutor),
+            rpc: Arc::new(
+                crate::data::rpc::RpcPool::with_attempts(
+                    vec!["http://localhost:1".into()],
+                    std::time::Duration::from_secs(1),
+                    1,
+                )
+                .unwrap(),
+            ),
+        };
+        let mut monitor = ExitMonitor::new(deps, 5);
+        let quote = crate::execution::Quote {
+            input_mint: "TOKEN".into(),
+            output_mint: "SOL".into(),
+            input_amount: 1_000_000,
+            output_amount: 500_000_000,
+            price_impact_bps: 10,
+            route: serde_json::json!({}),
+            observed_at: Utc::now(),
+        };
+        monitor.cache_quote("TOKEN".into(), quote);
+        // With TTL=0, cached_quote always returns None.
+        assert!(monitor.cached_quote("TOKEN").is_none());
+    }
+
+    struct MockQuoteExecutor;
+    #[async_trait::async_trait]
+    impl crate::execution::Executor for MockQuoteExecutor {
+        async fn quote(
+            &self,
+            _input: &str,
+            _output: &str,
+            amount: u64,
+            _slippage: u16,
+        ) -> Result<crate::execution::Quote, crate::execution::ExecutionError> {
+            Ok(crate::execution::Quote {
+                input_mint: "TOKEN".into(),
+                output_mint: "SOL".into(),
+                input_amount: amount,
+                output_amount: 500_000_000,
+                price_impact_bps: 10,
+                route: serde_json::json!({}),
+                observed_at: Utc::now(),
+            })
+        }
+        async fn execute(
+            &self,
+            _r: crate::execution::ExecutionRequest,
+        ) -> Result<crate::domain::trade::Fill, crate::execution::ExecutionError> {
+            Err(crate::execution::ExecutionError::Unavailable("mock".into()))
+        }
+        async fn health(&self) -> Result<(), crate::execution::ExecutionError> {
+            Ok(())
+        }
     }
 }

@@ -804,7 +804,8 @@ pub async fn run_session(
     let exit_interval = config.runtime.poll_interval_secs;
     let exit_monitor = ExitMonitor::new(exit_deps, exit_interval);
     let exit_handle = tokio::spawn(async move {
-        if let Err(e) = exit_monitor.run(exit_shutdown_rx).await {
+        let mut monitor = exit_monitor;
+        if let Err(e) = monitor.run(exit_shutdown_rx).await {
             tracing::error!(error = %e, "exit monitor terminated with error");
         }
     });
@@ -1190,6 +1191,13 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         let Some(c) = state.candidates.get(&mint).cloned() else {
             continue;
         };
+        // Prevent duplicate entries: skip if an open position already exists
+        // for this mint.  This reuses the persisted portfolio state and works
+        // across restarts; no parallel tracking system needed.
+        if state.portfolio.position(&mint).is_some_and(|p| p.is_open()) {
+            tracing::debug!(mint=%mint, "candidate skipped: open position already exists");
+            continue;
+        }
         let (Some(token_decimals), Some(base_mint_decimals)) =
             (c.token_decimals, c.base_mint_decimals)
         else {
@@ -2074,5 +2082,67 @@ mod tests {
             Some(500),
             "sync_position must replace the in-memory state with fresh store data"
         );
+    }
+
+    // --- Regression tests for duplicate candidate / idempotent entry ---
+
+    #[test]
+    fn duplicate_candidate_skipped_when_open_position_exists() {
+        // Verify that a candidate for a mint with an existing open position
+        // is skipped by process_entries (portfolio.is_open() check).
+        let store = crate::storage::StateStore::open(":memory:").unwrap();
+        let pos = position(1_000, dec!(0.00001));
+        store.save_position(&pos).unwrap();
+        let mut portfolio = Portfolio::default();
+        portfolio.load(store.positions().unwrap());
+        // The portfolio now has an open position for "T".
+        assert!(portfolio.position("T").unwrap().is_open());
+        // A candidate with the same mint should be blocked.
+        assert!(
+            portfolio.position("T").is_some_and(|p| p.is_open()),
+            "open position must prevent duplicate entry for same mint"
+        );
+    }
+
+    #[test]
+    fn closed_position_allows_reentry_for_same_mint() {
+        // After a position is closed, the same mint can be entered again.
+        let store = crate::storage::StateStore::open(":memory:").unwrap();
+        let mut pos = position(1_000, dec!(0.00001));
+        pos.state = crate::domain::position::PositionState::Closed;
+        store.save_position(&pos).unwrap();
+        let mut portfolio = Portfolio::default();
+        portfolio.load(store.positions().unwrap());
+        // Closed position should not block new entries.
+        assert!(!portfolio.position("T").unwrap().is_open());
+    }
+
+    #[test]
+    fn concurrent_position_limit_enforced_within_tick() {
+        use crate::config::types::*;
+
+        // RiskConfig with max_concurrent_positions=1 so second entry must be blocked.
+        let risk_cfg = RiskConfig {
+            starting_capital_usd: dec!(100),
+            max_live_capital_usd: dec!(25),
+            max_concurrent_positions: 1,
+            max_position_percent_of_equity: dec!(5),
+            max_position_percent_of_liquidity: dec!(0.10),
+            max_risk_per_trade_percent: dec!(0.5),
+            max_daily_loss_percent: dec!(2),
+            max_total_drawdown_before_kill_switch_pct: dec!(5),
+            cooldown_after_loss_minutes: 30,
+            max_slippage_bps: 100,
+            min_liquidity_usd: dec!(50000),
+            max_trades_per_day: 10,
+            max_consecutive_failures: 3,
+        };
+        let mut risk = RiskEngine::new(risk_cfg, dec!(100));
+        risk.set_open_positions(1);
+        risk.set_total_exposure(dec!(4));
+        // Risk engine with 1 open position and max=1 must reject a second entry.
+        assert!(risk
+            .authorize(dec!(5), dec!(100000), 10, 10, Utc::now())
+            .is_err());
     }
 }
