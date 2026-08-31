@@ -7,20 +7,47 @@ use rust_decimal::Decimal;
 /// Paper mode shares quotes, policy gates, and pricing with live mode; only
 /// the signing/submission is replaced by an adversarial haircut fill, so
 /// strategy and risk behaviour are identical.
-pub struct PaperExecutor<E> { quotes: E, fill_haircut_bps: u32 }
-impl<E> PaperExecutor<E> { pub fn new(quotes: E, fill_haircut_bps: u32) -> Self { Self { quotes, fill_haircut_bps } } }
+pub struct PaperExecutor<E> {
+    quotes: E,
+    fill_haircut_bps: u32,
+}
+impl<E> PaperExecutor<E> {
+    pub fn new(quotes: E, fill_haircut_bps: u32) -> Self {
+        Self {
+            quotes,
+            fill_haircut_bps,
+        }
+    }
+}
 
 #[async_trait]
 impl<E: Executor> Executor for PaperExecutor<E> {
-    fn is_live(&self) -> bool { false }
-    fn signer_pubkey(&self) -> Option<String> { None }
-    async fn quote(&self, a: &str, b: &str, c: u64, d: u16) -> Result<Quote, ExecutionError> { self.quotes.quote(a, b, c, d).await }
+    fn is_live(&self) -> bool {
+        false
+    }
+    fn signer_pubkey(&self) -> Option<String> {
+        None
+    }
+    async fn quote(&self, a: &str, b: &str, c: u64, d: u16) -> Result<Quote, ExecutionError> {
+        self.quotes.quote(a, b, c, d).await
+    }
     async fn execute(&self, r: ExecutionRequest) -> Result<Fill, ExecutionError> {
-        if r.quote.price_impact_bps > r.max_price_impact_bps || r.quote.output_amount < r.min_output_amount { return Err(ExecutionError::InvalidQuote); }
+        if r.quote.price_impact_bps > r.max_price_impact_bps
+            || r.quote.output_amount < r.min_output_amount
+        {
+            return Err(ExecutionError::InvalidQuote);
+        }
         let haircut = (10_000u64.saturating_sub(self.fill_haircut_bps as u64)) as u64;
         let output = r.quote.output_amount.saturating_mul(haircut) / 10_000;
-        if output < r.min_output_amount { return Err(ExecutionError::InvalidQuote); }
-        let (value_usd, price_usd) = r.value_basis.price_fill(r.quote.input_amount, r.input_decimals, output, r.output_decimals)?;
+        if output < r.min_output_amount {
+            return Err(ExecutionError::InvalidQuote);
+        }
+        let (value_usd, price_usd) = r.value_basis.price_fill(
+            r.quote.input_amount,
+            r.input_decimals,
+            output,
+            r.output_decimals,
+        )?;
         Ok(Fill {
             order_id: r.order_id,
             signature: format!("paper:{}", uuid::Uuid::new_v4()),
@@ -36,7 +63,9 @@ impl<E: Executor> Executor for PaperExecutor<E> {
             expected_output_amount: Some(r.quote.output_amount),
         })
     }
-    async fn health(&self) -> Result<(), ExecutionError> { self.quotes.health().await }
+    async fn health(&self) -> Result<(), ExecutionError> {
+        self.quotes.health().await
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -45,19 +74,58 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::time::Duration;
 
-    struct FakeExecutor { fail: bool }
+    struct FakeExecutor {
+        fail: bool,
+    }
     #[async_trait::async_trait]
     impl Executor for FakeExecutor {
-        async fn quote(&self, _a: &str, _b: &str, amount: u64, _s: u16) -> Result<Quote, ExecutionError> {
-            if self.fail { return Err(ExecutionError::Quote("down".into())); }
-            Ok(Quote { input_mint: "SOL".into(), output_mint: "T".into(), input_amount: amount, output_amount: 10_000_000, price_impact_bps: 10, route: serde_json::json!({}), observed_at: Utc::now() })
+        async fn quote(
+            &self,
+            _a: &str,
+            _b: &str,
+            amount: u64,
+            _s: u16,
+        ) -> Result<Quote, ExecutionError> {
+            if self.fail {
+                return Err(ExecutionError::Quote("down".into()));
+            }
+            Ok(Quote {
+                input_mint: "SOL".into(),
+                output_mint: "T".into(),
+                input_amount: amount,
+                output_amount: 10_000_000,
+                price_impact_bps: 10,
+                route: serde_json::json!({}),
+                observed_at: Utc::now(),
+            })
         }
-        async fn execute(&self, _r: ExecutionRequest) -> Result<Fill, ExecutionError> { Err(ExecutionError::Unavailable("paper never delegates".into())) }
-        async fn health(&self) -> Result<(), ExecutionError> { Ok(()) }
+        async fn execute(&self, _r: ExecutionRequest) -> Result<Fill, ExecutionError> {
+            Err(ExecutionError::Unavailable("paper never delegates".into()))
+        }
+        async fn health(&self) -> Result<(), ExecutionError> {
+            Ok(())
+        }
     }
     fn request() -> ExecutionRequest {
-        let quote = Quote { input_mint: "SOL".into(), output_mint: "T".into(), input_amount: 1_000_000, output_amount: 10_000_000, price_impact_bps: 10, route: serde_json::json!({}), observed_at: Utc::now() };
-        ExecutionRequest { order_id: "o".into(), quote, max_slippage_bps: 500, max_price_impact_bps: 300, min_output_amount: 5_000_000, input_decimals: 9, output_decimals: 6, value_basis: ValueBasis::InputValueUsd(dec!(10)) }
+        let quote = Quote {
+            input_mint: "SOL".into(),
+            output_mint: "T".into(),
+            input_amount: 1_000_000,
+            output_amount: 10_000_000,
+            price_impact_bps: 10,
+            route: serde_json::json!({}),
+            observed_at: Utc::now(),
+        };
+        ExecutionRequest {
+            order_id: "o".into(),
+            quote,
+            max_slippage_bps: 500,
+            max_price_impact_bps: 300,
+            min_output_amount: 5_000_000,
+            input_decimals: 9,
+            output_decimals: 6,
+            value_basis: ValueBasis::InputValueUsd(dec!(10)),
+        }
     }
     #[tokio::test]
     async fn paper_fill_applies_haircut_and_real_pricing() {
@@ -73,8 +141,12 @@ mod tests {
     #[tokio::test]
     async fn paper_rejects_excessive_price_impact() {
         let paper = PaperExecutor::new(FakeExecutor { fail: false }, 0);
-        let mut r = request(); r.quote.price_impact_bps = 400;
-        assert!(matches!(paper.execute(r).await, Err(ExecutionError::InvalidQuote)));
+        let mut r = request();
+        r.quote.price_impact_bps = 400;
+        assert!(matches!(
+            paper.execute(r).await,
+            Err(ExecutionError::InvalidQuote)
+        ));
     }
     #[tokio::test]
     async fn paper_quote_passthrough_and_health() {
@@ -83,5 +155,12 @@ mod tests {
         assert!(paper.health().await.is_ok());
     }
     #[test]
-    fn rpc_pool_validates_config() { assert!(crate::data::rpc::RpcPool::with_attempts(vec!["http://localhost:1".into()], Duration::from_millis(100), 0).is_ok()); }
+    fn rpc_pool_validates_config() {
+        assert!(crate::data::rpc::RpcPool::with_attempts(
+            vec!["http://localhost:1".into()],
+            Duration::from_millis(100),
+            0
+        )
+        .is_ok());
+    }
 }

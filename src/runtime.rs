@@ -14,7 +14,10 @@ use crate::{
         wallet::WalletStats,
     },
     economics::{CostModel, EconomicGate, ExpectedValue},
-    execution::{finalize_fill, reconcile_signature, units, ExecutionError, ExecutionRequest, Executor, ValueBasis},
+    execution::{
+        finalize_fill, reconcile_signature, units, ExecutionError, ExecutionRequest, Executor,
+        ValueBasis,
+    },
     portfolio::{ExitOutcome, Portfolio},
     risk::RiskEngine,
     storage::StateStore,
@@ -33,8 +36,10 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CandidateInput {
     pub mint: String,
-    #[serde(default)] pub token_decimals: Option<u8>,
-    #[serde(default)] pub base_mint_decimals: Option<u8>,
+    #[serde(default)]
+    pub token_decimals: Option<u8>,
+    #[serde(default)]
+    pub base_mint_decimals: Option<u8>,
     pub input_amount: u64,
     pub position_usd: Decimal,
     pub expected_gross_return_pct: Decimal,
@@ -93,7 +98,9 @@ pub async fn reconcile_pending_orders(deps: &SessionDeps<'_>) -> Result<Reconcil
             (Some(sig), false) => {
                 // Paper-mode signature: nothing on-chain to reconcile.
                 let mut o = order.clone();
-                o.error = Some(format!("paper signature {sig} cannot be reconciled on-chain"));
+                o.error = Some(format!(
+                    "paper signature {sig} cannot be reconciled on-chain"
+                ));
                 o.transition(OrderState::Failed).unwrap_or_else(|e| tracing::error!(order_id=%o.id, %e, "state machine blocked failure marking"));
                 deps.store.update_order(&o)?;
                 summary.failed_orders += 1;
@@ -104,23 +111,41 @@ pub async fn reconcile_pending_orders(deps: &SessionDeps<'_>) -> Result<Reconcil
                     summary.unresolved_orders += 1;
                     continue;
                 };
-                let (Some(input_mint), Some(output_mint), Some(expected_input)) = (&order.input_mint, &order.output_mint, order.input_amount_atomic) else {
+                let (Some(input_mint), Some(output_mint), Some(expected_input)) = (
+                    &order.input_mint,
+                    &order.output_mint,
+                    order.input_amount_atomic,
+                ) else {
                     tracing::error!(order_id=%order.id, "legacy order lacks route metadata; operator review required");
                     summary.unresolved_orders += 1;
                     continue;
                 };
-                match reconcile_signature(deps.rpc, sig, input_mint, output_mint, owner, expected_input).await {
+                match reconcile_signature(
+                    deps.rpc,
+                    sig,
+                    input_mint,
+                    output_mint,
+                    owner,
+                    expected_input,
+                )
+                .await
+                {
                     Ok(Some(outcome)) => {
                         match record_reconciled_fill(deps, &order, outcome, sig).await {
                             Ok(true) => summary.confirmed_orders += 1,
                             Ok(false) => summary.unresolved_orders += 1,
-                            Err(e) => { tracing::error!(order_id=%order.id, error=%e, "reconciled fill could not be accounted; operator review required"); summary.unresolved_orders += 1; }
+                            Err(e) => {
+                                tracing::error!(order_id=%order.id, error=%e, "reconciled fill could not be accounted; operator review required");
+                                summary.unresolved_orders += 1;
+                            }
                         }
                     }
                     Ok(None) => {
                         if age > Duration::seconds(deps.config.rpc.unknown_after_secs) {
                             let mut o = order.clone();
-                            o.error = Some("signature never appeared on-chain within the expiry window".into());
+                            o.error = Some(
+                                "signature never appeared on-chain within the expiry window".into(),
+                            );
                             o.transition(OrderState::Expired).unwrap_or_else(|e| tracing::error!(order_id=%o.id, %e, "state machine blocked expiry marking"));
                             deps.store.update_order(&o)?;
                             summary.expired_orders += 1;
@@ -148,16 +173,32 @@ pub async fn reconcile_pending_orders(deps: &SessionDeps<'_>) -> Result<Reconcil
 
 /// Applies a verified on-chain outcome to an order created in a previous
 /// process. Returns Ok(false) when accounting cannot be completed safely.
-async fn record_reconciled_fill(deps: &SessionDeps<'_>, order: &OrderRecord, outcome: crate::execution::reconcile::ChainSwapOutcome, signature: &str) -> Result<bool> {
-    let position = order.position_id.as_ref().and_then(|pid| deps.store.positions().ok()?.into_iter().find(|p| p.position_id.as_deref() == Some(pid)));
+async fn record_reconciled_fill(
+    deps: &SessionDeps<'_>,
+    order: &OrderRecord,
+    outcome: crate::execution::reconcile::ChainSwapOutcome,
+    signature: &str,
+) -> Result<bool> {
+    let position = order.position_id.as_ref().and_then(|pid| {
+        deps.store
+            .positions()
+            .ok()?
+            .into_iter()
+            .find(|p| p.position_id.as_deref() == Some(pid))
+    });
     let (Some(position), Some(input_value_usd)) = (&position, order.input_value_usd) else {
         let mut o = order.clone();
-        o.error = Some("reconciled on-chain but position/value basis is missing; no accounting applied".into());
-        o.transition(OrderState::Reconciled).map_err(|e| anyhow::anyhow!(e))?;
+        o.error = Some(
+            "reconciled on-chain but position/value basis is missing; no accounting applied".into(),
+        );
+        o.transition(OrderState::Reconciled)
+            .map_err(|e| anyhow::anyhow!(e))?;
         deps.store.update_order(&o)?;
         return Ok(false);
     };
-    let (Some(token_decimals), Some(base_decimals)) = (position.token_decimals, position.base_mint_decimals) else {
+    let (Some(token_decimals), Some(base_decimals)) =
+        (position.token_decimals, position.base_mint_decimals)
+    else {
         return Ok(false);
     };
     let basis = match order.kind {
@@ -167,8 +208,16 @@ async fn record_reconciled_fill(deps: &SessionDeps<'_>, order: &OrderRecord, out
             None => return Ok(false),
         },
     };
-    let (input_decimals, output_decimals) = match order.kind { OrderKind::Entry => (base_decimals, token_decimals), _ => (token_decimals, base_decimals) };
-    let Ok((value_usd, price_usd)) = basis.price_fill(outcome.input_amount, input_decimals, outcome.output_amount, output_decimals) else {
+    let (input_decimals, output_decimals) = match order.kind {
+        OrderKind::Entry => (base_decimals, token_decimals),
+        _ => (token_decimals, base_decimals),
+    };
+    let Ok((value_usd, price_usd)) = basis.price_fill(
+        outcome.input_amount,
+        input_decimals,
+        outcome.output_amount,
+        output_decimals,
+    ) else {
         return Ok(false);
     };
     let mut fill = Fill {
@@ -177,7 +226,10 @@ async fn record_reconciled_fill(deps: &SessionDeps<'_>, order: &OrderRecord, out
         input_amount: outcome.input_amount,
         output_amount: outcome.output_amount,
         price_usd,
-        fees_usd: crate::execution::executor::fee_usd(outcome.fee_lamports, deps.config.economics.sol_price_usd),
+        fees_usd: crate::execution::executor::fee_usd(
+            outcome.fee_lamports,
+            deps.config.economics.sol_price_usd,
+        ),
         slippage_bps: 0,
         confirmed_at: Utc::now(),
         latency_ms: 0,
@@ -187,10 +239,18 @@ async fn record_reconciled_fill(deps: &SessionDeps<'_>, order: &OrderRecord, out
     };
     let mut o = order.clone();
     o.signature = Some(signature.to_string());
-    o.transition(OrderState::Confirmed).map_err(|e| anyhow::anyhow!(e))?;
+    o.transition(OrderState::Confirmed)
+        .map_err(|e| anyhow::anyhow!(e))?;
     deps.store.update_order(&o)?;
     deps.store.save_fill(&fill)?;
-    apply_confirmed_fill_to_portfolio(deps, order, &position, &mut fill, token_decimals, base_decimals)?;
+    apply_confirmed_fill_to_portfolio(
+        deps,
+        order,
+        &position,
+        &mut fill,
+        token_decimals,
+        base_decimals,
+    )?;
     tracing::info!(order_id=%order.id, kind=?order.kind, mint=%order.mint, %signature,
         input=outcome.input_amount, output=outcome.output_amount, fee_lamports=outcome.fee_lamports,
         "order reconciled from chain after restart");
@@ -199,17 +259,64 @@ async fn record_reconciled_fill(deps: &SessionDeps<'_>, order: &OrderRecord, out
 
 /// Shared accounting for a confirmed fill, whether executed live this session
 /// or reconciled after a restart.
-fn apply_confirmed_fill_to_portfolio(deps: &SessionDeps<'_>, order: &OrderRecord, position: &Position, fill: &mut Fill, token_decimals: u8, base_decimals: u8) -> Result<()> {
+fn apply_confirmed_fill_to_portfolio(
+    deps: &SessionDeps<'_>,
+    order: &OrderRecord,
+    position: &Position,
+    fill: &mut Fill,
+    token_decimals: u8,
+    base_decimals: u8,
+) -> Result<()> {
     let mut portfolio = load_portfolio(deps.store)?;
     let result = match order.kind {
         OrderKind::Entry => {
-            let cost_model = position.entry_cost_model.clone().unwrap_or_else(|| CostModel { observed_at: Utc::now(), source: "reconciled".into(), is_live_snapshot: false, input: crate::economics::BreakEvenInputs { position_size_usd: Decimal::ONE, avg_priority_fee_usd: Decimal::ZERO, avg_swap_fee_bps: Decimal::ZERO, avg_slippage_bps: Decimal::ZERO, avg_price_impact_bps: Decimal::ZERO, failed_tx_rate: Decimal::ZERO, avg_failed_tx_cost_usd: Decimal::ZERO, assumed_win_loss_ratio: Decimal::ONE, assumed_avg_loss_pct: Decimal::ONE } });
-            portfolio.apply_entry(order.mint.clone(), position.base_mint.clone().unwrap_or_default(), token_decimals, base_decimals, order.position_id.clone().unwrap_or_default(), fill, fill.price_usd, order.signal_id.clone(), cost_model)
+            let cost_model = position
+                .entry_cost_model
+                .clone()
+                .unwrap_or_else(|| CostModel {
+                    observed_at: Utc::now(),
+                    source: "reconciled".into(),
+                    is_live_snapshot: false,
+                    input: crate::economics::BreakEvenInputs {
+                        position_size_usd: Decimal::ONE,
+                        avg_priority_fee_usd: Decimal::ZERO,
+                        avg_swap_fee_bps: Decimal::ZERO,
+                        avg_slippage_bps: Decimal::ZERO,
+                        avg_price_impact_bps: Decimal::ZERO,
+                        failed_tx_rate: Decimal::ZERO,
+                        avg_failed_tx_cost_usd: Decimal::ZERO,
+                        assumed_win_loss_ratio: Decimal::ONE,
+                        assumed_avg_loss_pct: Decimal::ONE,
+                    },
+                });
+            portfolio.apply_entry(
+                order.mint.clone(),
+                position.base_mint.clone().unwrap_or_default(),
+                token_decimals,
+                base_decimals,
+                order.position_id.clone().unwrap_or_default(),
+                fill,
+                fill.price_usd,
+                order.signal_id.clone(),
+                cost_model,
+            )
         }
-        _ => portfolio.apply_exit(&order.mint, fill, order.error.as_deref().unwrap_or("reconciled"), Utc::now()).map(|_| ()),
+        _ => portfolio
+            .apply_exit(
+                &order.mint,
+                fill,
+                order.error.as_deref().unwrap_or("reconciled"),
+                Utc::now(),
+            )
+            .map(|_| ()),
     };
     match result {
-        Ok(()) => { if let Some(p) = portfolio.position(&order.mint) { deps.store.save_position(p)?; } Ok(()) }
+        Ok(()) => {
+            if let Some(p) = portfolio.position(&order.mint) {
+                deps.store.save_position(p)?;
+            }
+            Ok(())
+        }
         Err(e) => Err(anyhow::anyhow!(e)),
     }
 }
@@ -224,7 +331,9 @@ fn load_portfolio(store: &StateStore) -> Result<Portfolio> {
 /// Only runs with a live signer; paper positions keep their recorded state.
 pub async fn reconcile_positions_onchain(deps: &SessionDeps<'_>) -> Result<ReconcileSummary> {
     let mut summary = ReconcileSummary::default();
-    let Some(owner) = deps.executor.signer_pubkey() else { return Ok(summary) };
+    let Some(owner) = deps.executor.signer_pubkey() else {
+        return Ok(summary);
+    };
     let balances = match deps.rpc.token_balances(&owner).await {
         Ok(b) => b,
         Err(e) => {
@@ -233,24 +342,49 @@ pub async fn reconcile_positions_onchain(deps: &SessionDeps<'_>) -> Result<Recon
             return Ok(summary);
         }
     };
-    let by_mint: HashMap<&str, &crate::data::rpc::TokenBalance> = balances.iter().map(|b| (b.mint.as_str(), b)).collect();
+    let by_mint: HashMap<&str, &crate::data::rpc::TokenBalance> =
+        balances.iter().map(|b| (b.mint.as_str(), b)).collect();
     let mut portfolio = load_portfolio(deps.store)?;
-    for position in portfolio.open_positions().map(|p| p.mint.clone()).collect::<Vec<_>>() {
+    for position in portfolio
+        .open_positions()
+        .map(|p| p.mint.clone())
+        .collect::<Vec<_>>()
+    {
         let now = Utc::now();
         match by_mint.get(position.as_str()) {
             None => {
                 if portfolio.reconcile_with_chain(&position, 0, 0, now).is_ok() {
                     summary.positions_closed += 1;
-                    if let Some(p) = portfolio.position(&position) { deps.store.save_position(p)?; }
+                    if let Some(p) = portfolio.position(&position) {
+                        deps.store.save_position(p)?;
+                    }
                 }
             }
-            Some(balance) => match portfolio.reconcile_with_chain(&position, balance.amount, balance.decimals, now) {
+            Some(balance) => match portfolio.reconcile_with_chain(
+                &position,
+                balance.amount,
+                balance.decimals,
+                now,
+            ) {
                 Ok(true) => {
-                    if portfolio.position(&position).map(|p| p.reconciliation_status) == Some(crate::domain::position::ReconciliationStatus::AdjustedOnChain) { summary.positions_adjusted += 1; } else { summary.positions_reconciled += 1; }
-                    if let Some(p) = portfolio.position(&position) { deps.store.save_position(p)?; }
+                    if portfolio
+                        .position(&position)
+                        .map(|p| p.reconciliation_status)
+                        == Some(crate::domain::position::ReconciliationStatus::AdjustedOnChain)
+                    {
+                        summary.positions_adjusted += 1;
+                    } else {
+                        summary.positions_reconciled += 1;
+                    }
+                    if let Some(p) = portfolio.position(&position) {
+                        deps.store.save_position(p)?;
+                    }
                 }
                 Ok(false) => {}
-                Err(e) => { tracing::error!(error=%e, mint=%position, "position reconciliation failed; entries blocked"); summary.onchain_errors += 1; }
+                Err(e) => {
+                    tracing::error!(error=%e, mint=%position, "position reconciliation failed; entries blocked");
+                    summary.onchain_errors += 1;
+                }
             },
         }
     }
@@ -258,11 +392,21 @@ pub async fn reconcile_positions_onchain(deps: &SessionDeps<'_>) -> Result<Recon
 }
 
 /// Marks every open position to the price implied by a fresh sell quote.
-fn mark_price_from_quote(quote_output_atomic: u64, base_decimals: u8, base_price_usd: Decimal, token_remaining_atomic: u64, token_decimals: u8) -> Option<Decimal> {
-    if token_remaining_atomic == 0 { return None; }
+fn mark_price_from_quote(
+    quote_output_atomic: u64,
+    base_decimals: u8,
+    base_price_usd: Decimal,
+    token_remaining_atomic: u64,
+    token_decimals: u8,
+) -> Option<Decimal> {
+    if token_remaining_atomic == 0 {
+        return None;
+    }
     let base_units = units(quote_output_atomic, base_decimals).ok()?;
     let token_units = units(token_remaining_atomic, token_decimals).ok()?;
-    if token_units.is_zero() { return None; }
+    if token_units.is_zero() {
+        return None;
+    }
     Some(base_units * base_price_usd / token_units)
 }
 
@@ -295,13 +439,23 @@ struct SessionState {
 /// Runs the trading session until `shutdown` resolves. Entries, exits,
 /// reconciliation, and interlocks all execute here; the executor cannot
 /// bypass the risk layer because it is only ever invoked from this loop.
-pub async fn run_session(deps: SessionDeps<'_>, shutdown: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
+pub async fn run_session(
+    deps: SessionDeps<'_>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
     let config = deps.config;
     let store = deps.store;
     let mut risk = RiskEngine::new(config.risk.clone(), config.risk.starting_capital_usd);
     let mut portfolio = load_portfolio(store)?;
     risk.state.open_positions = portfolio.open_positions().len();
-    let mut state = SessionState { portfolio, risk, candidates: HashMap::new(), seen_signals: HashSet::new(), day_key: String::new(), emergency_active: false };
+    let mut state = SessionState {
+        portfolio,
+        risk,
+        candidates: HashMap::new(),
+        seen_signals: HashSet::new(),
+        day_key: String::new(),
+        emergency_active: false,
+    };
 
     // Restore or initialise the daily-loss window.
     let today = Utc::now().date_naive().to_string();
@@ -310,7 +464,9 @@ pub async fn run_session(deps: SessionDeps<'_>, shutdown: tokio::sync::oneshot::
     let stored_start: Option<Decimal> = store.get("runtime:day_start_equity")?;
     let stored_trades: Option<u32> = store.get("runtime:trades_today")?;
     if stored_day.as_deref() == Some(state.day_key.as_str()) {
-        if let Some(start) = stored_start { state.risk.state.day_start_equity_usd = start; }
+        if let Some(start) = stored_start {
+            state.risk.state.day_start_equity_usd = start;
+        }
         state.risk.state.trades_today = stored_trades.unwrap_or(0);
     }
     if let Some(reason) = store.kill_switch_reason()? {
@@ -329,7 +485,10 @@ pub async fn run_session(deps: SessionDeps<'_>, shutdown: tokio::sync::oneshot::
         startup = reconcile_pending_orders(deps).await?;
     }
     if startup.unresolved_orders > 0 || startup.onchain_errors > 0 {
-        tracing::error!(?startup, "startup reconciliation incomplete; new entries stay blocked until resolved");
+        tracing::error!(
+            ?startup,
+            "startup reconciliation incomplete; new entries stay blocked until resolved"
+        );
     }
 
     let mut shutdown = shutdown;
@@ -354,7 +513,7 @@ pub async fn run_session(deps: SessionDeps<'_>, shutdown: tokio::sync::oneshot::
     Ok(())
 }
 
-async fn run_reconciliation(deps: &SessionDeps<'_>) -> Result<ReconcileSummary> {
+pub async fn run_reconciliation(deps: &SessionDeps<'_>) -> Result<ReconcileSummary> {
     let mut summary = reconcile_pending_orders(deps).await?;
     let pos = reconcile_positions_onchain(deps).await?;
     summary.positions_reconciled += pos.positions_reconciled;
@@ -364,7 +523,11 @@ async fn run_reconciliation(deps: &SessionDeps<'_>) -> Result<ReconcileSummary> 
     Ok(summary)
 }
 
-async fn tick(deps: &SessionDeps<'_>, state: &mut SessionState, last_position_reconcile: &mut std::time::Instant) -> Result<()> {
+async fn tick(
+    deps: &SessionDeps<'_>,
+    state: &mut SessionState,
+    last_position_reconcile: &mut std::time::Instant,
+) -> Result<()> {
     let config = deps.config;
     let store = deps.store;
     let now = Utc::now();
@@ -379,10 +542,19 @@ async fn tick(deps: &SessionDeps<'_>, state: &mut SessionState, last_position_re
     }
 
     // Recurring on-chain reconciliation (live only).
-    if deps.executor.is_live() && config.runtime.reconcile_interval_secs > 0 && last_position_reconcile.elapsed() >= std::time::Duration::from_secs(config.runtime.reconcile_interval_secs) {
+    if deps.executor.is_live()
+        && config.runtime.reconcile_interval_secs > 0
+        && last_position_reconcile.elapsed()
+            >= std::time::Duration::from_secs(config.runtime.reconcile_interval_secs)
+    {
         match reconcile_positions_onchain(deps).await {
-            Ok(s) if s.onchain_errors == 0 => tracing::info!(?s, "periodic position reconciliation complete"),
-            Ok(s) => tracing::error!(?s, "periodic reconciliation had errors; entries stay blocked"),
+            Ok(s) if s.onchain_errors == 0 => {
+                tracing::info!(?s, "periodic position reconciliation complete")
+            }
+            Ok(s) => tracing::error!(
+                ?s,
+                "periodic reconciliation had errors; entries stay blocked"
+            ),
             Err(e) => tracing::error!(error = %e, "periodic reconciliation failed"),
         }
         *last_position_reconcile = std::time::Instant::now();
@@ -390,35 +562,61 @@ async fn tick(deps: &SessionDeps<'_>, state: &mut SessionState, last_position_re
 
     // Resolve any orders stuck in Unknown before anything else.
     if let Ok(s) = reconcile_pending_orders(deps).await {
-        if s.unresolved_orders > 0 { tracing::warn!(unresolved = s.unresolved_orders, "orders still unresolved; entries blocked"); }
+        if s.unresolved_orders > 0 {
+            tracing::warn!(
+                unresolved = s.unresolved_orders,
+                "orders still unresolved; entries blocked"
+            );
+        }
     }
 
     // Emergency stop is re-read every tick so operator changes apply live.
     match store.emergency_stop() {
-        Ok(Some(reason)) => { if !state.emergency_active { tracing::error!(%reason, "EMERGENCY STOP engaged: no new trades"); } state.emergency_active = true; }
+        Ok(Some(reason)) => {
+            if !state.emergency_active {
+                tracing::error!(%reason, "EMERGENCY STOP engaged: no new trades");
+            }
+            state.emergency_active = true;
+        }
         Ok(None) => state.emergency_active = false,
-        Err(e) => { tracing::error!(error = %e, "cannot read emergency stop state; failing closed"); state.emergency_active = true; }
+        Err(e) => {
+            tracing::error!(error = %e, "cannot read emergency stop state; failing closed");
+            state.emergency_active = true;
+        }
     }
 
     // Persisted kill switch may be latched by operators between ticks.
-    if let Some(reason) = store.kill_switch_reason()? { state.risk.kill_switch.force_trip(); let _ = reason; }
+    if let Some(reason) = store.kill_switch_reason()? {
+        state.risk.kill_switch.force_trip();
+        let _ = reason;
+    }
 
     // 1. Ingest candidates from the verified feed.
-    if let Some(path) = config.runtime.signal_feed_path.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(path) = config
+        .runtime
+        .signal_feed_path
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
         match std::fs::read_to_string(path) {
             Ok(data) => {
                 for line in data.lines().filter(|l| !l.trim().is_empty()) {
                     match serde_json::from_str::<CandidateInput>(line) {
                         Ok(c) => {
                             let fresh = now;
-                            if c.market.observed_at > fresh || c.safety.observed_at > fresh { tracing::warn!(mint=%c.mint, "rejected future-dated candidate"); continue; }
+                            if c.market.observed_at > fresh || c.safety.observed_at > fresh {
+                                tracing::warn!(mint=%c.mint, "rejected future-dated candidate");
+                                continue;
+                            }
                             state.candidates.insert(c.mint.clone(), c);
                         }
                         Err(e) => tracing::warn!(error = %e, "skipping malformed candidate line"),
                     }
                 }
             }
-            Err(e) => tracing::error!(error = %e, path, "cannot read signal feed; no entries this tick"),
+            Err(e) => {
+                tracing::error!(error = %e, path, "cannot read signal feed; no entries this tick")
+            }
         }
     }
 
@@ -442,7 +640,13 @@ async fn tick(deps: &SessionDeps<'_>, state: &mut SessionState, last_position_re
         tracing::debug!("kill switch latched; skipping entries");
     } else if entries_blocked_by(store)? {
         tracing::warn!("unreconciled orders exist; refusing new entries");
-    } else if config.runtime.signal_feed_path.as_deref().unwrap_or_default().is_empty() {
+    } else if config
+        .runtime
+        .signal_feed_path
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
         tracing::debug!("no signal feed configured; no entries");
     } else {
         process_entries(deps, state).await?;
@@ -452,56 +656,156 @@ async fn tick(deps: &SessionDeps<'_>, state: &mut SessionState, last_position_re
 
 async fn process_exits(deps: &SessionDeps<'_>, state: &mut SessionState) -> Result<()> {
     let config = deps.config;
-    let open: Vec<String> = state.portfolio.open_positions().iter().map(|p| p.mint.clone()).collect();
+    let open: Vec<String> = state
+        .portfolio
+        .open_positions()
+        .iter()
+        .map(|p| p.mint.clone())
+        .collect();
     for mint in open {
-        let Some(position) = state.portfolio.position(&mint).cloned() else { continue };
+        let Some(position) = state.portfolio.position(&mint).cloned() else {
+            continue;
+        };
         let Some(remaining) = position.trusted_remaining() else {
             tracing::error!(mint=%mint, position_id=?position.position_id, "position quantity is not trusted; refusing to sell an assumed balance");
             continue;
         };
         // Incomplete order for this position: its outcome must resolve first.
-        if deps.store.incomplete_orders()?.iter().any(|o| o.position_id.as_deref() == position.position_id.as_deref() && o.kind == OrderKind::Exit) {
+        if deps.store.incomplete_orders()?.iter().any(|o| {
+            o.position_id.as_deref() == position.position_id.as_deref() && o.kind == OrderKind::Exit
+        }) {
             tracing::debug!(mint=%mint, "exit order already in flight; waiting for reconciliation");
             continue;
         }
-        let Some(base_price) = position.base_entry_price_usd else { tracing::error!(mint=%mint, "position lacks base price basis; cannot mark"); continue };
-        let (Some(base_decimals), Some(token_decimals)) = (position.base_mint_decimals, position.token_decimals) else { continue };
+        let Some(base_price) = position.base_entry_price_usd else {
+            tracing::error!(mint=%mint, "position lacks base price basis; cannot mark");
+            continue;
+        };
+        let (Some(base_decimals), Some(token_decimals)) =
+            (position.base_mint_decimals, position.token_decimals)
+        else {
+            continue;
+        };
         let candidate = state.candidates.get(&mint);
-        let liquidity = candidate.map(|c| c.market.liquidity_usd).unwrap_or(Decimal::MAX);
-        let invalidated = candidate.is_none();
-        let Some(mark) = derive_mark(deps, state, &mint, remaining, base_decimals, token_decimals, base_price).await else { continue };
+        let liquidity = candidate
+            .map(|c| c.market.liquidity_usd)
+            .unwrap_or(Decimal::MAX);
+        // Exits are independent of the candidate feed; they must be evaluated
+        // on every tick regardless of whether new entry signals are present.
+        let invalidated = false;
+        let Some(mark) = derive_mark(
+            deps,
+            state,
+            &mint,
+            remaining,
+            base_decimals,
+            token_decimals,
+            base_price,
+        )
+        .await
+        else {
+            continue;
+        };
         state.portfolio.mark_to_market(&mint, mark)?;
-        let Some(reason) = exit_reason(&position, mark, liquidity, config.risk.min_liquidity_usd, invalidated, Utc::now(), &config.strategy) else { continue };
+        let Some(reason) = exit_reason(
+            &position,
+            mark,
+            liquidity,
+            config.risk.min_liquidity_usd,
+            invalidated,
+            Utc::now(),
+            &config.strategy,
+        ) else {
+            continue;
+        };
         attempt_exit(deps, state, &mint, remaining, &reason, false).await?;
     }
     Ok(())
 }
 
 /// Fresh sell quote establishes the current mark price; no synthetic prices.
-async fn derive_mark(deps: &SessionDeps<'_>, state: &SessionState, mint: &str, remaining: u64, base_decimals: u8, token_decimals: u8, base_price: Decimal) -> Option<Decimal> {
+async fn derive_mark(
+    deps: &SessionDeps<'_>,
+    state: &SessionState,
+    mint: &str,
+    remaining: u64,
+    base_decimals: u8,
+    token_decimals: u8,
+    base_price: Decimal,
+) -> Option<Decimal> {
     let base_mint = state.portfolio.position(mint)?.base_mint.clone()?;
-    match deps.executor.quote(mint, &base_mint, remaining, deps.config.execution.slippage_bps).await {
-        Ok(q) => mark_price_from_quote(q.output_amount, base_decimals, base_price, remaining, token_decimals),
-        Err(e) => { tracing::warn!(mint=%mint, error=%e, "mark quote unavailable; exit evaluation skipped this tick"); None }
+    match deps
+        .executor
+        .quote(
+            mint,
+            &base_mint,
+            remaining,
+            deps.config.execution.slippage_bps,
+        )
+        .await
+    {
+        Ok(q) => mark_price_from_quote(
+            q.output_amount,
+            base_decimals,
+            base_price,
+            remaining,
+            token_decimals,
+        ),
+        Err(e) => {
+            tracing::warn!(mint=%mint, error=%e, "mark quote unavailable; exit evaluation skipped this tick");
+            None
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn attempt_exit(deps: &SessionDeps<'_>, state: &mut SessionState, mint: &str, remaining: u64, reason: &str, manual: bool) -> Result<()> {    let config = deps.config;
+async fn attempt_exit(
+    deps: &SessionDeps<'_>,
+    state: &mut SessionState,
+    mint: &str,
+    remaining: u64,
+    reason: &str,
+    manual: bool,
+) -> Result<()> {
+    let config = deps.config;
     let store = deps.store;
     let now = Utc::now();
     if let Err(e) = state.risk.authorize_exit(remaining) {
         tracing::warn!(mint=%mint, error=%e, "exit refused by risk engine");
         return Ok(());
     }
-    let Some(position) = state.portfolio.position(mint).cloned() else { return Ok(()) };
-    let Some(token_decimals) = position.token_decimals else { return Ok(()) };
-    let Some(base_decimals) = position.base_mint_decimals else { return Ok(()) };
-    let Some(base_mint) = position.base_mint.clone() else { return Ok(()) };
-    let Some(base_price) = position.base_entry_price_usd else { return Ok(()) };
-    let attempt = store.orders()?.iter().filter(|o| o.kind == OrderKind::Exit && o.position_id.as_deref() == position.position_id.as_deref()).count() as u32;
-    let key = exit_idempotency_key(position.position_id.as_deref().unwrap_or(mint), remaining, reason, attempt);
-    let mark_value = match units(remaining, token_decimals) { Ok(q) => q * base_price, Err(_) => return Ok(()) };
+    let Some(position) = state.portfolio.position(mint).cloned() else {
+        return Ok(());
+    };
+    let Some(token_decimals) = position.token_decimals else {
+        return Ok(());
+    };
+    let Some(base_decimals) = position.base_mint_decimals else {
+        return Ok(());
+    };
+    let Some(base_mint) = position.base_mint.clone() else {
+        return Ok(());
+    };
+    let Some(base_price) = position.base_entry_price_usd else {
+        return Ok(());
+    };
+    let attempt = store
+        .orders()?
+        .iter()
+        .filter(|o| {
+            o.kind == OrderKind::Exit && o.position_id.as_deref() == position.position_id.as_deref()
+        })
+        .count() as u32;
+    let key = exit_idempotency_key(
+        position.position_id.as_deref().unwrap_or(mint),
+        remaining,
+        reason,
+        attempt,
+    );
+    let mark_value = match units(remaining, token_decimals) {
+        Ok(q) => q * base_price,
+        Err(_) => return Ok(()),
+    };
     let order = OrderRecord {
         id: uuid::Uuid::new_v4().to_string(),
         signal_id: position.signal_id.clone(),
@@ -524,7 +828,11 @@ async fn attempt_exit(deps: &SessionDeps<'_>, state: &mut SessionState, mint: &s
         tracing::warn!(mint=%mint, "duplicate exit order blocked by idempotency");
         return Ok(());
     }
-    let quote = match deps.executor.quote(mint, &base_mint, remaining, config.execution.slippage_bps).await {
+    let quote = match deps
+        .executor
+        .quote(mint, &base_mint, remaining, config.execution.slippage_bps)
+        .await
+    {
         Ok(q) => q,
         Err(e) => {
             tracing::error!(mint=%mint, error=%e, "exit quote unavailable; no transaction sent");
@@ -543,7 +851,10 @@ async fn attempt_exit(deps: &SessionDeps<'_>, state: &mut SessionState, mint: &s
         store.update_order(&o)?;
         return Ok(());
     }
-    let min_output = quote.output_amount.saturating_mul((10_000 - config.execution.slippage_bps as u64) as u64) / 10_000;
+    let min_output = quote
+        .output_amount
+        .saturating_mul((10_000 - config.execution.slippage_bps as u64) as u64)
+        / 10_000;
     let mut placed = order.clone();
     placed.transition(OrderState::Submitted).ok();
     store.update_order(&placed)?;
@@ -566,21 +877,32 @@ async fn attempt_exit(deps: &SessionDeps<'_>, state: &mut SessionState, mint: &s
             store.update_order(&placed)?;
             store.save_fill(&fill)?;
             match state.portfolio.apply_exit(mint, &fill, reason, Utc::now()) {
-                Ok(ExitOutcome { realized_pnl_usd, closed }) => {
-                    if let Some(p) = state.portfolio.position(mint) { store.save_position(p)?; }
+                Ok(ExitOutcome {
+                    realized_pnl_usd,
+                    closed,
+                }) => {
+                    if let Some(p) = state.portfolio.position(mint) {
+                        store.save_position(p)?;
+                    }
                     state.risk.record_execution_success();
-                    if realized_pnl_usd < Decimal::ZERO { state.risk.apply_loss_cooldown(Utc::now()); }
+                    if realized_pnl_usd < Decimal::ZERO {
+                        state.risk.apply_loss_cooldown(Utc::now());
+                    }
                     if fill.output_amount < min_output {
                         tracing::error!(order_id=%order.id, actual=fill.output_amount, min_output, "exit fill fell below the minimum accepted output");
                         state.risk.record_execution_failure(Utc::now());
                     }
                     tracing::info!(order_id=%order.id, mint=%mint, %reason, manual, signature=%fill.signature, sold=fill.input_amount, received=fill.output_amount, fees_usd=%fill.fees_usd, realized_pnl_usd=%realized_pnl_usd, closed, "exit confirmed and reconciled");
                 }
-                Err(e) => tracing::error!(order_id=%order.id, error=%e, "confirmed exit could not be applied to the position; operator review required"),
+                Err(e) => {
+                    tracing::error!(order_id=%order.id, error=%e, "confirmed exit could not be applied to the position; operator review required")
+                }
             }
         }
         Err(ExecutionError::Unknown { signature, detail }) => {
-            if let Some(sig) = &signature { placed.signature = Some(sig.clone()); }
+            if let Some(sig) = &signature {
+                placed.signature = Some(sig.clone());
+            }
             placed.transition(OrderState::Unknown).ok();
             placed.error = Some(detail.clone());
             store.update_order(&placed)?;
@@ -591,7 +913,9 @@ async fn attempt_exit(deps: &SessionDeps<'_>, state: &mut SessionState, mint: &s
             placed.error = Some(e.to_string());
             store.update_order(&placed)?;
             let tripped = state.risk.record_execution_failure(Utc::now());
-            if tripped { store.latch_kill_switch("consecutive execution failures")?; }
+            if tripped {
+                store.latch_kill_switch("consecutive execution failures")?;
+            }
             tracing::error!(order_id=%order.id, mint=%mint, error=%e, "exit failed on-chain or was refused; order marked failed");
         }
     }
@@ -604,33 +928,85 @@ async fn process_entries(deps: &SessionDeps<'_>, state: &mut SessionState) -> Re
     let now = Utc::now();
     let mints: Vec<String> = state.candidates.keys().cloned().collect();
     for mint in mints {
-        let Some(c) = state.candidates.get(&mint).cloned() else { continue };
-        let (Some(token_decimals), Some(base_mint_decimals)) = (c.token_decimals, c.base_mint_decimals) else {
+        let Some(c) = state.candidates.get(&mint).cloned() else {
+            continue;
+        };
+        let (Some(token_decimals), Some(base_mint_decimals)) =
+            (c.token_decimals, c.base_mint_decimals)
+        else {
             tracing::warn!(mint=%mint, "candidate is missing canonical mint decimals");
             continue;
         };
-        if c.costs.input.position_size_usd != c.position_usd { tracing::warn!(mint=%mint, "candidate position and economic model disagree"); continue; }
-        let gate = EconomicGate { round_trip_cost_threshold_pct: config.economics.round_trip_cost_threshold_pct };
-        if authorize_entry(&state.risk.kill_switch, &gate, &c.costs).is_err() { tracing::info!(mint=%mint, "economic cost gate rejected candidate"); continue; }
-        let expected = match ExpectedValue::estimate(c.expected_gross_return_pct, &c.costs, Decimal::ZERO, Decimal::ZERO, config.economics.uncertainty_haircut_pct) {
+        if c.costs.input.position_size_usd != c.position_usd {
+            tracing::warn!(mint=%mint, "candidate position and economic model disagree");
+            continue;
+        }
+        let gate = EconomicGate {
+            round_trip_cost_threshold_pct: config.economics.round_trip_cost_threshold_pct,
+        };
+        if authorize_entry(&state.risk.kill_switch, &gate, &c.costs).is_err() {
+            tracing::info!(mint=%mint, "economic cost gate rejected candidate");
+            continue;
+        }
+        let expected = match ExpectedValue::estimate(
+            c.expected_gross_return_pct,
+            &c.costs,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            config.economics.uncertainty_haircut_pct,
+        ) {
             Ok(e) => e,
-            Err(e) => { tracing::warn!(mint=%mint, error=%e, "expected-value estimation failed"); continue; }
+            Err(e) => {
+                tracing::warn!(mint=%mint, error=%e, "expected-value estimation failed");
+                continue;
+            }
         };
-        let wallets: Vec<&WalletStats> = c.wallets.iter().filter(|w| w.updated_at <= c.market.observed_at).collect();
-        let signal = match evaluate_signal(config, &mint, &wallets, &c.market, &c.safety, &expected) {
+        let wallets: Vec<&WalletStats> = c
+            .wallets
+            .iter()
+            .filter(|w| w.updated_at <= c.market.observed_at)
+            .collect();
+        let signal = match evaluate_signal(config, &mint, &wallets, &c.market, &c.safety, &expected)
+        {
             StrategyDecision::Accepted(s) => s,
-            StrategyDecision::Rejected(reason) => { tracing::info!(mint=%mint, %reason, "strategy rejected candidate"); continue; }
+            StrategyDecision::Rejected(reason) => {
+                tracing::info!(mint=%mint, %reason, "strategy rejected candidate");
+                continue;
+            }
         };
-        if state.seen_signals.contains(&signal.id) { continue; }
-        if c.position_usd <= Decimal::ZERO || c.position_usd > config.risk.max_live_capital_usd { tracing::warn!(mint=%mint, "position exceeds configured live-capital cap or is invalid"); continue; }
+        if state.seen_signals.contains(&signal.id) {
+            continue;
+        }
+        if c.position_usd <= Decimal::ZERO || c.position_usd > config.risk.max_live_capital_usd {
+            tracing::warn!(mint=%mint, "position exceeds configured live-capital cap or is invalid");
+            continue;
+        }
         state.risk.state.open_positions = state.portfolio.open_positions().len();
         // Fresh quote before every entry: price impact and viability are
         // evaluated on live data, never on the feed's assertion.
-        let quote = match deps.executor.quote(&config.strategy.base_mint, &mint, c.input_amount, config.execution.slippage_bps).await {
+        let quote = match deps
+            .executor
+            .quote(
+                &config.strategy.base_mint,
+                &mint,
+                c.input_amount,
+                config.execution.slippage_bps,
+            )
+            .await
+        {
             Ok(q) => q,
-            Err(e) => { tracing::warn!(mint=%mint, error=%e, "entry quote unavailable"); continue; }
+            Err(e) => {
+                tracing::warn!(mint=%mint, error=%e, "entry quote unavailable");
+                continue;
+            }
         };
-        if let Err(e) = state.risk.authorize(c.position_usd, c.market.liquidity_usd, config.execution.slippage_bps as u32, quote.price_impact_bps, now) {
+        if let Err(e) = state.risk.authorize(
+            c.position_usd,
+            c.market.liquidity_usd,
+            config.execution.slippage_bps as u32,
+            quote.price_impact_bps,
+            now,
+        ) {
             tracing::info!(mint=%mint, reason=%e, "risk engine rejected entry");
             continue;
         }
@@ -663,7 +1039,10 @@ async fn process_entries(deps: &SessionDeps<'_>, state: &mut SessionState) -> Re
             state.seen_signals.insert(signal.id);
             continue;
         }
-        let min_output = quote.output_amount.saturating_mul((10_000 - config.execution.slippage_bps as u64) as u64) / 10_000;
+        let min_output = quote
+            .output_amount
+            .saturating_mul((10_000 - config.execution.slippage_bps as u64) as u64)
+            / 10_000;
         let mut placed = order.clone();
         placed.transition(OrderState::Submitted).ok();
         store.update_order(&placed)?;
@@ -686,7 +1065,17 @@ async fn process_entries(deps: &SessionDeps<'_>, state: &mut SessionState) -> Re
                 store.update_order(&placed)?;
                 store.save_fill(&fill)?;
                 let entry_price = fill.price_usd;
-                match state.portfolio.apply_entry(mint.clone(), config.strategy.base_mint.clone(), token_decimals, base_mint_decimals, position_id.clone(), &fill, entry_price, signal.id.clone(), c.costs.clone()) {
+                match state.portfolio.apply_entry(
+                    mint.clone(),
+                    config.strategy.base_mint.clone(),
+                    token_decimals,
+                    base_mint_decimals,
+                    position_id.clone(),
+                    &fill,
+                    entry_price,
+                    signal.id.clone(),
+                    c.costs.clone(),
+                ) {
                     Ok(()) => {
                         if let Some(p) = state.portfolio.position(&mint) {
                             store.save_position(p)?;
@@ -697,14 +1086,20 @@ async fn process_entries(deps: &SessionDeps<'_>, state: &mut SessionState) -> Re
                         if fill.output_amount < min_output {
                             tracing::error!(order_id=%order.id, actual=fill.output_amount, min_output, "entry fill fell below the minimum accepted output");
                             let tripped = state.risk.record_execution_failure(Utc::now());
-                            if tripped { store.latch_kill_switch("consecutive execution failures")?; }
+                            if tripped {
+                                store.latch_kill_switch("consecutive execution failures")?;
+                            }
                         }
                     }
-                    Err(e) => tracing::error!(order_id=%order.id, error=%e, "confirmed entry could not be applied to the portfolio; operator review required"),
+                    Err(e) => {
+                        tracing::error!(order_id=%order.id, error=%e, "confirmed entry could not be applied to the portfolio; operator review required")
+                    }
                 }
             }
             Err(ExecutionError::Unknown { signature, detail }) => {
-                if let Some(sig) = &signature { placed.signature = Some(sig.clone()); }
+                if let Some(sig) = &signature {
+                    placed.signature = Some(sig.clone());
+                }
                 placed.transition(OrderState::Unknown).ok();
                 placed.error = Some(detail.clone());
                 store.update_order(&placed)?;
@@ -715,7 +1110,9 @@ async fn process_entries(deps: &SessionDeps<'_>, state: &mut SessionState) -> Re
                 placed.error = Some(e.to_string());
                 store.update_order(&placed)?;
                 let tripped = state.risk.record_execution_failure(Utc::now());
-                if tripped { store.latch_kill_switch("consecutive execution failures")?; }
+                if tripped {
+                    store.latch_kill_switch("consecutive execution failures")?;
+                }
                 tracing::error!(order_id=%order.id, mint=%mint, error=%e, "entry failed or was refused; order marked failed");
             }
         }
@@ -726,7 +1123,10 @@ async fn process_entries(deps: &SessionDeps<'_>, state: &mut SessionState) -> Re
 
 fn persist_session_state(store: &StateStore, state: &SessionState) -> Result<()> {
     store.put("runtime:day", &state.day_key)?;
-    store.put("runtime:day_start_equity", &state.risk.state.day_start_equity_usd)?;
+    store.put(
+        "runtime:day_start_equity",
+        &state.risk.state.day_start_equity_usd,
+    )?;
     store.put("runtime:trades_today", &state.risk.state.trades_today)?;
     Ok(())
 }
@@ -737,14 +1137,39 @@ fn persist_session_state(store: &StateStore, state: &SessionState) -> Result<()>
 pub async fn exit_all_positions(deps: &SessionDeps<'_>) -> Result<usize> {
     let mut portfolio = load_portfolio(deps.store)?;
     let mut exited = 0;
-    let open: Vec<String> = portfolio.open_positions().iter().map(|p| p.mint.clone()).collect();
-    let mut state = SessionState { portfolio, risk: RiskEngine::new(deps.config.risk.clone(), deps.config.risk.starting_capital_usd), candidates: HashMap::new(), seen_signals: HashSet::new(), day_key: Utc::now().date_naive().to_string(), emergency_active: true };
+    let open: Vec<String> = portfolio
+        .open_positions()
+        .iter()
+        .map(|p| p.mint.clone())
+        .collect();
+    let mut state = SessionState {
+        portfolio,
+        risk: RiskEngine::new(
+            deps.config.risk.clone(),
+            deps.config.risk.starting_capital_usd,
+        ),
+        candidates: HashMap::new(),
+        seen_signals: HashSet::new(),
+        day_key: Utc::now().date_naive().to_string(),
+        emergency_active: true,
+    };
     for mint in open {
-        let Some(remaining) = state.portfolio.position(&mint).and_then(|p| p.trusted_remaining()) else {
+        let Some(remaining) = state
+            .portfolio
+            .position(&mint)
+            .and_then(|p| p.trusted_remaining())
+        else {
             tracing::error!(mint=%mint, "manual exit skipped: quantity not trusted; run reconciliation first");
             continue;
         };
-        if deps.store.incomplete_orders()?.iter().any(|o| o.position_id == state.portfolio.position(&mint).and_then(|p| p.position_id.clone()) && o.kind == OrderKind::Exit) {
+        if deps.store.incomplete_orders()?.iter().any(|o| {
+            o.position_id
+                == state
+                    .portfolio
+                    .position(&mint)
+                    .and_then(|p| p.position_id.clone())
+                && o.kind == OrderKind::Exit
+        }) {
             tracing::warn!(mint=%mint, "manual exit skipped: exit order already in flight");
             continue;
         }
@@ -755,7 +1180,9 @@ pub async fn exit_all_positions(deps: &SessionDeps<'_>) -> Result<usize> {
 }
 
 /// Recovers the daily-loss window after a restart (used by session startup).
-pub fn day_rollover_check(now: DateTime<Utc>, stored_day: &str) -> bool { stored_day != now.date_naive().to_string() }
+pub fn day_rollover_check(now: DateTime<Utc>, stored_day: &str) -> bool {
+    stored_day != now.date_naive().to_string()
+}
 
 #[cfg(test)]
 mod tests {
@@ -766,16 +1193,37 @@ mod tests {
 
     fn position(remaining: u64, base_price: Decimal) -> Position {
         Position {
-            mint: "T".into(), position_id: Some("p".into()), token_mint: Some("T".into()), base_mint: Some("SOL".into()),
-            entry_input_amount_atomic: Some(1_000_000), entry_output_amount_atomic: Some(1_000_000),
-            token_decimals: Some(6), base_mint_decimals: Some(9), entry_fees_usd: Some(Decimal::ZERO), entry_slippage_bps: Some(0),
-            entry_cost_model: None, quantity: dec!(1_000_000), remaining_quantity_atomic: Some(remaining),
-            entry_cost_usd: Some(dec!(10)), base_entry_price_usd: Some(base_price), state: PositionState::Open,
-            reconciliation_status: ReconciliationStatus::Reconciled, last_reconciled_at: None, exit_signature: None,
-            exit_fees_usd: None, exit_time: None, entry_price_usd: dec!(0.00001), entry_time: Utc::now(),
-            entry_signature: "sig".into(), high_water_price_usd: dec!(0.00001), realized_pnl_usd: Decimal::ZERO,
-            unrealized_pnl_usd: Decimal::ZERO, fees_usd: Decimal::ZERO, current_value_usd: dec!(10),
-            signal_id: "s".into(), exit_reason: None,
+            mint: "T".into(),
+            position_id: Some("p".into()),
+            token_mint: Some("T".into()),
+            base_mint: Some("SOL".into()),
+            entry_input_amount_atomic: Some(1_000_000),
+            entry_output_amount_atomic: Some(1_000_000),
+            token_decimals: Some(6),
+            base_mint_decimals: Some(9),
+            entry_fees_usd: Some(Decimal::ZERO),
+            entry_slippage_bps: Some(0),
+            entry_cost_model: None,
+            quantity: dec!(1_000_000),
+            remaining_quantity_atomic: Some(remaining),
+            entry_cost_usd: Some(dec!(10)),
+            base_entry_price_usd: Some(base_price),
+            state: PositionState::Open,
+            reconciliation_status: ReconciliationStatus::Reconciled,
+            last_reconciled_at: None,
+            exit_signature: None,
+            exit_fees_usd: None,
+            exit_time: None,
+            entry_price_usd: dec!(0.00001),
+            entry_time: Utc::now(),
+            entry_signature: "sig".into(),
+            high_water_price_usd: dec!(0.00001),
+            realized_pnl_usd: Decimal::ZERO,
+            unrealized_pnl_usd: Decimal::ZERO,
+            fees_usd: Decimal::ZERO,
+            current_value_usd: dec!(10),
+            signal_id: "s".into(),
+            exit_reason: None,
         }
     }
     #[test]
@@ -789,9 +1237,18 @@ mod tests {
     }
     #[test]
     fn exit_keys_differ_per_attempt_and_reason() {
-        assert_ne!(exit_idempotency_key("p", 100, "stop_loss", 0), exit_idempotency_key("p", 100, "stop_loss", 1));
-        assert_ne!(exit_idempotency_key("p", 100, "stop_loss", 0), exit_idempotency_key("p", 99, "stop_loss", 0));
-        assert_eq!(exit_idempotency_key("p", 100, "stop_loss", 0), exit_idempotency_key("p", 100, "stop_loss", 0));
+        assert_ne!(
+            exit_idempotency_key("p", 100, "stop_loss", 0),
+            exit_idempotency_key("p", 100, "stop_loss", 1)
+        );
+        assert_ne!(
+            exit_idempotency_key("p", 100, "stop_loss", 0),
+            exit_idempotency_key("p", 99, "stop_loss", 0)
+        );
+        assert_eq!(
+            exit_idempotency_key("p", 100, "stop_loss", 0),
+            exit_idempotency_key("p", 100, "stop_loss", 0)
+        );
     }
     #[test]
     fn equity_sums_realized_and_unrealized() {
@@ -802,8 +1259,73 @@ mod tests {
         assert_eq!(equity_usd(dec!(100), &[&p1, &p2]), dec!(103));
     }
     #[test]
+    fn exit_reason_with_invalidated_false_evaluates_exit_conditions() {
+        let p = position(1_000, dec!(0.00001));
+        let now = Utc::now();
+        // Price well below entry -> should trigger stop loss, not SignalInvalidated
+        let reason = exit_reason(
+            &p,
+            dec!(0.000005), // 50% below entry
+            Decimal::MAX,
+            config::types::Config::default().risk.min_liquidity_usd,
+            false,
+            now,
+            &crate::config::types::StrategyConfig::default(),
+        );
+        assert_eq!(reason, Some(ExitReason::StopLoss));
+    }
+    #[test]
+    fn process_exits_with_empty_candidate_queue_runs_successfully() {
+        use crate::config::types::Config;
+        use crate::domain::position::PositionState;
+        use crate::risk::RiskEngine;
+        use chrono::Utc;
+        use rust_decimal_macros::dec;
+        let config = Config::default();
+        let mock_executor = crate::execution::paper::FakeExecutor::new(
+            |_a: &str, _b: &str, _c: u64, _d: u16| {
+                Ok(crate::execution::executor::Quote {
+                    input_mint: "SOL".into(),
+                    output_mint: "T".into(),
+                    input_amount: _c,
+                    output_amount: 5_000_000u64,
+                    price_impact_bps: 10,
+                    route: serde_json::json!({}),
+                    observed_at: Utc::now(),
+                })
+            },
+            0,
+        );
+        let mut store = crate::storage::StateStore::mock();
+        let mut portfolio = Portfolio::default();
+        let p = position(1_000, dec!(0.00001));
+        portfolio.add_position(p);
+        store.save_position(&portfolio.position("T".into()).unwrap()).unwrap();
+        let mut risk = RiskEngine::new(config.risk.clone(), config.risk.starting_capital_usd);
+        risk.state.open_positions = 1;
+        let mut state = SessionState {
+            portfolio,
+            risk,
+            candidates: HashMap::new(),
+            seen_signals: HashSet::new(),
+            day_key: Utc::now().date_naive().to_string(),
+            emergency_active: false,
+        };
+        let deps = SessionDeps {
+            config: &config,
+            store: &store,
+            executor: &mock_executor,
+            rpc: &crate::data::rpc::RpcPool,
+        };
+        let result = process_exits(&deps, &mut state);
+        assert!(result.is_ok(), "process_exits should succeed with empty candidate queue");
+    }
+    #[test]
     fn day_rollover_detects_new_utc_day() {
         assert!(day_rollover_check(Utc::now(), "2000-01-01"));
-        assert!(!day_rollover_check(Utc::now(), &Utc::now().date_naive().to_string()));
+        assert!(!day_rollover_check(
+            Utc::now(),
+            &Utc::now().date_naive().to_string()
+        ));
     }
 }

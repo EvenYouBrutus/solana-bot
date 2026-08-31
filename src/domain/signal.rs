@@ -1,3 +1,26 @@
-use chrono::{DateTime, Utc}; use rust_decimal::Decimal; use serde::{Deserialize, Serialize};
-#[derive(Debug, Clone, Serialize, Deserialize)] pub struct SignalScore { pub wallet_score: Decimal, pub wallet_sample_size: u32, pub wallet_recent_score: Decimal, pub consensus_score: Decimal, pub liquidity_score: Decimal, pub momentum_score: Decimal, pub risk_score: Decimal, pub economic_score: Decimal, pub final_signal_score: Decimal }
-#[derive(Debug, Clone, Serialize, Deserialize)] pub struct TradeSignal { pub id: String, pub mint: String, pub wallets: Vec<String>, pub side: crate::domain::wallet::Side, pub score: SignalScore, pub expected_gross_return_pct: Decimal, pub created_at: DateTime<Utc>, pub reason: String }
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalScore {
+    pub wallet_score: Decimal,
+    pub wallet_sample_size: u32,
+    pub wallet_recent_score: Decimal,
+    pub consensus_score: Decimal,
+    pub liquidity_score: Decimal,
+    pub momentum_score: Decimal,
+    pub risk_score: Decimal,
+    pub economic_score: Decimal,
+    pub final_signal_score: Decimal,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeSignal {
+    pub id: String,
+    pub mint: String,
+    pub wallets: Vec<String>,
+    pub side: crate::domain::wallet::Side,
+    pub score: SignalScore,
+    pub expected_gross_return_pct: Decimal,
+    pub created_at: DateTime<Utc>,
+    pub reason: String,
+}

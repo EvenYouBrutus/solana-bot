@@ -1,3 +1,43 @@
-use crate::{config::types::StrategyConfig, domain::position::Position}; use chrono::{DateTime,Utc}; use rust_decimal::Decimal;
-#[derive(Debug,Clone,PartialEq,Eq)] pub enum ExitReason{StopLoss,TakeProfit,TrailingStop,TimeLimit,LiquidityDeterioration,SignalInvalidated}
-pub fn exit_reason(p:&Position,price:Decimal,liquidity:Decimal,min_liquidity:Decimal,invalidated:bool,now:DateTime<Utc>,c:&StrategyConfig)->Option<ExitReason>{if liquidity<min_liquidity{return Some(ExitReason::LiquidityDeterioration)}if invalidated{return Some(ExitReason::SignalInvalidated)}let r=(price-p.entry_price_usd)/p.entry_price_usd*Decimal::new(100,0);if r<=-c.stop_loss_pct{return Some(ExitReason::StopLoss)}if r>=c.take_profit_pct{return Some(ExitReason::TakeProfit)}if price<=p.high_water_price_usd*(Decimal::ONE-c.trailing_stop_pct/Decimal::new(100,0)){return Some(ExitReason::TrailingStop)}if(now-p.entry_time).num_minutes()>=c.max_holding_minutes{return Some(ExitReason::TimeLimit)}None}
+use crate::{config::types::StrategyConfig, domain::position::Position};
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitReason {
+    StopLoss,
+    TakeProfit,
+    TrailingStop,
+    TimeLimit,
+    LiquidityDeterioration,
+    SignalInvalidated,
+}
+pub fn exit_reason(
+    p: &Position,
+    price: Decimal,
+    liquidity: Decimal,
+    min_liquidity: Decimal,
+    invalidated: bool,
+    now: DateTime<Utc>,
+    c: &StrategyConfig,
+) -> Option<ExitReason> {
+    if liquidity < min_liquidity {
+        return Some(ExitReason::LiquidityDeterioration);
+    }
+    if invalidated {
+        return Some(ExitReason::SignalInvalidated);
+    }
+    let r = (price - p.entry_price_usd) / p.entry_price_usd * Decimal::new(100, 0);
+    if r <= -c.stop_loss_pct {
+        return Some(ExitReason::StopLoss);
+    }
+    if r >= c.take_profit_pct {
+        return Some(ExitReason::TakeProfit);
+    }
+    if price <= p.high_water_price_usd * (Decimal::ONE - c.trailing_stop_pct / Decimal::new(100, 0))
+    {
+        return Some(ExitReason::TrailingStop);
+    }
+    if (now - p.entry_time).num_minutes() >= c.max_holding_minutes {
+        return Some(ExitReason::TimeLimit);
+    }
+    None
+}

@@ -1,4 +1,101 @@
-use crate::{config::types::Config, domain::{market::MarketSnapshot, signal::{SignalScore, TradeSignal}, token::TokenSafety, wallet::{Side, WalletStats}}, economics::ExpectedValue};
-use chrono::Utc; use rust_decimal::Decimal; use rust_decimal_macros::dec; use uuid::Uuid;
-#[derive(Debug)] pub enum StrategyDecision { Accepted(TradeSignal), Rejected(String) }
-pub fn evaluate_signal(config:&Config,mint:&str,wallets:&[&WalletStats],market:&MarketSnapshot,safety:&TokenSafety,expected:&ExpectedValue)->StrategyDecision { let now=Utc::now(); if market.observed_at>now||safety.observed_at>now||market.age_seconds(now)>config.rpc.max_data_age_secs{return StrategyDecision::Rejected("stale or future-dated market data".into())} if market.liquidity_usd<config.risk.min_liquidity_usd{return StrategyDecision::Rejected("insufficient liquidity".into())} if safety.token_age_secs<config.strategy.min_token_age_secs||safety.mint_authority_present||safety.freeze_authority_present||safety.holder_top10_pct>dec!(70)||safety.sellable!=Some(true)||safety.route_available!=Some(true)||safety.creator_suspicious==Some(true)||safety.abnormal_activity==Some(true)||safety.liquidity_change_pct.unwrap_or(Decimal::ZERO)<dec!(-20){return StrategyDecision::Rejected("token safety filter or incomplete safety evidence".into())} if wallets.len()<config.strategy.min_consensus_wallets{return StrategyDecision::Rejected("insufficient independent qualified wallet consensus".into())} if wallets.iter().any(|w|w.trades<config.strategy.min_wallet_samples||w.score<config.strategy.min_wallet_score||w.updated_at>now){return StrategyDecision::Rejected("wallet evidence below configured confidence threshold".into())} if expected.net_return_pct<config.economics.min_expected_net_return_pct{return StrategyDecision::Rejected("economic edge below threshold".into())} let count=Decimal::from(wallets.len()as u32);let mut score=SignalScore{wallet_score:wallets.iter().map(|w|w.score).sum::<Decimal>()/count,wallet_sample_size:wallets.iter().map(|w|w.trades).min().unwrap_or(0),wallet_recent_score:wallets.iter().map(|w|w.recent_return_pct).sum::<Decimal>()/count,consensus_score:(count*dec!(20)).min(dec!(100)),liquidity_score:(market.liquidity_usd/dec!(10000)*dec!(100)).min(dec!(100)),momentum_score:(market.buy_sell_imbalance*dec!(50)).clamp(Decimal::ZERO,dec!(100)),risk_score:dec!(100)-market.volatility_pct.min(dec!(100)),economic_score:(expected.net_return_pct*dec!(10)).min(dec!(100)),final_signal_score:Decimal::ZERO};score.final_signal_score=(score.wallet_score+score.consensus_score+score.liquidity_score+score.momentum_score+score.risk_score+score.economic_score)/dec!(6);if score.final_signal_score<config.strategy.min_signal_score{return StrategyDecision::Rejected("signal confidence below threshold".into())}StrategyDecision::Accepted(TradeSignal{id:Uuid::new_v4().to_string(),mint:mint.into(),wallets:wallets.iter().map(|w|w.wallet.clone()).collect(),side:Side::Buy,score,expected_gross_return_pct:expected.gross_return_pct,created_at:now,reason:"qualified-wallet accumulation with liquid safe market".into()}) }
+use crate::{
+    config::types::Config,
+    domain::{
+        market::MarketSnapshot,
+        signal::{SignalScore, TradeSignal},
+        token::TokenSafety,
+        wallet::{Side, WalletStats},
+    },
+    economics::ExpectedValue,
+};
+use chrono::Utc;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use uuid::Uuid;
+#[derive(Debug)]
+pub enum StrategyDecision {
+    Accepted(TradeSignal),
+    Rejected(String),
+}
+pub fn evaluate_signal(
+    config: &Config,
+    mint: &str,
+    wallets: &[&WalletStats],
+    market: &MarketSnapshot,
+    safety: &TokenSafety,
+    expected: &ExpectedValue,
+) -> StrategyDecision {
+    let now = Utc::now();
+    if market.observed_at > now
+        || safety.observed_at > now
+        || market.age_seconds(now) > config.rpc.max_data_age_secs
+    {
+        return StrategyDecision::Rejected("stale or future-dated market data".into());
+    }
+    if market.liquidity_usd < config.risk.min_liquidity_usd {
+        return StrategyDecision::Rejected("insufficient liquidity".into());
+    }
+    if safety.token_age_secs < config.strategy.min_token_age_secs
+        || safety.mint_authority_present
+        || safety.freeze_authority_present
+        || safety.holder_top10_pct > dec!(70)
+        || safety.sellable != Some(true)
+        || safety.route_available != Some(true)
+        || safety.creator_suspicious == Some(true)
+        || safety.abnormal_activity == Some(true)
+        || safety.liquidity_change_pct.unwrap_or(Decimal::ZERO) < dec!(-20)
+    {
+        return StrategyDecision::Rejected(
+            "token safety filter or incomplete safety evidence".into(),
+        );
+    }
+    if wallets.len() < config.strategy.min_consensus_wallets {
+        return StrategyDecision::Rejected(
+            "insufficient independent qualified wallet consensus".into(),
+        );
+    }
+    if wallets.iter().any(|w| {
+        w.trades < config.strategy.min_wallet_samples
+            || w.score < config.strategy.min_wallet_score
+            || w.updated_at > now
+    }) {
+        return StrategyDecision::Rejected(
+            "wallet evidence below configured confidence threshold".into(),
+        );
+    }
+    if expected.net_return_pct < config.economics.min_expected_net_return_pct {
+        return StrategyDecision::Rejected("economic edge below threshold".into());
+    }
+    let count = Decimal::from(wallets.len() as u32);
+    let mut score = SignalScore {
+        wallet_score: wallets.iter().map(|w| w.score).sum::<Decimal>() / count,
+        wallet_sample_size: wallets.iter().map(|w| w.trades).min().unwrap_or(0),
+        wallet_recent_score: wallets.iter().map(|w| w.recent_return_pct).sum::<Decimal>() / count,
+        consensus_score: (count * dec!(20)).min(dec!(100)),
+        liquidity_score: (market.liquidity_usd / dec!(10000) * dec!(100)).min(dec!(100)),
+        momentum_score: (market.buy_sell_imbalance * dec!(50)).clamp(Decimal::ZERO, dec!(100)),
+        risk_score: dec!(100) - market.volatility_pct.min(dec!(100)),
+        economic_score: (expected.net_return_pct * dec!(10)).min(dec!(100)),
+        final_signal_score: Decimal::ZERO,
+    };
+    score.final_signal_score = (score.wallet_score
+        + score.consensus_score
+        + score.liquidity_score
+        + score.momentum_score
+        + score.risk_score
+        + score.economic_score)
+        / dec!(6);
+    if score.final_signal_score < config.strategy.min_signal_score {
+        return StrategyDecision::Rejected("signal confidence below threshold".into());
+    }
+    StrategyDecision::Accepted(TradeSignal {
+        id: Uuid::new_v4().to_string(),
+        mint: mint.into(),
+        wallets: wallets.iter().map(|w| w.wallet.clone()).collect(),
+        side: Side::Buy,
+        score,
+        expected_gross_return_pct: expected.gross_return_pct,
+        created_at: now,
+        reason: "qualified-wallet accumulation with liquid safe market".into(),
+    })
+}
