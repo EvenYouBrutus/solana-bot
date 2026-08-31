@@ -174,7 +174,7 @@ pub async fn reconcile_pending_orders(deps: &SessionDeps) -> Result<ReconcileSum
 
 /// Applies a verified on-chain outcome to an order created in a previous
 /// process. Returns Ok(false) when accounting cannot be completed safely.
-async fn record_reconciled_fill(
+pub(crate) async fn record_reconciled_fill(
     deps: &SessionDeps,
     order: &OrderRecord,
     outcome: crate::execution::reconcile::ChainSwapOutcome,
@@ -1599,5 +1599,263 @@ mod tests {
             Utc::now(),
             &Utc::now().date_naive().to_string()
         ));
+    }
+
+    // --- Regression tests for Task 5: reconciliation/accounting safety ---
+
+    #[test]
+    fn entries_blocked_by_incomplete_orders() {
+        let store = crate::storage::StateStore::open(":memory:").unwrap();
+        assert!(
+            !entries_blocked_by(&store).unwrap(),
+            "empty store should not block entries"
+        );
+        // Reserve an incomplete order.
+        let order = crate::domain::trade::OrderRecord {
+            id: "blocker".into(),
+            signal_id: "s".into(),
+            mint: "T".into(),
+            kind: OrderKind::Entry,
+            position_id: Some("p".into()),
+            side: OrderSide::Buy,
+            input_mint: Some("SOL".into()),
+            output_mint: Some("T".into()),
+            input_amount_atomic: Some(1_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(6),
+            state: OrderState::Pending,
+            idempotency_key: "blocker-key".into(),
+            created_at: Utc::now(),
+            signature: None,
+            error: None,
+        };
+        store.reserve_order(&order).unwrap();
+        assert!(
+            entries_blocked_by(&store).unwrap(),
+            "incomplete order must block new entries"
+        );
+    }
+
+    #[test]
+    fn duplicate_fill_prevented_by_idempotency() {
+        let store = crate::storage::StateStore::open(":memory:").unwrap();
+        let order = crate::domain::trade::OrderRecord {
+            id: "dup-test".into(),
+            signal_id: "s".into(),
+            mint: "T".into(),
+            kind: OrderKind::Entry,
+            position_id: Some("p".into()),
+            side: OrderSide::Buy,
+            input_mint: Some("SOL".into()),
+            output_mint: Some("T".into()),
+            input_amount_atomic: Some(1_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(6),
+            state: OrderState::Pending,
+            idempotency_key: "same-key".into(),
+            created_at: Utc::now(),
+            signature: None,
+            error: None,
+        };
+        assert!(store.reserve_order(&order).unwrap());
+        // Second reservation with same key must be rejected.
+        let order2 = crate::domain::trade::OrderRecord {
+            id: "dup-test-2".into(),
+            ..order
+        };
+        assert!(!store.reserve_order(&order2).unwrap());
+    }
+
+    #[test]
+    fn terminal_order_states_never_transition() {
+        let terminal_states = [
+            OrderState::Confirmed,
+            OrderState::Failed,
+            OrderState::Expired,
+            OrderState::Reconciled,
+        ];
+        for state in &terminal_states {
+            let mut order = crate::domain::trade::OrderRecord {
+                id: "term".into(),
+                signal_id: "s".into(),
+                mint: "T".into(),
+                kind: OrderKind::Entry,
+                position_id: Some("p".into()),
+                side: OrderSide::Buy,
+                input_mint: Some("SOL".into()),
+                output_mint: Some("T".into()),
+                input_amount_atomic: Some(1_000_000),
+                input_value_usd: Some(dec!(10)),
+                output_mint_decimals: Some(6),
+                state: state.clone(),
+                idempotency_key: "term-key".into(),
+                created_at: Utc::now(),
+                signature: None,
+                error: None,
+            };
+            assert!(
+                order.transition(OrderState::Pending).is_err(),
+                "terminal state {:?} must not transition to Pending",
+                state
+            );
+            assert!(
+                order.transition(OrderState::Submitted).is_err(),
+                "terminal state {:?} must not transition to Submitted",
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_order_requires_reconciliation_before_terminal() {
+        let mut order = crate::domain::trade::OrderRecord {
+            id: "unk".into(),
+            signal_id: "s".into(),
+            mint: "T".into(),
+            kind: OrderKind::Entry,
+            position_id: Some("p".into()),
+            side: OrderSide::Buy,
+            input_mint: Some("SOL".into()),
+            output_mint: Some("T".into()),
+            input_amount_atomic: Some(1_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(6),
+            state: OrderState::Unknown,
+            idempotency_key: "unk-key".into(),
+            created_at: Utc::now(),
+            signature: None,
+            error: None,
+        };
+        // Unknown → Confirmed is allowed.
+        assert!(order.transition(OrderState::Confirmed).is_ok());
+        // Unknown → Reconciled is allowed.
+        let mut order2 = crate::domain::trade::OrderRecord {
+            id: "unk2".into(),
+            state: OrderState::Unknown,
+            idempotency_key: "unk-key2".into(),
+            ..crate::domain::trade::OrderRecord {
+                id: "tmp".into(),
+                signal_id: "s".into(),
+                mint: "T".into(),
+                kind: OrderKind::Entry,
+                position_id: Some("p".into()),
+                side: OrderSide::Buy,
+                input_mint: Some("SOL".into()),
+                output_mint: Some("T".into()),
+                input_amount_atomic: Some(1_000_000),
+                input_value_usd: Some(dec!(10)),
+                output_mint_decimals: Some(6),
+                state: OrderState::Pending,
+                idempotency_key: "tmp".into(),
+                created_at: Utc::now(),
+                signature: None,
+                error: None,
+            }
+        };
+        assert!(order2.transition(OrderState::Reconciled).is_ok());
+        // Unknown → Failed is allowed.
+        let mut order3 = make_unknown_order("unk3", "unk-key3");
+        assert!(order3.transition(OrderState::Failed).is_ok());
+        // Unknown → Pending is NOT allowed (no backwards transitions).
+        let mut order4 = make_unknown_order("unk4", "unk-key4");
+        assert!(order4.transition(OrderState::Pending).is_err());
+    }
+
+    fn make_unknown_order(id: &str, key: &str) -> crate::domain::trade::OrderRecord {
+        crate::domain::trade::OrderRecord {
+            id: id.into(),
+            signal_id: "s".into(),
+            mint: "T".into(),
+            kind: OrderKind::Entry,
+            position_id: Some("p".into()),
+            side: OrderSide::Buy,
+            input_mint: Some("SOL".into()),
+            output_mint: Some("T".into()),
+            input_amount_atomic: Some(1_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(6),
+            state: OrderState::Unknown,
+            idempotency_key: key.into(),
+            created_at: Utc::now(),
+            signature: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn aggregate_exposure_matches_portfolio() {
+        use crate::domain::position::Position;
+        let mut portfolio = Portfolio::default();
+        // Use different mints so both positions are stored.
+        let mut p1 = position(1_000, dec!(0.00001));
+        p1.mint = "T1".into();
+        let mut p2 = position(2_000, dec!(0.00002));
+        p2.mint = "T2".into();
+        portfolio.load(vec![p1, p2]);
+        let open: Vec<&Position> = portfolio.open_positions();
+        let exposure = aggregate_exposure(&open);
+        // Both have entry_cost_usd = Some(dec!(10)) so total = 20.
+        assert_eq!(exposure, dec!(20));
+    }
+
+    #[test]
+    fn exit_idempotency_key_includes_all_fields() {
+        let k1 = exit_idempotency_key("p1", 100, "stop_loss", 0);
+        let k2 = exit_idempotency_key("p2", 100, "stop_loss", 0);
+        let k3 = exit_idempotency_key("p1", 200, "stop_loss", 0);
+        let k4 = exit_idempotency_key("p1", 100, "take_profit", 0);
+        let k5 = exit_idempotency_key("p1", 100, "stop_loss", 1);
+        // All different inputs → all different keys.
+        assert_ne!(k1, k2);
+        assert_ne!(k1, k3);
+        assert_ne!(k1, k4);
+        assert_ne!(k1, k5);
+    }
+
+    #[test]
+    fn fill_accounting_fields_survive_store_round_trip() {
+        let store = crate::storage::StateStore::open(":memory:").unwrap();
+        let mut order = crate::domain::trade::OrderRecord {
+            id: "acct".into(),
+            signal_id: "s".into(),
+            mint: "T".into(),
+            kind: OrderKind::Entry,
+            position_id: Some("p".into()),
+            side: OrderSide::Buy,
+            input_mint: Some("SOL".into()),
+            output_mint: Some("T".into()),
+            input_amount_atomic: Some(1_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(6),
+            state: OrderState::Pending,
+            idempotency_key: "acct-key".into(),
+            created_at: Utc::now(),
+            signature: None,
+            error: None,
+        };
+        store.reserve_order(&order).unwrap();
+        order.transition(OrderState::Submitted).unwrap();
+        order.signature = Some("sig-123".into());
+        store.update_order(&order).unwrap();
+        let fill = crate::domain::trade::Fill {
+            order_id: "acct".into(),
+            signature: "sig-123".into(),
+            input_amount: 1_000_000,
+            output_amount: 5_000_000,
+            price_usd: dec!(0.000002),
+            fees_usd: dec!(0.01),
+            slippage_bps: 30,
+            confirmed_at: Utc::now(),
+            latency_ms: 150,
+            fee_lamports: 10_000,
+            input_value_usd: Some(dec!(10)),
+            expected_output_amount: Some(5_200_000),
+        };
+        store.save_fill(&fill).unwrap();
+        let loaded = store.fill_for_order("acct").unwrap().unwrap();
+        assert_eq!(loaded.fee_lamports, 10_000);
+        assert_eq!(loaded.input_value_usd, Some(dec!(10)));
+        assert_eq!(loaded.expected_output_amount, Some(5_200_000));
+        assert_eq!(loaded.slippage_bps, 30);
     }
 }

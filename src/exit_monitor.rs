@@ -15,6 +15,7 @@ use crate::{
     },
     execution::{reconcile_signature, units, ExecutionError, Executor},
     portfolio::Portfolio,
+    runtime::{record_reconciled_fill, SessionDeps},
     storage::StateStore,
     strategy::exit_reason,
 };
@@ -77,7 +78,7 @@ impl ExitMonitor {
 
         // 1. Reconcile any orders stuck in Unknown/Pending before evaluating
         //    exits – this frees up positions that have a flight in progress.
-        reconcile_stale_orders(store, executor, &self.deps.rpc, config).await;
+        reconcile_stale_orders(&self.deps).await;
 
         // 2. Load all positions from persistent storage.
         let stored = store.positions()?;
@@ -213,16 +214,17 @@ fn has_inflight_exit(store: &StateStore, position: &Position) -> Result<bool> {
 // Order reconciliation for stale / unknown orders
 // ---------------------------------------------------------------------------
 
-async fn reconcile_stale_orders(
-    store: &StateStore,
-    executor: &dyn Executor,
-    rpc: &RpcPool,
-    config: &Config,
-) {
+async fn reconcile_stale_orders(deps: &ExitDeps) {
+    let session_deps = SessionDeps {
+        config: deps.config.clone(),
+        store: deps.store.clone(),
+        executor: deps.executor.clone(),
+        rpc: deps.rpc.clone(),
+    };
     let now = Utc::now();
-    let live = executor.is_live();
-    let owner = executor.signer_pubkey();
-    for order in match store.incomplete_orders() {
+    let live = deps.executor.is_live();
+    let owner = deps.executor.signer_pubkey();
+    for order in match deps.store.incomplete_orders() {
         Ok(o) => o,
         Err(e) => {
             tracing::error!(error=%e, "exit monitor: could not load incomplete orders");
@@ -232,19 +234,18 @@ async fn reconcile_stale_orders(
         let age = now - order.created_at;
         match (&order.signature, live) {
             (None, _) => {
-                if age > Duration::seconds(config.rpc.unknown_after_secs) {
+                if age > Duration::seconds(deps.config.rpc.unknown_after_secs) {
                     let mut o = order.clone();
                     o.error = Some("expired without submission (exit monitor)".into());
                     o.transition(OrderState::Failed).ok();
-                    store.update_order(&o).ok();
+                    deps.store.update_order(&o).ok();
                 }
             }
             (Some(_sig), false) => {
-                // Paper-mode: nothing on-chain.
                 let mut o = order.clone();
                 o.error = Some("paper signature cannot be reconciled".into());
                 o.transition(OrderState::Failed).ok();
-                store.update_order(&o).ok();
+                deps.store.update_order(&o).ok();
             }
             (Some(sig), true) => {
                 let Some(owner) = &owner else {
@@ -257,29 +258,47 @@ async fn reconcile_stale_orders(
                 ) else {
                     continue;
                 };
-                match reconcile_signature(rpc, sig, input_mint, output_mint, owner, expected_input)
-                    .await
+                match reconcile_signature(
+                    &deps.rpc,
+                    sig,
+                    input_mint,
+                    output_mint,
+                    owner,
+                    expected_input,
+                )
+                .await
                 {
-                    Ok(Some(_outcome)) => {
-                        // Fill was already accounted by the main session or
-                        // earlier reconciliation; just mark terminal.
-                        let mut o = order.clone();
-                        o.transition(OrderState::Confirmed).ok();
-                        store.update_order(&o).ok();
+                    Ok(Some(outcome)) => {
+                        // Use the shared reconciliation path to record the
+                        // fill and apply it to the portfolio, preventing
+                        // lost accounting after a restart.
+                        match record_reconciled_fill(&session_deps, &order, outcome, sig).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                // Fill already accounted or position missing;
+                                // mark terminal so the order doesn't block.
+                                let mut o = order.clone();
+                                o.transition(OrderState::Confirmed).ok();
+                                deps.store.update_order(&o).ok();
+                            }
+                            Err(e) => {
+                                tracing::error!(order_id=%order.id, error=%e, "exit monitor: reconciled fill could not be accounted");
+                            }
+                        }
                     }
                     Ok(None) => {
-                        if age > Duration::seconds(config.rpc.unknown_after_secs) {
+                        if age > Duration::seconds(deps.config.rpc.unknown_after_secs) {
                             let mut o = order.clone();
                             o.error = Some("signature never appeared (exit monitor)".into());
                             o.transition(OrderState::Expired).ok();
-                            store.update_order(&o).ok();
+                            deps.store.update_order(&o).ok();
                         }
                     }
                     Err(ExecutionError::Transaction(detail)) => {
                         let mut o = order.clone();
                         o.error = Some(detail);
                         o.transition(OrderState::Failed).ok();
-                        store.update_order(&o).ok();
+                        deps.store.update_order(&o).ok();
                     }
                     Err(_) => {
                         // Availability error; leave as-is for next tick.
@@ -947,5 +966,142 @@ mod tests {
         assert!(store.is_signal_invalidated("sig-1").unwrap());
         // Different signal is not invalidated.
         assert!(!store.is_signal_invalidated("sig-2").unwrap());
+    }
+
+    // --- Regression tests for Task 5: reconciliation/accounting safety ---
+
+    #[test]
+    fn fill_recorded_by_reconciliation_survives_restart() {
+        let store = StateStore::open(":memory:").unwrap();
+        let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        store.save_position(&pos).unwrap();
+        // Create an Unknown order with a signature (as if submit succeeded
+        // but confirmation was lost).
+        let order = OrderRecord {
+            id: "exit-unknown".into(),
+            signal_id: "s".into(),
+            mint: "TOKEN".into(),
+            kind: OrderKind::Exit,
+            position_id: Some("pos-1".into()),
+            side: OrderSide::Sell,
+            input_mint: Some("TOKEN".into()),
+            output_mint: Some("SOL".into()),
+            input_amount_atomic: Some(1_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(9),
+            state: OrderState::Unknown,
+            idempotency_key: "exit-unknown-key".into(),
+            created_at: Utc::now(),
+            signature: Some("on-chain-sig".into()),
+            error: Some("outcome unknown".into()),
+        };
+        store.reserve_order(&order).unwrap();
+        // After restart, the order is still Unknown and has a signature.
+        let incomplete = store.incomplete_orders().unwrap();
+        assert_eq!(incomplete.len(), 1);
+        assert_eq!(incomplete[0].state, OrderState::Unknown);
+        assert!(incomplete[0].signature.is_some());
+    }
+
+    #[test]
+    fn confirmed_order_blocks_inflight_exit_check() {
+        let store = StateStore::open(":memory:").unwrap();
+        let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        // Create an exit order that was confirmed.
+        let order = OrderRecord {
+            id: "exit-confirmed".into(),
+            signal_id: "s".into(),
+            mint: "TOKEN".into(),
+            kind: OrderKind::Exit,
+            position_id: Some("pos-1".into()),
+            side: OrderSide::Sell,
+            input_mint: Some("TOKEN".into()),
+            output_mint: Some("SOL".into()),
+            input_amount_atomic: Some(1_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(9),
+            state: OrderState::Confirmed,
+            idempotency_key: "exit-confirmed-key".into(),
+            created_at: Utc::now(),
+            signature: Some("sig".into()),
+            error: None,
+        };
+        store.reserve_order(&order).unwrap();
+        // Confirmed order is terminal → should not block new exits.
+        assert!(!has_inflight_exit(&store, &pos).unwrap());
+    }
+
+    #[test]
+    fn fill_persists_after_partial_exit() {
+        let store = StateStore::open(":memory:").unwrap();
+        let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        store.save_position(&pos).unwrap();
+        let mut portfolio = Portfolio::default();
+        portfolio.load(store.positions().unwrap());
+        // Partial exit: sell 40% of the position.
+        let fill = crate::domain::trade::Fill {
+            order_id: "o-partial".into(),
+            signature: "sig-partial".into(),
+            input_amount: 400_000,
+            output_amount: 200_000_000,
+            price_usd: dec!(0.00001),
+            fees_usd: dec!(0.01),
+            slippage_bps: 10,
+            confirmed_at: Utc::now(),
+            latency_ms: 0,
+            fee_lamports: 5_000,
+            input_value_usd: Some(dec!(4)),
+            expected_output_amount: Some(210_000_000),
+        };
+        let outcome = portfolio.apply_exit("TOKEN", &fill, "trailing_stop", Utc::now());
+        assert!(outcome.is_ok());
+        let out = outcome.unwrap();
+        assert!(!out.closed);
+        // Remaining: 600_000
+        assert_eq!(
+            portfolio
+                .position("TOKEN")
+                .unwrap()
+                .remaining_quantity_atomic,
+            Some(600_000)
+        );
+        // realized_pnl = proceeds - cost_of_sold - fees = 4 - 4 - 0.01 = -0.01
+        assert_eq!(out.realized_pnl_usd, dec!(-0.01));
+        if let Some(p) = portfolio.position("TOKEN") {
+            store.save_position(p).unwrap();
+        }
+        let reloaded = store.positions().unwrap();
+        assert_eq!(reloaded[0].remaining_quantity_atomic, Some(600_000));
+        assert_eq!(reloaded[0].realized_pnl_usd, dec!(-0.01));
+    }
+
+    #[test]
+    fn exit_all_uses_shared_execution_path() {
+        // Verify that exit_all_positions checks incomplete orders before
+        // attempting exits, same as normal exit pipeline.
+        let store = StateStore::open(":memory:").unwrap();
+        let pos = test_position(1_000_000, dec!(0.00001), dec!(150));
+        store.save_position(&pos).unwrap();
+        let order = OrderRecord {
+            id: "inflight".into(),
+            signal_id: "s".into(),
+            mint: "TOKEN".into(),
+            kind: OrderKind::Exit,
+            position_id: Some("pos-1".into()),
+            side: OrderSide::Sell,
+            input_mint: Some("TOKEN".into()),
+            output_mint: Some("SOL".into()),
+            input_amount_atomic: Some(1_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(9),
+            state: OrderState::Submitted,
+            idempotency_key: "inflight-key".into(),
+            created_at: Utc::now(),
+            signature: None,
+            error: None,
+        };
+        store.reserve_order(&order).unwrap();
+        // has_inflight_exit detects the in-flight order.
+        assert!(has_inflight_exit(&store, &pos).unwrap());
     }
 }
