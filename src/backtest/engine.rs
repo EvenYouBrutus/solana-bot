@@ -273,6 +273,12 @@ fn build_position(
 /// - MFE/MAE are computed from all observations up to and including the exit.
 /// - The trailing stop evaluates against high-water from prior observations
 ///   (the current observation's price is evaluated against the previous high).
+/// - TimeLimit is ONLY ever produced by exit_reason() evaluating a real
+///   observation. If the walk ends with no trigger, the trade is Censored
+///   (insufficient future data), never a synthetic TimeLimit.
+/// - Ambiguous intervals (SL and TP both crossed, ordering unknowable) take
+///   the documented conservative rule: exit at the stop level, flag the trade
+///   ambiguous, exclude it from performance statistics.
 /// - IDs are deterministic (no randomness; no wall-clock input anywhere).
 pub fn simulate_signal(
     signal: &HistoricalSignal,
@@ -281,17 +287,6 @@ pub fn simulate_signal(
     split: Split,
     trade_index: usize,
 ) -> Result<SimulatedTrade, String> {
-    // --- Price path sufficiency check ---
-    // The data must span at least max_holding_minutes from entry to permit
-    // a valid TimeLimit exit. If not, and no exit trigger occurs, the trade
-    // must be marked Censored.
-    let max_hold = chrono::Duration::minutes(config.strategy.max_holding_minutes);
-    let price_path_sufficient = if let Some(last_obs) = signal.price_history.last() {
-        (last_obs.timestamp - signal.signal_timestamp) >= max_hold
-    } else {
-        false
-    };
-
     // --- Point-in-time validation of the economic inputs ---
     // The production entry path evaluates the economic gate on the cost model,
     // so the cost model must be point-in-time valid. Reject otherwise: cost
@@ -400,7 +395,11 @@ pub fn simulate_signal(
             ) {
                 is_ambiguous = true;
                 ambiguous_reason = Some(reason);
-                exit_price = price;
+                // Conservative rule: assume the unfavorable outcome (the stop)
+                // fired inside the interval. Book the exit at the stop level,
+                // never at the observed close, which may sit on the favorable
+                // (take-profit) side of the interval.
+                exit_price = entry_price * (dec!(1) - config.strategy.stop_loss_pct / dec!(100));
                 exit_time = obs.timestamp;
                 exit_reason_found = Some(ExitReason::StopLoss);
                 break;
@@ -448,44 +447,34 @@ pub fn simulate_signal(
     }
 
     // --- Determine exit reason ---
+    // TimeLimit is ONLY ever produced by exit_reason() evaluating a real
+    // observation at/after max_holding_minutes. If the walk ended without a
+    // trigger, the historical record ends before a valid exit can be
+    // determined and there is no terminal event: the trade is Censored and
+    // must never be reported as a synthetic TimeLimit exit.
     let (exit_reason_final, is_censored, censored_reason) = match &exit_reason_found {
         Some(reason) => (reason.clone(), false, None),
         None => {
-            // No exit trigger occurred. Determine if this is a valid TimeLimit
-            // or if the data is insufficient (Censored).
-            if price_path_sufficient {
-                // Data spans >= max_holding_minutes: valid TimeLimit exit.
-                if signal.price_history.last().is_some() {
-                    (ExitReason::TimeLimit, false, None)
-                } else {
-                    (
-                        ExitReason::Censored,
-                        true,
-                        Some("no price observations".into()),
-                    )
-                }
-            } else {
-                // Data spans < max_holding_minutes: insufficient data.
-                // Mark as Censored, not TimeLimit.
-                (
-                    ExitReason::Censored,
-                    true,
-                    Some(format!(
-                        "price history spans {} minutes but max_holding is {} minutes; \
-                         insufficient future data to determine exit",
-                        signal
-                            .price_history
-                            .last()
-                            .map(|o| (o.timestamp - signal.signal_timestamp).num_minutes())
-                            .unwrap_or(0),
-                        config.strategy.max_holding_minutes
-                    )),
-                )
-            }
+            let span_minutes = signal
+                .price_history
+                .last()
+                .map(|o| (o.timestamp - signal.signal_timestamp).num_minutes())
+                .unwrap_or(0);
+            (
+                ExitReason::Censored,
+                true,
+                Some(format!(
+                    "insufficient_future_data: {span_minutes} minutes of history after entry \
+                     but max_holding is {} minutes; no exit trigger and no terminal event observed",
+                    config.strategy.max_holding_minutes
+                )),
+            )
         }
     };
 
-    // Set exit_price and exit_time for the no-trigger case.
+    // Set exit_price and exit_time for the no-trigger case. These mark where
+    // the observable data ends; censored trades are excluded from realized
+    // performance statistics.
     if exit_reason_found.is_none() {
         if let Some(last_obs) = signal.price_history.last() {
             exit_price = last_obs.price_usd;
@@ -1013,7 +1002,7 @@ sqlite_path = ":memory:"
         assert!(trade
             .censored_reason
             .unwrap()
-            .contains("insufficient future data"));
+            .contains("insufficient_future_data"));
     }
 
     #[test]
@@ -1030,6 +1019,51 @@ sqlite_path = ":memory:"
             simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         assert_eq!(trade.exit_reason, ExitReason::Censored);
         assert!(trade.is_censored);
+    }
+
+    #[test]
+    fn no_trigger_before_max_holding_is_censored_not_time_limit() {
+        // Flat, untriggered price path whose history ends before
+        // max_holding_minutes must be Censored, never a synthetic TimeLimit.
+        let config = base_config(); // max_holding = 240
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.0001), dec!(100000)), (dec!(0.0001), dec!(100000))],
+        );
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        assert_eq!(trade.exit_reason, ExitReason::Censored);
+        assert!(trade.is_censored);
+        assert!(trade
+            .censored_reason
+            .unwrap()
+            .contains("insufficient_future_data"));
+    }
+
+    #[test]
+    fn time_limit_only_from_evaluated_exit_not_synthetic() {
+        // With sufficient history, TimeLimit fires at the FIRST observation
+        // at/after max_holding_minutes (+10 min here), not at the end of the
+        // data (+15 min). This proves TimeLimit comes from exit evaluation.
+        let mut config = base_config();
+        config.strategy.max_holding_minutes = 10;
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![
+                (dec!(0.0001), dec!(100000)),
+                (dec!(0.0001), dec!(100000)),
+                (dec!(0.0001), dec!(100000)),
+            ],
+        );
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        assert_eq!(trade.exit_reason, ExitReason::TimeLimit);
+        assert!(!trade.is_censored);
+        assert_eq!(trade.holding_minutes, 10);
     }
 
     #[test]
@@ -1326,6 +1360,28 @@ sqlite_path = ":memory:"
     }
 
     #[test]
+    fn mfe_mae_exclude_observations_after_exit() {
+        // TP fires at obs 2 (+12%); obs 3 (+100%) is after the actual exit
+        // and must never contribute to MFE/MAE.
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![
+                (dec!(0.000097), dec!(100000)), // -3%
+                (dec!(0.000112), dec!(100000)), // +12% → TP here
+                (dec!(0.0002), dec!(100000)),   // +100% — after exit, ignored
+            ],
+        );
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        assert_eq!(trade.exit_reason, ExitReason::TakeProfit);
+        assert_eq!(trade.mfe_pct, dec!(12));
+        assert_eq!(trade.mae_pct, dec!(-3));
+    }
+
+    #[test]
     fn trailing_stop_uses_high_water_from_prior_observations() {
         // The trailing stop should use high water from PRIOR observations,
         // not the current candle.
@@ -1344,6 +1400,69 @@ sqlite_path = ":memory:"
         // High water = 0.00011 (from obs 1). Trailing stop at 4% from 0.00011 = 0.0001056.
         // Obs 2 price = 0.000100 < 0.0001056 → trailing stop triggers.
         assert_eq!(trade.exit_reason, ExitReason::TrailingStop);
+    }
+
+    #[test]
+    fn trailing_high_water_state_persists_across_observations() {
+        // State ordering: obs 1 raises the high-water (no exit on obs 1
+        // itself); obs 2 stays above the trailing threshold set by obs 1's
+        // high (no exit — high-water unchanged); obs 3 falls below that
+        // threshold and exits there. The threshold tracked from obs 1 must
+        // persist, and obs 2's lower close must not lower it.
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![
+                (dec!(0.00011), dec!(100000)),  // new high-water 0.00011
+                (dec!(0.000106), dec!(100000)), // > 0.0001056 → no exit
+                (dec!(0.000105), dec!(100000)), // <= 0.0001056 → TrailingStop
+            ],
+        );
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        assert_eq!(trade.exit_reason, ExitReason::TrailingStop);
+        assert_eq!(trade.holding_minutes, 15);
+        assert_eq!(trade.mfe_pct, dec!(10));
+    }
+
+    #[test]
+    fn stop_loss_level_always_exits_at_own_observation() {
+        // Backstop for the conservative ambiguity rule: with close-price
+        // observations, an observation at/below the stop level exits at its
+        // own evaluation, so the walk can never proceed past a stop into a
+        // later favorable (TP-side) price. A stop-level close followed by a
+        // far-above-TP close must exit at the stop, not book the TP.
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![
+                (dec!(0.000095), dec!(100000)), // exactly at stop (-5%) → exit here
+                (dec!(0.00015), dec!(100000)),  // +50%, beyond TP — never reached
+            ],
+        );
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        assert_eq!(trade.exit_reason, ExitReason::StopLoss);
+        assert_eq!(trade.exit_price_usd, dec!(0.000095));
+        assert!(!trade.is_ambiguous);
+        assert_eq!(trade.mfe_pct, Decimal::ZERO);
+    }
+
+    #[test]
+    fn ambiguity_at_exact_thresholds() {
+        // Boundary of the documented conservative rule: an interval whose
+        // observed range exactly touches both the stop and the target level
+        // is ambiguous; one tick inside on either side is not.
+        let entry = dec!(0.0001);
+        let sl = entry * (dec!(1) - dec!(5) / dec!(100));
+        let tp = entry * (dec!(1) + dec!(12) / dec!(100));
+        assert!(detect_ambiguity(sl, tp, entry, dec!(5), dec!(12)).is_some());
+        assert!(detect_ambiguity(sl + dec!(0.0000001), tp, entry, dec!(5), dec!(12)).is_none());
+        assert!(detect_ambiguity(sl, tp - dec!(0.0000001), entry, dec!(5), dec!(12)).is_none());
     }
 
     #[test]
