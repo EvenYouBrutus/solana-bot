@@ -2,6 +2,12 @@
 # entry decision always uses the production thresholds from the main config
 # (min_expected_net_return_pct, min_signal_score, round_trip_cost_threshold_pct).
 
+# The bundled `data/sample_historical.jsonl` is a SYNTHETIC fixture. This
+# flag is operator-set and MUST NOT be inferred from performance. When
+# `true`, the final OOS verdict is forced to `SYNTHETIC_DATA` so the run
+# cannot be misread as real-world evidence.
+is_synthetic_data = true
+
 [split]
 train_end = "2024-06-01T00:00:00Z"
 validation_start = "2024-06-01T00:00:00Z"

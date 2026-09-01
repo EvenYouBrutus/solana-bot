@@ -686,6 +686,14 @@ pub struct BacktestConfig {
     /// Starting capital in USD for drawdown calculations.
     #[serde(default = "default_capital")]
     pub capital_usd: rust_decimal::Decimal,
+    /// Explicit, operator-set flag identifying whether the input dataset
+    /// is synthetic. Must be set in `config/backtest.toml` — the backtest
+    /// MUST NOT infer this from performance results. When `true`, the
+    /// final OOS verdict is forced to `SYNTHETIC_DATA` regardless of any
+    /// positive/negative statistical signal, so the backtest cannot be
+    /// used as evidence of real-world profitability.
+    #[serde(default)]
+    pub is_synthetic_data: bool,
 }
 
 fn default_capital() -> rust_decimal::Decimal {

@@ -76,28 +76,64 @@ pub fn run_backtest(
 
     // Trades are simulated in signal_timestamp order (the loader sorts), so
     // the equity path used for drawdown is chronological.
+    //
+    // The synthetic-data flag is taken from the operator-set
+    // `BacktestConfig.is_synthetic_data` (never inferred from results).
     let mut stats = compute_statistics(
         &trades,
         total_signals_before,
         structural_rejections.len(),
         bt_config.capital_usd,
+        bt_config.is_synthetic_data,
     );
 
-    // OOS evaluation: verdict, sample size, mean, and 95% CI are computed
-    // from the OOS split ONLY — never from the full (train-contaminated)
-    // sample.
-    let oos_trades: Vec<&engine::SimulatedTrade> = trades
+    // OOS evaluation: verdict, mean, and 95% CI are computed from the
+    // OOS split ONLY — never from the full (train-contaminated) sample.
+    //
+    // The four OOS sample fields are kept distinct: `oos_total_trades`
+    // counts every simulated OOS trade, `oos_usable_trades` is the
+    // statistical sample (non-ambiguous AND non-censored), and
+    // `oos_ambiguous_trades` / `oos_censored_trades` report the
+    // exclusions. The mean, CI, and verdict MUST be derived from the
+    // usable count only.
+    let oos_total_trades = trades
         .iter()
         .filter(|t| t.split == Split::OutOfSample)
+        .count();
+    let oos_ambiguous_trades = trades
+        .iter()
+        .filter(|t| t.split == Split::OutOfSample && t.is_ambiguous)
+        .count();
+    let oos_censored_trades = trades
+        .iter()
+        .filter(|t| t.split == Split::OutOfSample && t.is_censored)
+        .count();
+    let oos_owned: Vec<engine::SimulatedTrade> = trades
+        .iter()
+        .filter(|t| t.split == Split::OutOfSample)
+        .cloned()
         .collect();
-    let oos_owned: Vec<engine::SimulatedTrade> = oos_trades.into_iter().cloned().collect();
-    let oos_stats = compute_statistics(&oos_owned, oos_owned.len(), 0, bt_config.capital_usd);
-    stats.oos_verdict = stats::compute_oos_verdict(&oos_stats);
-    stats.oos_sample_size = oos_stats.accepted_trades;
+    // The OOS sub-stats are built with the same `is_synthetic_data`
+    // flag so the verdict function has access to it.
+    let oos_stats = compute_statistics(
+        &oos_owned,
+        oos_total_trades,
+        0,
+        bt_config.capital_usd,
+        bt_config.is_synthetic_data,
+    );
+    stats.oos_total_trades = oos_total_trades;
+    // Usable = total - ambiguous - censored (a trade is either usable,
+    // ambiguous, or censored; ambiguous and censored are excluded from
+    // the statistical sample).
+    stats.oos_usable_trades = oos_total_trades - oos_ambiguous_trades - oos_censored_trades;
+    stats.oos_ambiguous_trades = oos_ambiguous_trades;
+    stats.oos_censored_trades = oos_censored_trades;
     stats.oos_mean_return_pct = oos_stats.expectancy_per_trade_pct;
     let (ci_lo, ci_hi) = stats::ci95(oos_stats.expectancy_per_trade_pct, oos_stats.standard_error);
     stats.oos_ci95_lower_pct = ci_lo;
     stats.oos_ci95_upper_pct = ci_hi;
+    stats.oos_verdict = stats::compute_oos_verdict(&stats);
 
     Ok(BacktestResult {
         statistics: stats,
