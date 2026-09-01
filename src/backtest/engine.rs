@@ -741,6 +741,16 @@ impl CostAssumptions {
 }
 
 /// Full result returned by `backtest::run_backtest()`.
+///
+/// Records are explicitly separated by stage:
+/// - `malformed_records`: unparseable or load-time-invalid records;
+/// - `structural_rejections`: well-formed records rejected before simulation
+///   (empty price history, mint mismatch, ...);
+/// - `range_excluded`: signals outside the configured experiment range;
+/// - `strategy_rejections`: signals the (production) entry decision rejected,
+///   each with its structured reason;
+/// - `all_trades`: accepted simulated trades, further classified per-trade by
+///   `is_ambiguous` / `is_censored` (fully realized = neither flag).
 #[derive(Debug, Clone, Serialize)]
 pub struct BacktestResult {
     pub statistics: crate::backtest::stats::BacktestStatistics,
@@ -748,6 +758,14 @@ pub struct BacktestResult {
     pub total_signals: usize,
     pub accepted_trades: usize,
     pub rejected_count: usize,
+    /// Malformed records (JSON parse errors, point-in-time violations).
+    pub malformed_records: Vec<String>,
+    /// Structurally rejected records, with reasons.
+    pub structural_rejections: Vec<crate::backtest::data::SignalRejection>,
+    /// Strategy-rejected signals, with structured reasons.
+    pub strategy_rejections: Vec<crate::backtest::data::SignalRejection>,
+    /// Signals outside the configured experiment range, with reasons.
+    pub range_excluded: Vec<crate::backtest::data::SignalRejection>,
 }
 
 impl std::fmt::Display for BacktestResult {
@@ -763,6 +781,18 @@ impl std::fmt::Display for BacktestResult {
         writeln!(f, "{}", self.statistics)?;
         writeln!(f, "Rejections: {}", self.rejected_count)?;
         writeln!(f, "Trades: {}", self.all_trades.len())?;
+        writeln!(
+            f,
+            "Malformed records: {} | structural rejections: {} | range-excluded: {} | \
+             strategy rejections: {}",
+            self.malformed_records.len(),
+            self.structural_rejections.len(),
+            self.range_excluded.len(),
+            self.strategy_rejections.len()
+        )?;
+        for r in &self.range_excluded {
+            writeln!(f, "  excluded {}: {}", r.signal_timestamp, r.reason)?;
+        }
         Ok(())
     }
 }

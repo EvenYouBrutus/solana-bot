@@ -11,10 +11,17 @@ pub enum OosVerdict {
     PositiveExpectancy,
     /// OOS mean net return is negative with sufficient sample.
     NegativeExpectancy,
-    /// OOS sample is too small for a meaningful conclusion.
+    /// Sufficient sample but no statistical dispersion to test against
+    /// (e.g. every usable trade returned identically).
     Inconclusive,
     /// No OOS data exists at all.
     NoOosData,
+    /// OOS trades exist but every outcome is ambiguous or censored: the
+    /// realized OOS result is unknowable from this data.
+    InvalidData,
+    /// Usable OOS sample is below the minimum required for any conclusion.
+    /// A tiny positive sample is NOT evidence of profitability.
+    InsufficientOosSample,
     /// The dataset is synthetic; no real-world conclusions should be drawn.
     SyntheticData,
 }
@@ -26,6 +33,8 @@ impl std::fmt::Display for OosVerdict {
             OosVerdict::NegativeExpectancy => write!(f, "NEGATIVE_EXPECTANCY"),
             OosVerdict::Inconclusive => write!(f, "INCONCLUSIVE"),
             OosVerdict::NoOosData => write!(f, "NO_OOS_DATA"),
+            OosVerdict::InvalidData => write!(f, "INVALID_DATA"),
+            OosVerdict::InsufficientOosSample => write!(f, "INSUFFICIENT_OOS_SAMPLE"),
             OosVerdict::SyntheticData => write!(f, "SYNTHETIC_DATA"),
         }
     }
@@ -79,8 +88,10 @@ pub struct BacktestStatistics {
     pub net_pnl_usd: Decimal,
     /// Sum of total modeled costs across ALL trades.
     pub total_costs_usd: Decimal,
-    /// Maximum drawdown % from equity peak, computed from cumulative net PnL
-    /// starting from starting_capital_usd. Excludes ambiguous/censored trades.
+    /// Maximum drawdown % from equity peak. Equity is the chronological path
+    /// starting_capital_usd + cumulative net PnL over usable trades in trade
+    /// (signal-timestamp) order; the actual configured starting capital is
+    /// the anchor. Excludes ambiguous/censored trades.
     pub max_drawdown_pct: Decimal,
     /// Longest consecutive sequence of trades with net_pnl <= 0.
     pub longest_losing_streak: usize,
@@ -94,13 +105,26 @@ pub struct BacktestStatistics {
     /// t-statistic: mean / standard_error. Non-ambiguous, non-censored only.
     pub t_statistic: Decimal,
     /// Sharpe-like ratio: mean / std_dev. Non-ambiguous, non-censored only.
-    /// NOT annualized. This is a simplified trade-return metric.
+    /// NOT annualized (per-trade horizon); it is a simplified trade-return
+    /// metric and must not be compared against annualized Sharpe values.
     pub sharpe_like: Decimal,
-    /// Sortino-like ratio: mean / downside_dev. Non-ambiguous, non-censored only.
-    /// Downside deviation computed from negative returns only.
+    /// Sortino-like ratio: mean / downside_dev. Non-ambiguous, non-censored
+    /// only. NOT annualized. Downside deviation squares only negative
+    /// returns but divides by ALL usable trades (target-zero convention).
     pub sortino_like: Decimal,
     /// Whether costs are modeled, observed, or mixed.
     pub cost_mode: CostMode,
+    /// Number of simulated trades in the OOS split (before exclusions).
+    pub oos_sample_size: usize,
+    /// Mean net return % across USABLE (non-ambiguous, non-censored) OOS
+    /// trades only.
+    pub oos_mean_return_pct: Decimal,
+    /// Lower bound of the 95% confidence interval for the OOS mean net
+    /// return: mean - 1.96 * standard_error (normal approximation).
+    pub oos_ci95_lower_pct: Decimal,
+    /// Upper bound of the 95% confidence interval for the OOS mean net
+    /// return: mean + 1.96 * standard_error (normal approximation).
+    pub oos_ci95_upper_pct: Decimal,
     /// Final OOS verdict based on statistical rules.
     pub oos_verdict: OosVerdict,
     /// Whether the dataset is synthetic (for empirical validity).
@@ -157,8 +181,25 @@ impl fmt::Display for BacktestStatistics {
         writeln!(f, "Return std dev:    {}%", self.return_std_dev)?;
         writeln!(f, "Standard error:    {}", self.standard_error)?;
         writeln!(f, "t-statistic:       {}", self.t_statistic)?;
-        writeln!(f, "Sharpe-like:       {}", self.sharpe_like)?;
-        writeln!(f, "Sortino-like:      {}", self.sortino_like)?;
+        writeln!(
+            f,
+            "Sharpe-like:       {} (per trade, not annualized)",
+            self.sharpe_like
+        )?;
+        writeln!(
+            f,
+            "Sortino-like:      {} (per trade, not annualized)",
+            self.sortino_like
+        )?;
+        writeln!(f)?;
+        writeln!(f, "OOS sample size:   {}", self.oos_sample_size)?;
+        writeln!(f, "OOS mean return:   {}%", self.oos_mean_return_pct)?;
+        writeln!(
+            f,
+            "OOS 95% CI:        [{}, {}] (normal approx)",
+            self.oos_ci95_lower_pct, self.oos_ci95_upper_pct
+        )?;
+        writeln!(f, "OOS verdict:       {}", self.oos_verdict)?;
         Ok(())
     }
 }
@@ -367,21 +408,52 @@ pub fn compute_statistics(
         sharpe_like,
         sortino_like,
         cost_mode,
+        oos_sample_size: 0,
+        oos_mean_return_pct: Decimal::ZERO,
+        oos_ci95_lower_pct: Decimal::ZERO,
+        oos_ci95_upper_pct: Decimal::ZERO,
         oos_verdict: OosVerdict::Inconclusive,
-        is_synthetic_data: true,
+        is_synthetic_data: false,
     }
 }
 
-/// Compute the OOS verdict based on statistical rules.
+/// 95% confidence interval for a mean given its standard error, using the
+/// normal approximation (mean ± 1.96·SE). Valid for large samples; for small
+/// samples it is narrower than an exact t-interval (conservative reading).
+pub fn ci95(mean: Decimal, standard_error: Decimal) -> (Decimal, Decimal) {
+    let half = dec!(1.96) * standard_error;
+    (mean - half, mean + half)
+}
+
+/// Compute the OOS verdict from OOS-ONLY statistics.
+///
+/// Decision order:
+/// 1. synthetic dataset → `SyntheticData` (no real-world conclusions);
+/// 2. no OOS trades at all → `NoOosData`;
+/// 3. OOS trades exist but all are ambiguous/censored → `InvalidData`
+///    (the realized outcome is unknowable);
+/// 4. usable sample < `MIN_OOS_TRADES_FOR_VERDICT` → `InsufficientOosSample`
+///    (a tiny positive sample is NOT evidence of profitability);
+/// 5. no dispersion among usable returns → `Inconclusive`;
+/// 6. otherwise sign of the OOS mean → positive/negative expectancy.
 pub fn compute_oos_verdict(stats: &BacktestStatistics) -> OosVerdict {
     if stats.is_synthetic_data {
         return OosVerdict::SyntheticData;
     }
-    if stats.accepted_trades == 0 && stats.censored_trades == 0 && stats.ambiguous_trades == 0 {
+    if stats.accepted_trades == 0 && stats.ambiguous_trades == 0 && stats.censored_trades == 0 {
         return OosVerdict::NoOosData;
     }
     let usable_count = stats.accepted_trades - stats.ambiguous_trades - stats.censored_trades;
+    if usable_count == 0 {
+        // Trades exist, but every OOS outcome is ambiguous or censored.
+        return OosVerdict::InvalidData;
+    }
     if usable_count < MIN_OOS_TRADES_FOR_VERDICT {
+        return OosVerdict::InsufficientOosSample;
+    }
+    if stats.standard_error == Decimal::ZERO {
+        // Sufficient sample but zero dispersion: the t-statistic is
+        // undefined, so no directional conclusion is drawn.
         return OosVerdict::Inconclusive;
     }
     if stats.expectancy_per_trade_pct > Decimal::ZERO {
@@ -627,6 +699,47 @@ mod tests {
     }
 
     #[test]
+    fn standard_error_is_std_dev_over_sqrt_n() {
+        // Hand-checkable dispersion: returns 10, 20, 30 → mean 20,
+        // sample variance = (100+0+100)/2 = 100 → std_dev 10, n = 3,
+        // SE = 10 / sqrt(3) ≈ 5.7735.
+        let trades = vec![
+            make_trade(dec!(1), dec!(10), 30, false, false),
+            make_trade(dec!(2), dec!(20), 30, false, false),
+            make_trade(dec!(3), dec!(30), 30, false, false),
+        ];
+        let stats = compute_statistics(&trades, 3, 0, dec!(100));
+        let expected = dec!(10) / decimal_sqrt(&Decimal::from(3usize));
+        assert!((stats.standard_error - expected).abs() < dec!(0.0001));
+        // t = mean / SE
+        assert!((stats.t_statistic - dec!(20) / expected).abs() < dec!(0.001));
+    }
+
+    #[test]
+    fn ci95_is_mean_plus_minus_196_se() {
+        let (lo, hi) = ci95(dec!(2), dec!(1));
+        assert_eq!(lo, dec!(0.04));
+        assert_eq!(hi, dec!(3.96));
+        // Zero SE collapses to the point estimate.
+        let (lo, hi) = ci95(dec!(2), Decimal::ZERO);
+        assert_eq!(lo, dec!(2));
+        assert_eq!(hi, dec!(2));
+    }
+
+    #[test]
+    fn ci_brackets_mean_when_computed_from_trades() {
+        let trades = vec![
+            make_trade(dec!(1), dec!(10), 30, false, false),
+            make_trade(dec!(2), dec!(20), 30, false, false),
+            make_trade(dec!(-1), dec!(-10), 30, false, false),
+        ];
+        let stats = compute_statistics(&trades, 3, 0, dec!(100));
+        let (lo, hi) = ci95(stats.expectancy_per_trade_pct, stats.standard_error);
+        assert!(lo < stats.expectancy_per_trade_pct);
+        assert!(hi > stats.expectancy_per_trade_pct);
+    }
+
+    #[test]
     fn sharpe_like_zero_when_no_variance() {
         let trades = vec![
             make_trade(dec!(1), dec!(10), 30, false, false),
@@ -662,6 +775,10 @@ mod tests {
             sharpe_like: dec!(0.5),
             sortino_like: dec!(0.7),
             cost_mode: CostMode::Modeled,
+            oos_sample_size: 8,
+            oos_mean_return_pct: dec!(3),
+            oos_ci95_lower_pct: dec!(-2.88),
+            oos_ci95_upper_pct: dec!(8.88),
             oos_verdict: OosVerdict::Inconclusive,
             is_synthetic_data: true,
         };
@@ -670,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn oos_verdict_inconclusive_when_too_few_trades() {
+    fn oos_verdict_insufficient_sample_when_too_few_trades() {
         let stats = BacktestStatistics {
             total_signals: 3,
             accepted_trades: 2,
@@ -695,10 +812,167 @@ mod tests {
             sharpe_like: dec!(0.3),
             sortino_like: dec!(0.4),
             cost_mode: CostMode::Modeled,
+            oos_sample_size: 2,
+            oos_mean_return_pct: dec!(2.5),
+            oos_ci95_lower_pct: dec!(-7.3),
+            oos_ci95_upper_pct: dec!(12.3),
             oos_verdict: OosVerdict::Inconclusive,
             is_synthetic_data: false,
         };
         let verdict = compute_oos_verdict(&stats);
-        assert_eq!(verdict, OosVerdict::Inconclusive);
+        assert_eq!(verdict, OosVerdict::InsufficientOosSample);
+    }
+
+    #[test]
+    fn tiny_positive_oos_sample_is_not_profitability_evidence() {
+        // One glowing OOS trade must NOT yield POSITIVE_EXPECTANCY.
+        let trades = vec![make_trade(dec!(5), dec!(50), 30, false, false)];
+        let stats = compute_statistics(&trades, 1, 0, dec!(100));
+        assert_eq!(
+            compute_oos_verdict(&stats),
+            OosVerdict::InsufficientOosSample
+        );
+    }
+
+    #[test]
+    fn oos_verdict_invalid_data_when_all_outcomes_unknowable() {
+        // OOS trades exist, but every one is ambiguous or censored: the
+        // realized OOS outcome cannot be known from this data.
+        let trades = vec![
+            make_trade(dec!(0), dec!(0), 30, true, false),
+            make_trade(dec!(0), dec!(0), 30, false, true),
+        ];
+        let stats = compute_statistics(&trades, 2, 0, dec!(100));
+        assert_eq!(compute_oos_verdict(&stats), OosVerdict::InvalidData);
+    }
+
+    #[test]
+    fn oos_verdict_no_data() {
+        let stats = compute_statistics(&[], 0, 0, dec!(100));
+        assert_eq!(compute_oos_verdict(&stats), OosVerdict::NoOosData);
+    }
+
+    #[test]
+    fn oos_verdict_positive_with_sufficient_dispersed_sample() {
+        let mut trades = Vec::new();
+        for _ in 0..6 {
+            trades.push(make_trade(dec!(1), dec!(10), 30, false, false));
+        }
+        trades.push(make_trade(dec!(-1), dec!(-10), 30, false, false));
+        let stats = compute_statistics(&trades, 7, 0, dec!(100));
+        assert_eq!(compute_oos_verdict(&stats), OosVerdict::PositiveExpectancy);
+    }
+
+    #[test]
+    fn oos_verdict_inconclusive_with_zero_dispersion() {
+        // Sufficient sample, but identical returns → SE = 0 → Inconclusive.
+        let trades: Vec<_> = (0..6)
+            .map(|_| make_trade(dec!(1), dec!(10), 30, false, false))
+            .collect();
+        let stats = compute_statistics(&trades, 6, 0, dec!(100));
+        assert_eq!(stats.standard_error, Decimal::ZERO);
+        assert_eq!(compute_oos_verdict(&stats), OosVerdict::Inconclusive);
+    }
+
+    #[test]
+    fn sortino_like_zero_when_no_negative_returns() {
+        // All wins: downside_var = 0 → downside_dev = 0 → sortino = 0.
+        let trades = vec![
+            make_trade(dec!(1), dec!(10), 30, false, false),
+            make_trade(dec!(2), dec!(20), 30, false, false),
+        ];
+        let stats = compute_statistics(&trades, 2, 0, dec!(100));
+        assert_eq!(stats.sortino_like, Decimal::ZERO);
+    }
+
+    #[test]
+    fn sortino_like_nonzero_with_negative_returns() {
+        // Returns: -5%, 10% → mean = 2.5, downside_var = 25/2 = 12.5,
+        // downside_dev = sqrt(12.5) ≈ 3.5355, sortino = 2.5 / 3.5355 ≈ 0.7071
+        let trades = vec![
+            make_trade(dec!(-0.5), dec!(-5), 30, false, false),
+            make_trade(dec!(1), dec!(10), 30, false, false),
+        ];
+        let stats = compute_statistics(&trades, 2, 0, dec!(100));
+        assert!(stats.sortino_like > Decimal::ZERO);
+        // Hand-checkable: mean=2.5, downside_dev=sqrt(12.5)≈3.5355
+        let expected_sortino = dec!(2.5) / decimal_sqrt(&dec!(12.5));
+        assert!((stats.sortino_like - expected_sortino).abs() < dec!(0.001));
+    }
+
+    #[test]
+    fn oos_verdict_negative_expectancy() {
+        // 6 losses, 1 win → mean negative → NegativeExpectancy.
+        let mut trades = Vec::new();
+        for _ in 0..6 {
+            trades.push(make_trade(dec!(-1), dec!(-10), 30, false, false));
+        }
+        trades.push(make_trade(dec!(0.5), dec!(5), 30, false, false));
+        let stats = compute_statistics(&trades, 7, 0, dec!(100));
+        assert!(stats.expectancy_per_trade_pct < Decimal::ZERO);
+        assert_eq!(compute_oos_verdict(&stats), OosVerdict::NegativeExpectancy);
+    }
+
+    #[test]
+    fn profit_factor_no_losses_returns_max() {
+        // All wins, no losses → profit_factor = i32::MAX.
+        let trades = vec![
+            make_trade(dec!(1), dec!(10), 30, false, false),
+            make_trade(dec!(2), dec!(20), 30, false, false),
+        ];
+        let stats = compute_statistics(&trades, 2, 0, dec!(100));
+        assert_eq!(stats.profit_factor, Decimal::from(i32::MAX));
+    }
+
+    #[test]
+    fn profit_factor_no_wins_returns_zero() {
+        // All losses, no wins → profit_factor = 0.
+        let trades = vec![
+            make_trade(dec!(-1), dec!(-10), 30, false, false),
+            make_trade(dec!(-2), dec!(-20), 30, false, false),
+        ];
+        let stats = compute_statistics(&trades, 2, 0, dec!(100));
+        assert_eq!(stats.profit_factor, Decimal::ZERO);
+    }
+
+    #[test]
+    fn profit_factor_balanced() {
+        // 2 wins (+2, +1), 1 loss (-1) → gross_wins=3, gross_losses=1, pf=3.
+        let trades = vec![
+            make_trade(dec!(2), dec!(20), 30, false, false),
+            make_trade(dec!(1), dec!(10), 30, false, false),
+            make_trade(dec!(-1), dec!(-10), 30, false, false),
+        ];
+        let stats = compute_statistics(&trades, 3, 0, dec!(100));
+        assert_eq!(stats.profit_factor, dec!(3));
+    }
+
+    #[test]
+    fn drawdown_zero_when_monotonic_up() {
+        // All wins → equity never drops → max_drawdown = 0.
+        let trades = vec![
+            make_trade(dec!(1), dec!(10), 30, false, false),
+            make_trade(dec!(2), dec!(20), 30, false, false),
+            make_trade(dec!(1), dec!(10), 30, false, false),
+        ];
+        let stats = compute_statistics(&trades, 3, 0, dec!(100));
+        assert_eq!(stats.max_drawdown_pct, Decimal::ZERO);
+    }
+
+    #[test]
+    fn ambiguous_and_censored_counted_separately() {
+        let trades = vec![
+            make_trade(dec!(1), dec!(10), 30, false, false),
+            make_trade(dec!(-1), dec!(-10), 30, false, false),
+            make_trade(dec!(0), dec!(0), 30, true, false),
+            make_trade(dec!(0), dec!(0), 30, false, true),
+            make_trade(dec!(0), dec!(0), 30, true, true),
+        ];
+        let stats = compute_statistics(&trades, 5, 0, dec!(100));
+        assert_eq!(stats.ambiguous_trades, 2); // one ambiguous-only + one both
+        assert_eq!(stats.censored_trades, 2); // one censored-only + one both
+        assert_eq!(stats.accepted_trades, 5);
+        // Only 2 usable trades for win/loss stats.
+        assert_eq!(stats.win_rate, dec!(50));
     }
 }
