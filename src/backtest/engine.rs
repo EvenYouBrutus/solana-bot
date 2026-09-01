@@ -102,6 +102,19 @@ pub struct SimulatedTrade {
 }
 
 /// Backtest-specific configuration for cost modeling.
+///
+/// DOCUMENTED COST MODEL (single, internally consistent choice):
+/// - Token quantity is `notional / observed_price` and is NEVER adjusted for
+///   execution effects.
+/// - Swap fees, network/priority fees, slippage, and price impact are each
+///   represented EXACTLY ONCE, as a dollar cost per leg. They are never also
+///   applied as a quantity reduction or as an adjustment to the entry/exit
+///   price, so no adverse effect is double-counted.
+/// - Failed transactions are a PROBABILISTIC expectation
+///   (`2 * failed_tx_rate * failed_tx_cost_usd`), never a certain per-trade
+///   cost.
+/// - These assumptions are MODELED, not observed: every leg reports
+///   `is_observed = false` and the trade's `cost_mode` is `CostMode::Modeled`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CostAssumptions {
     /// Entry leg: AMM/DEX swap fee in bps.
@@ -127,10 +140,18 @@ pub struct CostAssumptions {
 }
 
 impl CostAssumptions {
+    /// Which `CostMode` these assumptions produce. Modeled assumptions only:
+    /// observed and mixed modes require real fill data and are not
+    /// constructible from assumption config.
+    pub fn mode(&self) -> CostMode {
+        CostMode::Modeled
+    }
+
     /// Compute entry costs for a given notional USD amount.
     ///
-    /// These are ALL MODELED assumptions. Slippage is captured as a separate
-    /// dollar cost here; it is NOT also applied as a quantity reduction.
+    /// Modeled only. Each of swap fee, priority fee, slippage, and price
+    /// impact appears exactly once as a dollar cost; the token quantity is
+    /// never reduced and the entry price is never adjusted.
     pub fn entry_costs(&self, notional_usd: Decimal) -> TradeCosts {
         let swap_fee = notional_usd * self.entry_swap_fee_bps / dec!(10000);
         let slippage = notional_usd * self.entry_slippage_bps / dec!(10000);
@@ -148,7 +169,8 @@ impl CostAssumptions {
 
     /// Compute exit costs for a given proceeds USD amount.
     ///
-    /// These are ALL MODELED assumptions.
+    /// Modeled only, mirroring `entry_costs`: each effect exactly once as a
+    /// dollar cost on the gross proceeds; no quantity or price adjustment.
     pub fn exit_costs(&self, proceeds_usd: Decimal) -> TradeCosts {
         let swap_fee = proceeds_usd * self.exit_swap_fee_bps / dec!(10000);
         let slippage = proceeds_usd * self.exit_slippage_bps / dec!(10000);
@@ -485,14 +507,24 @@ pub fn simulate_signal(
     let holding_minutes = (exit_time - entry_time).num_minutes();
 
     // --- Exit cost simulation ---
-    // Exit proceeds: tokens * exit_price. Slippage is in exit_costs, not
-    // a quantity reduction, consistent with entry treatment.
+    // Exit proceeds: token quantity (never adjusted) * observed exit price.
+    // Slippage and impact are dollar costs in exit_costs, NOT quantity
+    // reductions or price adjustments — the same single-representation rule
+    // as the entry leg, so no effect is double-counted.
     let exit_proceeds_gross = entry_quantity_tokens * exit_price;
     let exit_costs = cost_assumptions.exit_costs(exit_proceeds_gross);
+    // Probabilistic expectation across both legs; NOT a certain per-trade cost.
     let failed_tx = cost_assumptions.expected_failed_tx_cost();
     let total_cost = entry_costs.total_usd + exit_costs.total_usd + failed_tx;
 
     // --- PnL ---
+    // gross_pnl = quantity * exit_price - position_usd (market outcome only,
+    // unaffected by any modeled cost).
+    // total_cost = entry leg (swap + priority + slippage + impact)
+    //            + exit leg (swap + priority + slippage + impact)
+    //            + expected failed-tx cost (each term counted exactly once).
+    // net_pnl = gross_pnl - total_cost.
+    // returns are percentages of position_usd.
     let gross_pnl = exit_proceeds_gross - signal.position_usd;
     let net_pnl = gross_pnl - total_cost;
     let gross_return_pct = if signal.position_usd > Decimal::ZERO {
@@ -532,7 +564,7 @@ pub fn simulate_signal(
         ambiguous_reason,
         is_censored,
         censored_reason,
-        cost_mode: CostMode::Modeled,
+        cost_mode: cost_assumptions.mode(),
     })
 }
 
@@ -720,6 +752,14 @@ pub struct BacktestResult {
 
 impl std::fmt::Display for BacktestResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Requirement: the report must explicitly disclose that the sample
+        // backtest prices execution with MODELED assumptions, not observed
+        // fills. (The statistics block also prints the cost mode.)
+        writeln!(
+            f,
+            "Execution costs: MODELED ASSUMPTIONS (swap fees, priority fees, slippage, \
+             price impact, expected failed-tx cost) — not observed fills"
+        )?;
         writeln!(f, "{}", self.statistics)?;
         writeln!(f, "Rejections: {}", self.rejected_count)?;
         writeln!(f, "Trades: {}", self.all_trades.len())?;
@@ -1095,6 +1135,180 @@ sqlite_path = ":memory:"
         assert!(!trade.entry_costs.is_observed);
         assert!(!trade.exit_costs.is_observed);
         assert_eq!(trade.cost_mode, CostMode::Modeled);
+    }
+
+    /// Symmetric assumptions across both legs for the hand-calculated tests.
+    fn symmetric_ca(
+        swap_fee_bps: Decimal,
+        priority_fee_usd: Decimal,
+        slippage_bps: Decimal,
+        impact_bps: Decimal,
+        failed_tx_rate: Decimal,
+        failed_tx_cost_usd: Decimal,
+    ) -> CostAssumptions {
+        CostAssumptions {
+            entry_swap_fee_bps: swap_fee_bps,
+            entry_priority_fee_usd: priority_fee_usd,
+            entry_slippage_bps: slippage_bps,
+            entry_price_impact_bps: impact_bps,
+            exit_swap_fee_bps: swap_fee_bps,
+            exit_priority_fee_usd: priority_fee_usd,
+            exit_slippage_bps: slippage_bps,
+            exit_price_impact_bps: impact_bps,
+            failed_tx_rate,
+            failed_tx_cost_usd,
+        }
+    }
+
+    /// Standard scenario for the hand-calculated tests: TP exit at +12%.
+    /// position_usd = 4, entry 0.0001 → quantity 40000, exit 0.000112
+    /// → gross proceeds 4.48, gross PnL +0.48 (+12%).
+    fn tp_signal() -> HistoricalSignal {
+        make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.000112), dec!(100000))],
+        )
+    }
+
+    #[test]
+    fn hand_calculated_pnl_with_zero_fees() {
+        // All costs zero: net PnL must equal gross PnL exactly.
+        let config = base_config();
+        let ca = symmetric_ca(dec!(0), dec!(0), dec!(0), dec!(0), dec!(0), dec!(0));
+        let trade = simulate_signal(&tp_signal(), &config, &ca, Split::Train, 0).unwrap();
+        assert_eq!(trade.exit_reason, ExitReason::TakeProfit);
+        assert_eq!(trade.entry_costs.total_usd, dec!(0));
+        assert_eq!(trade.exit_costs.total_usd, dec!(0));
+        assert_eq!(trade.total_cost_usd, dec!(0));
+        assert_eq!(trade.gross_pnl_usd, dec!(0.48)); // 4.48 - 4
+        assert_eq!(trade.net_pnl_usd, dec!(0.48));
+        assert_eq!(trade.gross_return_pct, dec!(12)); // 0.48 / 4 * 100
+        assert_eq!(trade.net_return_pct, dec!(12));
+    }
+
+    #[test]
+    fn hand_calculated_pnl_with_nonzero_fees() {
+        // Fixture assumptions: 30bps swap + 0.002 priority + 50bps slippage
+        // + 20bps impact per leg; failed tx 5% at 0.002.
+        // Entry leg: 4 * (30+50+20)bps = 0.04, + 0.002 = 0.042.
+        // Exit leg: 4.48 * 100bps = 0.0448, + 0.002 = 0.0468.
+        // Failed tx expectation: 2 * 0.05 * 0.002 = 0.0002.
+        // total = 0.042 + 0.0468 + 0.0002 = 0.089.
+        // net = 0.48 - 0.089 = 0.391 → 9.775% of 4.
+        let config = base_config();
+        let ca = symmetric_ca(
+            dec!(30),
+            dec!(0.002),
+            dec!(50),
+            dec!(20),
+            dec!(0.05),
+            dec!(0.002),
+        );
+        let trade = simulate_signal(&tp_signal(), &config, &ca, Split::Train, 0).unwrap();
+        assert_eq!(trade.entry_costs.total_usd, dec!(0.042));
+        assert_eq!(trade.exit_costs.total_usd, dec!(0.0468));
+        assert_eq!(trade.total_cost_usd, dec!(0.089));
+        assert_eq!(trade.gross_pnl_usd, dec!(0.48));
+        assert_eq!(trade.net_pnl_usd, dec!(0.391));
+        assert_eq!(trade.gross_return_pct, dec!(12));
+        assert_eq!(trade.net_return_pct, dec!(9.775));
+    }
+
+    #[test]
+    fn slippage_charged_exactly_once_as_dollar_cost() {
+        // Only slippage: 50bps per leg, nothing else.
+        // Entry: 4 * 50/10000 = 0.02. Exit: 4.48 * 50/10000 = 0.0224.
+        // Quantity stays exactly position/price (no hidden second charge).
+        let config = base_config();
+        let ca = symmetric_ca(dec!(0), dec!(0), dec!(50), dec!(0), dec!(0), dec!(0));
+        let signal = tp_signal();
+        let trade = simulate_signal(&signal, &config, &ca, Split::Train, 0).unwrap();
+        assert_eq!(trade.entry_costs.slippage_cost_usd, dec!(0.02));
+        assert_eq!(trade.exit_costs.slippage_cost_usd, dec!(0.0224));
+        assert_eq!(trade.total_cost_usd, dec!(0.0424));
+        assert_eq!(
+            trade.entry_quantity_tokens,
+            signal.position_usd / dec!(0.0001)
+        );
+        assert_eq!(trade.gross_pnl_usd, dec!(0.48));
+        assert_eq!(trade.net_pnl_usd, dec!(0.4376)); // 0.48 - 0.0424
+    }
+
+    #[test]
+    fn price_impact_charged_exactly_once_as_dollar_cost() {
+        // Only impact: 20bps per leg.
+        // Entry: 4 * 20/10000 = 0.008. Exit: 4.48 * 20/10000 = 0.00896.
+        let config = base_config();
+        let ca = symmetric_ca(dec!(0), dec!(0), dec!(0), dec!(20), dec!(0), dec!(0));
+        let trade = simulate_signal(&tp_signal(), &config, &ca, Split::Train, 0).unwrap();
+        assert_eq!(trade.entry_costs.price_impact_cost_usd, dec!(0.008));
+        assert_eq!(trade.exit_costs.price_impact_cost_usd, dec!(0.00896));
+        assert_eq!(trade.total_cost_usd, dec!(0.01696));
+        assert_eq!(trade.net_pnl_usd, dec!(0.46304)); // 0.48 - 0.01696
+    }
+
+    #[test]
+    fn swap_fee_charged_on_notional_per_leg() {
+        // Only swap fee: 30bps per leg.
+        // Entry: 4 * 30/10000 = 0.012. Exit: 4.48 * 30/10000 = 0.01344.
+        let config = base_config();
+        let ca = symmetric_ca(dec!(30), dec!(0), dec!(0), dec!(0), dec!(0), dec!(0));
+        let trade = simulate_signal(&tp_signal(), &config, &ca, Split::Train, 0).unwrap();
+        assert_eq!(trade.entry_costs.swap_fee_usd, dec!(0.012));
+        assert_eq!(trade.exit_costs.swap_fee_usd, dec!(0.01344));
+        assert_eq!(trade.total_cost_usd, dec!(0.02544));
+        assert_eq!(trade.net_pnl_usd, dec!(0.45456)); // 0.48 - 0.02544
+    }
+
+    #[test]
+    fn priority_fee_is_fixed_usd_per_leg() {
+        // Only priority fee: 0.002 per leg, independent of notional.
+        let config = base_config();
+        let ca = symmetric_ca(dec!(0), dec!(0.002), dec!(0), dec!(0), dec!(0), dec!(0));
+        let trade = simulate_signal(&tp_signal(), &config, &ca, Split::Train, 0).unwrap();
+        assert_eq!(trade.entry_costs.priority_fee_usd, dec!(0.002));
+        assert_eq!(trade.exit_costs.priority_fee_usd, dec!(0.002));
+        assert_eq!(trade.total_cost_usd, dec!(0.004));
+        assert_eq!(trade.net_pnl_usd, dec!(0.476)); // 0.48 - 0.004
+    }
+
+    #[test]
+    fn failed_tx_cost_is_probabilistic_expectation() {
+        // 5% failure rate at 0.002 per failure, two legs:
+        // E[cost] = 2 * 0.05 * 0.002 = 0.0002. This is the EXPECTED cost —
+        // a 100%-failure rate would be needed for 2 * 0.002 per trade.
+        let config = base_config();
+        let ca = symmetric_ca(dec!(0), dec!(0), dec!(0), dec!(0), dec!(0.05), dec!(0.002));
+        assert_eq!(ca.expected_failed_tx_cost(), dec!(0.0002));
+        let trade = simulate_signal(&tp_signal(), &config, &ca, Split::Train, 0).unwrap();
+        assert_eq!(trade.total_cost_usd, dec!(0.0002));
+        assert_eq!(trade.net_pnl_usd, dec!(0.4798)); // 0.48 - 0.0002
+
+        // Expectation scales with the rate: zero rate → zero cost.
+        let zero_rate = symmetric_ca(dec!(0), dec!(0), dec!(0), dec!(0), dec!(0), dec!(0.002));
+        assert_eq!(zero_rate.expected_failed_tx_cost(), dec!(0));
+        // Certain failure on both legs would cost 2 * 0.002 = 0.004 — the
+        // modeled 5% rate must NOT behave like that.
+        let certain = symmetric_ca(dec!(0), dec!(0), dec!(0), dec!(0), dec!(1), dec!(0.002));
+        assert_eq!(certain.expected_failed_tx_cost(), dec!(0.004));
+    }
+
+    #[test]
+    fn complete_round_trip_cost_matches_leg_sum() {
+        let ca = symmetric_ca(
+            dec!(30),
+            dec!(0.002),
+            dec!(50),
+            dec!(20),
+            dec!(0.05),
+            dec!(0.002),
+        );
+        // Entry 0.042 + exit 0.0468 + failed-tx 0.0002 = 0.089 (same as the
+        // hand calculation in hand_calculated_pnl_with_nonzero_fees).
+        assert_eq!(ca.total_round_trip_cost(dec!(4), dec!(4.48)), dec!(0.089));
+        assert_eq!(ca.mode(), CostMode::Modeled);
     }
 
     #[test]
