@@ -774,6 +774,10 @@ pub struct BacktestResult {
     pub strategy_rejections: Vec<crate::backtest::data::SignalRejection>,
     /// Signals outside the configured experiment range, with reasons.
     pub range_excluded: Vec<crate::backtest::data::SignalRejection>,
+    /// Per-split (Train / Validation) statistics. OOS statistics are
+    /// already on `statistics` because the OOS verdict depends on them.
+    pub train_stats: crate::backtest::stats::BacktestStatistics,
+    pub validation_stats: crate::backtest::stats::BacktestStatistics,
 }
 
 impl std::fmt::Display for BacktestResult {
@@ -786,7 +790,63 @@ impl std::fmt::Display for BacktestResult {
             "Execution costs: MODELED ASSUMPTIONS (swap fees, priority fees, slippage, \
              price impact, expected failed-tx cost) — not observed fills"
         )?;
+        if self.statistics.is_synthetic_data {
+            writeln!(
+                f,
+                "Dataset: SYNTHETIC / TEST DATA (operator-set flag). This run CANNOT be \
+                 used as evidence of real-world profitability."
+            )?;
+        }
         writeln!(f, "{}", self.statistics)?;
+        // Per-split summary
+        writeln!(f, "=== Per-split counts ===")?;
+        writeln!(
+            f,
+            "Train:        {} total, {} usable, {} ambiguous, {} censored",
+            self.statistics.train_total_trades,
+            self.statistics.train_usable_trades,
+            self.statistics.train_ambiguous_trades,
+            self.statistics.train_censored_trades
+        )?;
+        writeln!(
+            f,
+            "Validation:   {} total, {} usable, {} ambiguous, {} censored",
+            self.statistics.validation_total_trades,
+            self.statistics.validation_usable_trades,
+            self.statistics.validation_ambiguous_trades,
+            self.statistics.validation_censored_trades
+        )?;
+        writeln!(
+            f,
+            "OOS:          {} total, {} usable, {} ambiguous, {} censored",
+            self.statistics.oos_total_trades,
+            self.statistics.oos_usable_trades,
+            self.statistics.oos_ambiguous_trades,
+            self.statistics.oos_censored_trades
+        )?;
+        // Sample-size warnings
+        let min_oos = crate::backtest::stats::MIN_OOS_TRADES_FOR_VERDICT;
+        let usable_oos = self.statistics.oos_usable_trades;
+        if usable_oos < min_oos {
+            writeln!(
+                f,
+                "WARNING: OOS usable sample ({} trades) is below the minimum ({}) \
+                 required for a directional verdict.",
+                usable_oos, min_oos
+            )?;
+        }
+        if self.statistics.train_total_trades == 0 {
+            writeln!(f, "WARNING: no simulated trades fell in the Train split.")?;
+        }
+        if self.statistics.validation_total_trades == 0 {
+            writeln!(
+                f,
+                "WARNING: no simulated trades fell in the Validation split."
+            )?;
+        }
+        if self.statistics.oos_total_trades == 0 {
+            writeln!(f, "WARNING: no simulated trades fell in the OOS split.")?;
+        }
         writeln!(f, "Rejections: {}", self.rejected_count)?;
         writeln!(f, "Trades: {}", self.all_trades.len())?;
         writeln!(
@@ -800,6 +860,16 @@ impl std::fmt::Display for BacktestResult {
         )?;
         for r in &self.range_excluded {
             writeln!(f, "  excluded {}: {}", r.signal_timestamp, r.reason)?;
+        }
+        for r in &self.strategy_rejections {
+            writeln!(
+                f,
+                "  rejected {}: {} ({})",
+                r.signal_timestamp, r.reason, r.mint
+            )?;
+        }
+        for m in &self.malformed_records {
+            writeln!(f, "  malformed: {m}")?;
         }
         Ok(())
     }

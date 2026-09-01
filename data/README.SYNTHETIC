@@ -1,0 +1,16 @@
+SYNTHETIC / TEST DATA
+
+This directory contains hand-crafted JSONL fixtures used only by the
+backtest integration test. The data is NOT real historical market data.
+
+The bundled sample is wired into config/backtest.toml with
+is_synthetic_data = true, and the OOS verdict function forces
+OosVerdict::SyntheticData whenever this flag is set. The bundled
+sample MUST NEVER be presented as evidence that the real strategy
+is profitable.
+
+To run the backtest against real data, copy the sample to a new
+file, set is_synthetic_data = false in the new backtest config, and
+ensure every record passes the strict PIT validation in
+src/backtest/data.rs (signal_timestamp, wallet updated_at, market/
+safety/costs observed_at all consistent).

@@ -42,7 +42,7 @@ impl std::fmt::Display for OosVerdict {
 
 /// Minimum number of non-ambiguous, non-censored OOS trades required
 /// for a meaningful statistical conclusion.
-const MIN_OOS_TRADES_FOR_VERDICT: usize = 5;
+pub const MIN_OOS_TRADES_FOR_VERDICT: usize = 5;
 
 /// Backtest statistics for a set of trades.
 ///
@@ -143,6 +143,20 @@ pub struct BacktestStatistics {
     /// `BacktestConfig.is_synthetic_data`; never inferred from results).
     /// When `true`, the verdict is forced to `SYNTHETIC_DATA`.
     pub is_synthetic_data: bool,
+    /// Number of simulated trades in the Train split (before exclusions).
+    pub train_total_trades: usize,
+    /// Number of fully realized Train trades (non-ambiguous AND non-censored).
+    pub train_usable_trades: usize,
+    /// Number of Train trades excluded because the outcome was ambiguous.
+    pub train_ambiguous_trades: usize,
+    /// Number of Train trades excluded because the price history was
+    /// insufficient to determine a valid exit.
+    pub train_censored_trades: usize,
+    /// Number of simulated trades in the Validation split.
+    pub validation_total_trades: usize,
+    pub validation_usable_trades: usize,
+    pub validation_ambiguous_trades: usize,
+    pub validation_censored_trades: usize,
 }
 
 impl fmt::Display for BacktestStatistics {
@@ -455,6 +469,14 @@ pub fn compute_statistics(
         oos_ci95_upper_pct: Decimal::ZERO,
         oos_verdict: OosVerdict::Inconclusive,
         is_synthetic_data,
+        train_total_trades: 0,
+        train_usable_trades: 0,
+        train_ambiguous_trades: 0,
+        train_censored_trades: 0,
+        validation_total_trades: 0,
+        validation_usable_trades: 0,
+        validation_ambiguous_trades: 0,
+        validation_censored_trades: 0,
     }
 }
 
@@ -830,6 +852,14 @@ mod tests {
             oos_ci95_upper_pct: dec!(8.88),
             oos_verdict: OosVerdict::Inconclusive,
             is_synthetic_data: true,
+            train_total_trades: 0,
+            train_usable_trades: 0,
+            train_ambiguous_trades: 0,
+            train_censored_trades: 0,
+            validation_total_trades: 0,
+            validation_usable_trades: 0,
+            validation_ambiguous_trades: 0,
+            validation_censored_trades: 0,
         };
         stats.oos_verdict = compute_oos_verdict(&stats);
         assert_eq!(stats.oos_verdict, OosVerdict::SyntheticData);
@@ -870,6 +900,14 @@ mod tests {
             oos_ci95_upper_pct: dec!(12.3),
             oos_verdict: OosVerdict::Inconclusive,
             is_synthetic_data: false,
+            train_total_trades: 0,
+            train_usable_trades: 0,
+            train_ambiguous_trades: 0,
+            train_censored_trades: 0,
+            validation_total_trades: 0,
+            validation_usable_trades: 0,
+            validation_ambiguous_trades: 0,
+            validation_censored_trades: 0,
         };
         let verdict = compute_oos_verdict(&stats);
         assert_eq!(verdict, OosVerdict::InsufficientOosSample);

@@ -3,6 +3,9 @@ pub mod engine;
 pub mod split;
 pub mod stats;
 
+#[cfg(test)]
+mod integration;
+
 pub use engine::{BacktestConfig, BacktestResult, CostAssumptions};
 pub use split::Split;
 pub use stats::{compute_statistics, BacktestStatistics, OosVerdict};
@@ -135,6 +138,64 @@ pub fn run_backtest(
     stats.oos_ci95_upper_pct = ci_hi;
     stats.oos_verdict = stats::compute_oos_verdict(&stats);
 
+    // Per-split counts: Train, Validation, OOS. Used by the report to
+    // show that every split is populated.
+    let train_total = trades.iter().filter(|t| t.split == Split::Train).count();
+    let train_ambiguous = trades
+        .iter()
+        .filter(|t| t.split == Split::Train && t.is_ambiguous)
+        .count();
+    let train_censored = trades
+        .iter()
+        .filter(|t| t.split == Split::Train && t.is_censored)
+        .count();
+    let val_total = trades
+        .iter()
+        .filter(|t| t.split == Split::Validation)
+        .count();
+    let val_ambiguous = trades
+        .iter()
+        .filter(|t| t.split == Split::Validation && t.is_ambiguous)
+        .count();
+    let val_censored = trades
+        .iter()
+        .filter(|t| t.split == Split::Validation && t.is_censored)
+        .count();
+    stats.train_total_trades = train_total;
+    stats.train_usable_trades = train_total - train_ambiguous - train_censored;
+    stats.train_ambiguous_trades = train_ambiguous;
+    stats.train_censored_trades = train_censored;
+    stats.validation_total_trades = val_total;
+    stats.validation_usable_trades = val_total - val_ambiguous - val_censored;
+    stats.validation_ambiguous_trades = val_ambiguous;
+    stats.validation_censored_trades = val_censored;
+
+    // Per-split statistics for the report.
+    let train_owned: Vec<engine::SimulatedTrade> = trades
+        .iter()
+        .filter(|t| t.split == Split::Train)
+        .cloned()
+        .collect();
+    let val_owned: Vec<engine::SimulatedTrade> = trades
+        .iter()
+        .filter(|t| t.split == Split::Validation)
+        .cloned()
+        .collect();
+    let train_stats = compute_statistics(
+        &train_owned,
+        train_total,
+        0,
+        bt_config.capital_usd,
+        bt_config.is_synthetic_data,
+    );
+    let validation_stats = compute_statistics(
+        &val_owned,
+        val_total,
+        0,
+        bt_config.capital_usd,
+        bt_config.is_synthetic_data,
+    );
+
     Ok(BacktestResult {
         statistics: stats,
         all_trades: trades,
@@ -145,5 +206,7 @@ pub fn run_backtest(
         structural_rejections,
         strategy_rejections,
         range_excluded,
+        train_stats,
+        validation_stats,
     })
 }
