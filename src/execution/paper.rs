@@ -2,20 +2,43 @@ use super::{ExecutionError, ExecutionRequest, Executor, Quote};
 use crate::domain::trade::Fill;
 use async_trait::async_trait;
 use chrono::Utc;
-use rust_decimal::Decimal;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Paper mode shares quotes, policy gates, and pricing with live mode; only
-/// the signing/submission is replaced by an adversarial haircut fill, so
-/// strategy and risk behaviour are identical.
+/// the signing/submission is replaced by a realistic simulated fill with
+/// slippage, fees, price impact, and occasional failed transactions.
 pub struct PaperExecutor<E> {
     quotes: E,
     fill_haircut_bps: u32,
+    /// Simulated base fee in lamports (5000).
+    base_fee_lamports: u64,
+    /// Simulated priority fee in lamports.
+    priority_fee_lamports: u64,
+    /// Counter for deterministic failure injection (every nth call fails).
+    call_counter: AtomicU64,
+    /// Fail every N calls (0 = no failures).
+    fail_every_n: u64,
 }
 impl<E> PaperExecutor<E> {
     pub fn new(quotes: E, fill_haircut_bps: u32) -> Self {
         Self {
             quotes,
             fill_haircut_bps,
+            base_fee_lamports: 5_000,
+            priority_fee_lamports: 10_000,
+            call_counter: AtomicU64::new(0),
+            fail_every_n: 0,
+        }
+    }
+
+    pub fn with_failure_injection(quotes: E, fill_haircut_bps: u32, fail_every_n: u64) -> Self {
+        Self {
+            quotes,
+            fill_haircut_bps,
+            base_fee_lamports: 5_000,
+            priority_fee_lamports: 10_000,
+            call_counter: AtomicU64::new(0),
+            fail_every_n,
         }
     }
 }
@@ -42,28 +65,53 @@ impl<E: Executor> Executor for PaperExecutor<E> {
         {
             return Err(ExecutionError::InvalidQuote);
         }
+
+        // Simulated failure injection.
+        if self.fail_every_n > 0 {
+            let count = self.call_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            if count.is_multiple_of(self.fail_every_n) {
+                return Err(ExecutionError::Transaction(
+                    "paper: simulated transaction failure".into(),
+                ));
+            }
+        }
+
+        // Apply haircut (adversarial fill worse than quote).
         let haircut = 10_000u64.saturating_sub(self.fill_haircut_bps as u64);
         let output = r.quote.output_amount.saturating_mul(haircut) / 10_000;
         if output < r.min_output_amount {
             return Err(ExecutionError::InvalidQuote);
         }
+
+        // Simulated slippage: output is slightly worse than quote.
+        let slippage_bps = r.quote.price_impact_bps / 3 + 5;
+        let after_slippage = output.saturating_mul(10_000 - slippage_bps as u64) / 10_000;
+        if after_slippage < r.min_output_amount {
+            return Err(ExecutionError::InvalidQuote);
+        }
+
         let (value_usd, price_usd) = r.value_basis.price_fill(
             r.quote.input_amount,
             r.input_decimals,
-            output,
+            after_slippage,
             r.output_decimals,
         )?;
+
+        // Simulated fees: base fee + priority fee.
+        let fee_lamports = self.base_fee_lamports + self.priority_fee_lamports;
+        let fees_usd = super::executor::fee_usd(fee_lamports, None);
+
         Ok(Fill {
             order_id: r.order_id,
             signature: format!("paper:{}", uuid::Uuid::new_v4()),
             input_amount: r.quote.input_amount,
-            output_amount: output,
+            output_amount: after_slippage,
             price_usd,
-            fees_usd: Decimal::ZERO,
-            slippage_bps: 0,
+            fees_usd,
+            slippage_bps,
             confirmed_at: Utc::now(),
             latency_ms: 0,
-            fee_lamports: 0,
+            fee_lamports,
             input_value_usd: Some(value_usd),
             expected_output_amount: Some(r.quote.output_amount),
         })
@@ -71,7 +119,11 @@ impl<E: Executor> Executor for PaperExecutor<E> {
     async fn health(&self) -> Result<(), ExecutionError> {
         self.quotes.health().await
     }
+    fn register_quote(&self, quote: Quote) {
+        self.quotes.register_quote(quote);
+    }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,12 +185,14 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn paper_fill_applies_haircut_and_real_pricing() {
+    async fn paper_fill_applies_haircut_slippage_and_fees() {
         let paper = PaperExecutor::new(FakeExecutor { fail: false }, 100);
         let fill = paper.execute(request()).await.unwrap();
-        assert_eq!(fill.output_amount, 9_900_000);
-        assert_eq!(fill.price_usd, dec!(10) / dec!(9.9));
-        assert_eq!(fill.expected_output_amount, Some(10_000_000));
+        // Haircut: 10_000_000 * 9900/10000 = 9_900_000
+        // Slippage (price_impact 10/3 + 5 = 8 bps): 9_900_000 * 9992/10000 = 9_892_080
+        assert_eq!(fill.output_amount, 9_892_080);
+        assert!(fill.slippage_bps > 0, "should have simulated slippage");
+        assert!(fill.fee_lamports > 0, "should have simulated fees");
         assert!(fill.signature.starts_with("paper:"));
         assert!(!paper.is_live());
         assert!(paper.signer_pubkey().is_none());
@@ -203,7 +257,6 @@ mod tests {
         let r = request();
         let fill = paper.execute(r).await.expect("paper execute must succeed");
         assert!(fill.signature.starts_with("paper:"));
-        assert_eq!(fill.fee_lamports, 0);
         assert!(!paper.is_live());
         assert!(paper.signer_pubkey().is_none());
     }
@@ -228,5 +281,19 @@ mod tests {
             paper.execute(r).await,
             Err(ExecutionError::InvalidQuote)
         ));
+    }
+
+    #[tokio::test]
+    async fn paper_failure_injection_triggers_errors() {
+        let paper = PaperExecutor::with_failure_injection(FakeExecutor { fail: false }, 25, 3);
+        let r = request();
+        // Call 3 times: 1st ok, 2nd ok, 3rd fails.
+        let _ = paper.execute(r.clone()).await;
+        let _ = paper.execute(r.clone()).await;
+        let result = paper.execute(r).await;
+        assert!(
+            matches!(result, Err(ExecutionError::Transaction(_))),
+            "every 3rd call should fail"
+        );
     }
 }

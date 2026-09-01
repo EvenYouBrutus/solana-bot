@@ -150,6 +150,10 @@ pub struct RuntimeConfig {
     /// Collector configuration for Phase 1
     #[serde(default = "default_collector")]
     pub collector: CollectorConfig,
+    /// Path to a JSONL replay dataset for Mode::Replay. When set, the
+    /// collector feeds candidates from this file instead of signal_feed_path.
+    #[serde(default)]
+    pub replay_dataset_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -243,6 +247,7 @@ impl Default for RuntimeConfig {
             max_liquidity_age_secs: default_max_liquidity_age(),
             quote_cache_ttl_secs: default_quote_cache_ttl(),
             collector: default_collector(),
+            replay_dataset_path: None,
         }
     }
 }

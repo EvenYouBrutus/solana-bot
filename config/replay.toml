@@ -54,7 +54,7 @@ confirm_poll_ms = 500
 allowed_program_ids = []
 
 [storage]
-sqlite_path = "state/paper.sqlite3"
+sqlite_path = ":memory:"
 
 [runtime]
 signal_feed_path = "config/candidates.jsonl"
@@ -65,9 +65,9 @@ max_liquidity_age_secs = 300
 quote_cache_ttl_secs = 30
 
 [runtime.collector]
-enabled = true
+enabled = false
 websocket_endpoints = []
-replay_mode = false
+replay_mode = true
 
 [observability]
 log_format = "pretty"

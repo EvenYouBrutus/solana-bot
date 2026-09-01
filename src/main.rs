@@ -1,14 +1,16 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use solana_smart_money_bot::{
+    backtest::{self, BacktestConfig},
     config::{
         load,
         types::{Config, Mode},
     },
     data::rpc::RpcPool,
     economics::{break_even_calculator, BreakEvenInputs},
-    execution::{Executor, JupiterExecutor, PaperExecutor},
+    execution::{DeterministicExecutor, Executor, JupiterExecutor, PaperExecutor},
     observability,
+    report::PerformanceReport,
     runtime::{self, SessionDeps},
     storage::StateStore,
 };
@@ -63,6 +65,31 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Generate a performance report from persisted trade data.
+    Report {
+        #[arg(long)]
+        config: PathBuf,
+        /// Output format: "text" (default) or "json"
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Run historical backtest/replay with OOS split.
+    Backtest {
+        #[arg(long)]
+        config: PathBuf,
+        /// Path to backtest-specific TOML (split boundaries, cost assumptions)
+        #[arg(long, default_value = "config/backtest.toml")]
+        backtest_config: PathBuf,
+        /// Path to JSONL historical signal data
+        #[arg(long)]
+        input: PathBuf,
+        /// Output format: "text" (default) or "json"
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Optional path to write trade-by-trade JSON output
+        #[arg(long)]
+        trades: Option<PathBuf>,
+    },
 }
 
 fn build_executor(c: &Config, rpc: RpcPool) -> anyhow::Result<Arc<dyn Executor>> {
@@ -88,9 +115,7 @@ fn build_executor(c: &Config, rpc: RpcPool) -> anyhow::Result<Arc<dyn Executor>>
             )?;
             Ok(Arc::new(jup))
         }
-        Mode::Paper | Mode::Replay => {
-            // Paper and replay wrap Jupiter for quotes only; signer_env is
-            // explicitly None so no signing key is ever loaded.
+        Mode::Paper => {
             let jup = JupiterExecutor::new(
                 c.execution.jupiter_api_url.clone(),
                 rpc,
@@ -105,6 +130,14 @@ fn build_executor(c: &Config, rpc: RpcPool) -> anyhow::Result<Arc<dyn Executor>>
             )?;
             Ok(Arc::new(PaperExecutor::new(
                 jup,
+                c.runtime.paper_fill_haircut_bps,
+            )))
+        }
+        Mode::Replay => {
+            // Replay mode uses a deterministic executor that serves quotes
+            // from the candidate dataset. No network calls are made.
+            Ok(Arc::new(PaperExecutor::new(
+                DeterministicExecutor::new(),
                 c.runtime.paper_fill_haircut_bps,
             )))
         }
@@ -242,6 +275,53 @@ fn clear_emergency_stop(path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn report(path: PathBuf, format: &str) -> anyhow::Result<()> {
+    let (c, state, _rpc) = base_setup(&path)?;
+    let report = PerformanceReport::generate(&state, c.risk.starting_capital_usd)?;
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        _ => {
+            println!("{report}");
+        }
+    }
+    Ok(())
+}
+
+fn backtest_cmd(
+    config_path: PathBuf,
+    bt_config_path: PathBuf,
+    input: PathBuf,
+    format: &str,
+    trades_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let (config, _state, _rpc) = base_setup(&config_path)?;
+    let bt_toml = std::fs::read_to_string(&bt_config_path)
+        .with_context(|| format!("read {}", bt_config_path.display()))?;
+    let bt_config: BacktestConfig = toml::from_str(&bt_toml).context("parse backtest config")?;
+    let output =
+        backtest::run_backtest(&config, &bt_config, &input).map_err(|e| anyhow::anyhow!(e))?;
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                output.to_json_summary().map_err(|e| anyhow::anyhow!(e))?
+            );
+        }
+        _ => {
+            println!("{output}");
+        }
+    }
+    if let Some(trades_path) = trades_path {
+        let json = serde_json::to_string_pretty(&output.all_trades)?;
+        std::fs::write(&trades_path, json)
+            .with_context(|| format!("write {}", trades_path.display()))?;
+        println!("trade-by-trade output written to {}", trades_path.display());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -262,6 +342,14 @@ async fn main() -> anyhow::Result<()> {
         Command::ExitAll { config } => exit_all(config).await?,
         Command::EmergencyStop { config, reason } => emergency_stop(config, reason)?,
         Command::ClearEmergencyStop { config } => clear_emergency_stop(config)?,
+        Command::Report { config, format } => report(config, &format)?,
+        Command::Backtest {
+            config,
+            backtest_config,
+            input,
+            format,
+            trades,
+        } => backtest_cmd(config, backtest_config, input, &format, trades)?,
     }
     Ok(())
 }

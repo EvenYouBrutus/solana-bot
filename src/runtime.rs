@@ -6,6 +6,7 @@
 //! recovered without duplicate trades.
 
 use crate::{
+    collector::CandidateCollector,
     config::types::Config,
     data::rpc::RpcPool,
     domain::{
@@ -20,6 +21,7 @@ use crate::{
     },
     exit_monitor::{ExitDeps, ExitMonitor},
     portfolio::Portfolio,
+    report::PerformanceReport,
     risk::{authorize_entry, RiskEngine},
     storage::StateStore,
     strategy::{evaluate_signal, exit_reason, StrategyDecision},
@@ -27,6 +29,7 @@ use crate::{
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -733,6 +736,9 @@ struct SessionState {
     seen_signals: HashSet<String>,
     day_key: String,
     emergency_active: bool,
+    collector: CandidateCollector,
+    #[allow(dead_code)]
+    report: PerformanceReport,
 }
 
 /// Runs the trading session until `shutdown` resolves. Entries, exits,
@@ -756,6 +762,8 @@ pub async fn run_session(
         seen_signals: HashSet::new(),
         day_key: String::new(),
         emergency_active: false,
+        collector: CandidateCollector::new(),
+        report: PerformanceReport::new(config.risk.starting_capital_usd),
     };
 
     // Restore or initialise the daily-loss window.
@@ -834,6 +842,11 @@ pub async fn run_session(
             Err(e) => tracing::error!(error = %e, "final reconciliation failed"),
         }
     }
+
+    // Generate and log the performance report.
+    let report =
+        crate::report::PerformanceReport::generate(store, config.risk.starting_capital_usd)?;
+    tracing::info!(summary = %report.summary(), "session performance report");
     Ok(())
 }
 
@@ -915,35 +928,51 @@ async fn tick(
         let _ = reason;
     }
 
-    // 1. Ingest candidates from the verified feed.
-    if let Some(path) = config
+    // 1. Ingest candidates from the verified feed using the collector.
+    let feed_path = config
         .runtime
-        .signal_feed_path
+        .replay_dataset_path
         .as_deref()
-        .filter(|s| !s.is_empty())
-    {
-        match std::fs::read_to_string(path) {
-            Ok(data) => {
-                for line in data.lines().filter(|l| !l.trim().is_empty()) {
-                    match serde_json::from_str::<CandidateInput>(line) {
-                        Ok(c) => {
-                            let fresh = now;
-                            if c.market.observed_at > fresh || c.safety.observed_at > fresh {
-                                tracing::warn!(mint=%c.mint, "rejected future-dated candidate");
-                                continue;
-                            }
-                            // Persist liquidity observation so the exit monitor
-                            // can evaluate LiquidityDeterioration without the feed.
-                            let _ = store.set_last_liquidity(&c.mint, c.market.liquidity_usd);
-                            state.candidates.insert(c.mint.clone(), c);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "skipping malformed candidate line"),
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, path, "cannot read signal feed; no entries this tick")
-            }
+        .or(config.runtime.signal_feed_path.as_deref())
+        .filter(|s| !s.is_empty());
+    if let Some(path) = feed_path {
+        let new_candidates =
+            state
+                .collector
+                .collect_from_jsonl(path, now, config.rpc.max_data_age_secs);
+        for c in &new_candidates {
+            let _ = store.set_last_liquidity(&c.mint, c.market.liquidity_usd);
+            // Register a quote from candidate market data so the deterministic
+            // executor can serve it during process_entries.
+            let sol_price = config.economics.sol_price_usd.unwrap_or(dec!(150));
+            let input_value_usd = c.position_usd;
+            let tokens = if sol_price > Decimal::ZERO && c.market.price_usd > Decimal::ZERO {
+                (input_value_usd / c.market.price_usd * dec!(1_000_000) * dec!(1_000_000_000)
+                    / dec!(1_000_000))
+                .to_string()
+                .parse::<u64>()
+                .unwrap_or(c.input_amount)
+            } else {
+                c.input_amount
+            };
+            deps.executor.register_quote(crate::execution::Quote {
+                input_mint: config.strategy.base_mint.clone(),
+                output_mint: c.mint.clone(),
+                input_amount: c.input_amount,
+                output_amount: tokens,
+                price_impact_bps: c
+                    .costs
+                    .input
+                    .avg_price_impact_bps
+                    .to_string()
+                    .parse()
+                    .unwrap_or(50),
+                route: serde_json::json!({"source": "replay"}),
+                observed_at: now,
+            });
+        }
+        for c in new_candidates {
+            state.candidates.insert(c.mint.clone(), c);
         }
     }
 
@@ -974,8 +1003,9 @@ async fn tick(
         .as_deref()
         .unwrap_or_default()
         .is_empty()
+        && !config.runtime.collector.enabled
     {
-        tracing::debug!("no signal feed configured; no entries");
+        tracing::debug!("no signal feed and no collector configured; no entries");
     } else {
         process_entries(deps, state).await?;
     }
@@ -1466,6 +1496,8 @@ pub async fn exit_all_positions(deps: &SessionDeps) -> Result<usize> {
         seen_signals: HashSet::new(),
         day_key: Utc::now().date_naive().to_string(),
         emergency_active: true,
+        collector: CandidateCollector::new(),
+        report: PerformanceReport::new(deps.config.risk.starting_capital_usd),
     };
     for mint in open {
         let Some(remaining) = state
@@ -1717,6 +1749,8 @@ mod tests {
             seen_signals: HashSet::new(),
             day_key: Utc::now().date_naive().to_string(),
             emergency_active: false,
+            collector: CandidateCollector::new(),
+            report: PerformanceReport::new(config.risk.starting_capital_usd),
         };
         let rpc = Arc::new(
             crate::data::rpc::RpcPool::with_attempts(

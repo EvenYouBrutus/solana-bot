@@ -1,7 +1,7 @@
 use crate::{config::types::StrategyConfig, domain::position::Position};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExitReason {
     StopLoss,
     TakeProfit,

@@ -1,0 +1,17 @@
+[split]
+train_end = "2024-06-01T00:00:00Z"
+validation_start = "2024-06-01T00:00:00Z"
+validation_end = "2024-09-01T00:00:00Z"
+oos_start = "2024-09-01T00:00:00Z"
+
+[costs]
+entry_swap_fee_bps = 30
+entry_priority_fee_usd = 0.002
+entry_slippage_bps = 50
+entry_price_impact_bps = 20
+exit_swap_fee_bps = 30
+exit_priority_fee_usd = 0.002
+exit_slippage_bps = 50
+exit_price_impact_bps = 20
+failed_tx_rate = 0.05
+failed_tx_cost_usd = 0.002

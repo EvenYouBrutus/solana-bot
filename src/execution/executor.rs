@@ -119,6 +119,9 @@ pub trait Executor: Send + Sync {
     fn is_live(&self) -> bool {
         false
     }
+    /// Pre-register a quote for deterministic/replay executors. No-op for
+    /// live and Jupiter-backed executors.
+    fn register_quote(&self, _quote: Quote) {}
 }
 
 /// Enriches a fill with fee USD using a SOL price; lamports are always kept.
