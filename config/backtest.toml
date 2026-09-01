@@ -1,5 +1,6 @@
-min_expected_net_return_pct = -100.0
-min_signal_score = 0.0
+# NOTE: no strategy/economic threshold overrides live here. The backtest
+# entry decision always uses the production thresholds from the main config
+# (min_expected_net_return_pct, min_signal_score, round_trip_cost_threshold_pct).
 
 [split]
 train_end = "2024-06-01T00:00:00Z"

@@ -33,15 +33,7 @@ pub fn run_backtest(
         let split =
             split::classify_split_with_exclusion(signal.signal_timestamp, &bt_config.split).0;
 
-        match engine::simulate_signal(
-            signal,
-            config,
-            &cost_assumptions,
-            split,
-            trade_index,
-            bt_config.min_expected_net_return_pct,
-            bt_config.min_signal_score,
-        ) {
+        match engine::simulate_signal(signal, config, &cost_assumptions, split, trade_index) {
             Ok(trade) => {
                 trades.push(trade);
                 trade_index += 1;

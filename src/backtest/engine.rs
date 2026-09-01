@@ -5,7 +5,7 @@ use crate::domain::position::{Position, PositionState, ReconciliationStatus};
 use crate::domain::signal::{SignalScore, TradeSignal};
 use crate::domain::token::TokenSafety;
 use crate::domain::wallet::{Side, WalletStats};
-use crate::economics::ExpectedValue;
+use crate::economics::{EconomicGate, EconomicGateDecision, ExpectedValue};
 use crate::strategy::exit::{exit_reason, ExitReason};
 use crate::strategy::signal::StrategyDecision;
 use chrono::{DateTime, Utc};
@@ -259,21 +259,27 @@ fn build_position(
 ///
 /// Key invariants:
 /// - `expected_gross_return_pct` from the signal is NEVER used in the entry decision.
-/// - The economic gate uses only point-in-time cost data.
+/// - The entry decision uses the ACTUAL production thresholds from `config`
+///   (economic edge, signal score, cost gate). There are no backtest overrides.
+/// - All decision data is strictly point-in-time: market/safety/costs
+///   observed_at and every wallet updated_at must be <= signal_timestamp.
+/// - The expected return required by the production economic gate is
+///   reconstructed ONLY from the point-in-time cost model (the average gross
+///   win required to break even under the recorded payoff assumptions).
+///   If it cannot be reconstructed, the signal is rejected as insufficient
+///   economic evidence.
 /// - Entry quantity is computed at market price; execution effects (slippage,
 ///   impact, fees) are captured as modeled dollar costs, not quantity reductions.
 /// - MFE/MAE are computed from all observations up to and including the exit.
 /// - The trailing stop evaluates against high-water from prior observations
 ///   (the current observation's price is evaluated against the previous high).
-/// - IDs are deterministic (no randomness).
+/// - IDs are deterministic (no randomness; no wall-clock input anywhere).
 pub fn simulate_signal(
     signal: &HistoricalSignal,
     config: &Config,
     cost_assumptions: &CostAssumptions,
     split: Split,
     trade_index: usize,
-    min_edge_override: Option<Decimal>,
-    min_signal_score_override: Option<Decimal>,
 ) -> Result<SimulatedTrade, String> {
     // --- Price path sufficiency check ---
     // The data must span at least max_holding_minutes from entry to permit
@@ -286,25 +292,52 @@ pub fn simulate_signal(
         false
     };
 
-    // --- Point-in-time entry decision ---
-    // Compute break-even return from the signal's cost model. This is the
-    // minimum gross return needed to cover all modeled costs. The signal's
-    // own expected_gross_return_pct is NEVER used.
-    let cost_result = signal
-        .costs
-        .calculate()
-        .map_err(|e| format!("cost model calculation failed: {e}"))?;
-    let break_even_gross_return =
-        cost_result.round_trip_cost_pct_of_position + config.economics.uncertainty_haircut_pct;
+    // --- Point-in-time validation of the economic inputs ---
+    // The production entry path evaluates the economic gate on the cost model,
+    // so the cost model must be point-in-time valid. Reject otherwise: cost
+    // data observed after the signal is insufficient economic evidence.
+    if signal.costs.observed_at > signal.signal_timestamp {
+        return Err(
+            "insufficient economic evidence: costs.observed_at is after signal_timestamp".into(),
+        );
+    }
 
+    // --- Production economic cost gate (mirrors risk::authorize_entry) ---
+    let gate = EconomicGate {
+        round_trip_cost_threshold_pct: config.economics.round_trip_cost_threshold_pct,
+    };
+    let cost_result = match gate.check(&signal.costs) {
+        Ok(EconomicGateDecision::Allowed(result)) => result,
+        Ok(EconomicGateDecision::Rejected {
+            result,
+            threshold_pct,
+        }) => {
+            return Err(format!(
+                "round-trip cost {}% exceeds {}% threshold",
+                result.round_trip_cost_pct_of_position, threshold_pct
+            ));
+        }
+        Err(e) => {
+            return Err(format!("insufficient economic evidence: {e}"));
+        }
+    };
+
+    // --- Point-in-time entry decision ---
+    // The production economic gate needs an expected gross return. Production
+    // derives it from a forward-looking forecast that is not reconstructable
+    // from the historical record (and the recorded expected_gross_return_pct
+    // must not influence the decision), so the expected return is reconstructed
+    // purely from the point-in-time cost model: the average gross win required
+    // to break even under the recorded payoff assumptions. If the cost model
+    // cannot produce it, the signal lacks sufficient economic evidence.
     let expected = ExpectedValue::estimate(
-        break_even_gross_return,
+        cost_result.required_avg_win_pct,
         &signal.costs,
         dec!(0),
         dec!(0),
         config.economics.uncertainty_haircut_pct,
     )
-    .map_err(|e| format!("economic estimation failed: {e}"))?;
+    .map_err(|e| format!("insufficient economic evidence: {e}"))?;
 
     let wallet_refs: Vec<&WalletStats> = signal.wallets.iter().collect();
 
@@ -316,8 +349,6 @@ pub fn simulate_signal(
         &signal.safety,
         &expected,
         signal.signal_timestamp,
-        min_edge_override,
-        min_signal_score_override,
     );
 
     let _signal_data = match decision {
@@ -518,8 +549,8 @@ pub fn simulate_signal(
 
 /// Point-in-time version of evaluate_signal that accepts an explicit `now`
 /// parameter instead of using `Utc::now()`. Faithfully reproduces the same
-/// validation order and thresholds from the production `evaluate_signal`.
-#[allow(clippy::too_many_arguments)]
+/// validation order and thresholds from the production `evaluate_signal`,
+/// using the ACTUAL production config values (no backtest overrides).
 fn evaluate_signal_pit(
     config: &Config,
     mint: &str,
@@ -528,8 +559,6 @@ fn evaluate_signal_pit(
     safety: &TokenSafety,
     expected: &ExpectedValue,
     now: DateTime<Utc>,
-    min_edge_override: Option<Decimal>,
-    min_signal_score_override: Option<Decimal>,
 ) -> StrategyDecision {
     // Staleness / future-dated check
     if market.observed_at > now
@@ -573,10 +602,10 @@ fn evaluate_signal_pit(
             "wallet evidence below configured confidence threshold".into(),
         );
     }
-    // Economic edge — uses break-even return from cost model, NOT
-    // signal.expected_gross_return_pct. This is strictly PIT.
-    let min_edge = min_edge_override.unwrap_or(config.economics.min_expected_net_return_pct);
-    if expected.net_return_pct < min_edge {
+    // Economic edge — production threshold, no override. Uses the expected
+    // value reconstructed from point-in-time cost data, NOT
+    // signal.expected_gross_return_pct.
+    if expected.net_return_pct < config.economics.min_expected_net_return_pct {
         return StrategyDecision::Rejected("economic edge below threshold".into());
     }
     // Signal scoring
@@ -599,8 +628,7 @@ fn evaluate_signal_pit(
         + score.risk_score
         + score.economic_score)
         / dec!(6);
-    let min_score = min_signal_score_override.unwrap_or(config.strategy.min_signal_score);
-    if score.final_signal_score < min_score {
+    if score.final_signal_score < config.strategy.min_signal_score {
         return StrategyDecision::Rejected("signal confidence below threshold".into());
     }
     StrategyDecision::Accepted(Box::new(TradeSignal {
@@ -625,6 +653,10 @@ fn deterministic_trade_id_from_str(s: &str, ts: DateTime<Utc>) -> String {
 use crate::domain::market::MarketSnapshot;
 
 /// Backtest-specific configuration loaded from `config/backtest.toml`.
+///
+/// This config intentionally contains NO strategy/economic threshold
+/// overrides: the entry decision always uses the production thresholds
+/// from the main `Config` (economic edge, signal score, cost gate).
 #[derive(Debug, Clone, Deserialize)]
 pub struct BacktestConfig {
     pub split: crate::backtest::split::SplitConfig,
@@ -633,10 +665,6 @@ pub struct BacktestConfig {
     /// Starting capital in USD for drawdown calculations.
     #[serde(default = "default_capital")]
     pub capital_usd: rust_decimal::Decimal,
-    /// Override for min_expected_net_return_pct (bypasses config validation).
-    pub min_expected_net_return_pct: Option<rust_decimal::Decimal>,
-    /// Override for min_signal_score.
-    pub min_signal_score: Option<rust_decimal::Decimal>,
 }
 
 fn default_capital() -> rust_decimal::Decimal {
@@ -724,27 +752,29 @@ mod tests {
     use rust_decimal_macros::dec;
 
     fn base_config() -> Config {
+        // Mirrors the production thresholds in config/paper.toml. The backtest
+        // entry decision must run under the ACTUAL production gates.
         let text = r#"
 mode = "paper"
 [rpc]
 http_endpoints = ["https://api.test"]
-max_data_age_secs = 999999
+max_data_age_secs = 15
 [strategy]
 base_mint = "So11111111111111111111111111111111111111112"
 min_wallet_score = 60.0
 min_wallet_samples = 25
 min_consensus_wallets = 2
-            min_signal_score = 50.0
+min_signal_score = 65.0
 min_token_age_secs = 86400
 stop_loss_pct = 5.0
 take_profit_pct = 12.0
 trailing_stop_pct = 4.0
 max_holding_minutes = 240
 [economics]
-round_trip_cost_threshold_pct = 100.0
-min_expected_net_return_pct = -100.0
-max_quote_age_secs = 999999
-uncertainty_haircut_pct = 0
+round_trip_cost_threshold_pct = 3.0
+min_expected_net_return_pct = 2.0
+max_quote_age_secs = 3
+uncertainty_haircut_pct = 1.0
 [risk]
 starting_capital_usd = 100.0
 max_live_capital_usd = 100.0
@@ -756,7 +786,7 @@ max_daily_loss_percent = 100.0
 max_total_drawdown_before_kill_switch_pct = 100.0
 cooldown_after_loss_minutes = 0
 max_slippage_bps = 10000
-min_liquidity_usd = 1.0
+min_liquidity_usd = 50000.0
 max_trades_per_day = 100
 [execution]
 provider = "jupiter"
@@ -811,8 +841,8 @@ sqlite_path = ":memory:"
             price_usd: price,
             liquidity_usd: liquidity,
             volume_24h_usd: dec!(50000),
-            volatility_pct: dec!(15),
-            buy_sell_imbalance: dec!(0.6),
+            volatility_pct: dec!(5),
+            buy_sell_imbalance: dec!(1.0),
             observed_at: ts,
             received_at: ts,
             slot: None,
@@ -894,16 +924,8 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000)), (dec!(0.00012), dec!(100000))],
         );
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         assert_eq!(trade.exit_reason, ExitReason::TakeProfit);
         assert!(trade.gross_pnl_usd > Decimal::ZERO);
         assert!(!trade.is_ambiguous);
@@ -921,16 +943,8 @@ sqlite_path = ":memory:"
                 (dec!(0.00009), dec!(100000)),
             ],
         );
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         assert_eq!(trade.exit_reason, ExitReason::StopLoss);
         assert!(trade.gross_pnl_usd < Decimal::ZERO);
     }
@@ -948,16 +962,8 @@ sqlite_path = ":memory:"
                 (dec!(0.000101), dec!(100000)),
             ],
         );
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         assert!(
             trade.exit_reason == ExitReason::TrailingStop
                 || trade.exit_reason == ExitReason::TakeProfit
@@ -979,16 +985,8 @@ sqlite_path = ":memory:"
             ],
         );
         // 3 obs at 5min intervals = 15 min of data >= max_holding of 10 min
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         assert_eq!(trade.exit_reason, ExitReason::TimeLimit);
         assert!(!trade.is_censored);
     }
@@ -1007,16 +1005,8 @@ sqlite_path = ":memory:"
             ],
         );
         // 2 obs at 5min intervals = 10 min of data < max_holding of 240 min
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         assert_eq!(trade.exit_reason, ExitReason::Censored);
         assert!(trade.is_censored);
         assert!(trade.censored_reason.is_some());
@@ -1036,16 +1026,8 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.000101), dec!(100000))],
         );
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         assert_eq!(trade.exit_reason, ExitReason::Censored);
         assert!(trade.is_censored);
     }
@@ -1060,16 +1042,8 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.0001), dec!(70000))],
         );
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         assert_eq!(trade.exit_reason, ExitReason::LiquidityDeterioration);
     }
 
@@ -1082,16 +1056,8 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000))],
         );
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         assert!(!trade.entry_costs.is_observed);
         assert!(!trade.exit_costs.is_observed);
         assert_eq!(trade.cost_mode, CostMode::Modeled);
@@ -1107,7 +1073,7 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000))],
         );
-        let trade = simulate_signal(&signal, &config, &ca, Split::Train, 0, None, None).unwrap();
+        let trade = simulate_signal(&signal, &config, &ca, Split::Train, 0).unwrap();
         // Total cost = entry + exit + expected failed tx cost
         // No slippage_factor double-count: entry costs include slippage as
         // a dollar cost, quantity is at full market price.
@@ -1143,24 +1109,10 @@ sqlite_path = ":memory:"
         );
         signal_high.expected_gross_return_pct = dec!(9999);
 
-        let result_low = simulate_signal(
-            &signal_low,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        );
-        let result_high = simulate_signal(
-            &signal_high,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        );
+        let result_low =
+            simulate_signal(&signal_low, &config, &cost_assumptions(), Split::Train, 0);
+        let result_high =
+            simulate_signal(&signal_high, &config, &cost_assumptions(), Split::Train, 0);
 
         // Both must produce the same outcome: same exit reason, same PnL.
         assert_eq!(result_low.is_ok(), result_high.is_ok());
@@ -1169,6 +1121,155 @@ sqlite_path = ":memory:"
             assert_eq!(tl.gross_pnl_usd, th.gross_pnl_usd);
             assert_eq!(tl.net_pnl_usd, th.net_pnl_usd);
         }
+
+        // Same invariance on the rejection path: with a signal score above
+        // the production threshold, both variants are rejected identically.
+        let mut strict = base_config();
+        strict.strategy.min_signal_score = dec!(70.0);
+        let err_low = simulate_signal(&signal_low, &strict, &cost_assumptions(), Split::Train, 0)
+            .unwrap_err();
+        let err_high = simulate_signal(&signal_high, &strict, &cost_assumptions(), Split::Train, 0)
+            .unwrap_err();
+        assert_eq!(err_low, err_high);
+        assert!(err_low.contains("signal confidence below threshold"));
+    }
+
+    #[test]
+    fn future_market_data_rejected_in_decision_path() {
+        let config = base_config();
+        let mut signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        signal.market.observed_at = "2024-01-15T12:01:00Z".parse().unwrap();
+        let err =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap_err();
+        assert!(err.contains("future-dated"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn future_safety_data_rejected_in_decision_path() {
+        let config = base_config();
+        let mut signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        signal.safety.observed_at = "2024-01-15T12:01:00Z".parse().unwrap();
+        let err =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap_err();
+        assert!(err.contains("future-dated"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn future_wallet_data_rejected_in_decision_path() {
+        let config = base_config();
+        let mut signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        signal.wallets[0].updated_at = "2024-01-15T12:01:00Z".parse().unwrap();
+        let err =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap_err();
+        assert!(
+            err.contains("wallet evidence below configured confidence threshold"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn future_cost_data_rejected_in_decision_path() {
+        let config = base_config();
+        let mut signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        signal.costs.observed_at = "2024-01-15T12:01:00Z".parse().unwrap();
+        let err =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap_err();
+        assert!(
+            err.contains("insufficient economic evidence"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn production_economic_edge_threshold_is_used() {
+        // base_config uses the production min_expected_net_return_pct = 2.0.
+        // The expected value is reconstructed from the point-in-time cost
+        // model only, so the production threshold — not any backtest
+        // override — decides acceptance here.
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        assert!(simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).is_ok());
+
+        // A stricter edge than production rejects the same signal.
+        let mut strict = base_config();
+        strict.economics.min_expected_net_return_pct = dec!(6.0);
+        let err =
+            simulate_signal(&signal, &strict, &cost_assumptions(), Split::Train, 0).unwrap_err();
+        assert!(
+            err.contains("economic edge below threshold"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn production_signal_score_threshold_is_used() {
+        // base_config uses the production min_signal_score = 65.0.
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        assert!(simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).is_ok());
+
+        let mut strict = base_config();
+        strict.strategy.min_signal_score = dec!(70.0);
+        let err =
+            simulate_signal(&signal, &strict, &cost_assumptions(), Split::Train, 0).unwrap_err();
+        assert!(
+            err.contains("signal confidence below threshold"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn production_round_trip_cost_gate_is_enforced() {
+        // Mirrors the production authorize_entry gate: round-trip cost of the
+        // point-in-time cost model must be within the configured threshold.
+        let mut config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        // The fixture cost model's round-trip cost is 2.105% of position.
+        config.economics.round_trip_cost_threshold_pct = dec!(2.0);
+        let err =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap_err();
+        assert!(
+            err.contains("exceeds") && err.contains("threshold"),
+            "unexpected error: {err}"
+        );
+
+        config.economics.round_trip_cost_threshold_pct = dec!(3.0);
+        assert!(simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).is_ok());
     }
 
     #[test]
@@ -1181,15 +1282,7 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000))],
         );
-        let result = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        );
+        let result = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("wallet evidence"));
     }
@@ -1206,16 +1299,8 @@ sqlite_path = ":memory:"
                 (dec!(0.000097), dec!(100000)),
             ],
         );
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         assert_eq!(trade.mfe_pct, dec!(10)); // +10% from 0.0001 to 0.00011
         assert_eq!(trade.mae_pct, dec!(-3)); // -3% from 0.0001 to 0.000097
     }
@@ -1233,16 +1318,8 @@ sqlite_path = ":memory:"
                 (dec!(0.000112), dec!(100000)),
             ],
         );
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         // TP at 12% triggers at obs 2 (0.000112). MFE should be 12%.
         assert_eq!(trade.exit_reason, ExitReason::TakeProfit);
         assert_eq!(trade.mfe_pct, dec!(12));
@@ -1262,16 +1339,8 @@ sqlite_path = ":memory:"
                 (dec!(0.000100), dec!(100000)),
             ],
         );
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         // High water = 0.00011 (from obs 1). Trailing stop at 4% from 0.00011 = 0.0001056.
         // Obs 2 price = 0.000100 < 0.0001056 → trailing stop triggers.
         assert_eq!(trade.exit_reason, ExitReason::TrailingStop);
@@ -1313,26 +1382,8 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000))],
         );
-        let t1 = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
-        let t2 = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let t1 = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        let t2 = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         // Same input → same deterministic ID
         assert_eq!(t1.trade_id, t2.trade_id);
     }
@@ -1346,26 +1397,8 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000))],
         );
-        let t1 = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
-        let t2 = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            1,
-            None,
-            None,
-        )
-        .unwrap();
+        let t1 = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        let t2 = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 1).unwrap();
         assert_ne!(t1.trade_id, t2.trade_id);
     }
 
@@ -1380,16 +1413,8 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000))],
         );
-        let trade = simulate_signal(
-            &signal,
-            &config,
-            &cost_assumptions(),
-            Split::Train,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
         let expected_quantity = signal.position_usd / dec!(0.0001);
         assert_eq!(trade.entry_quantity_tokens, expected_quantity);
     }

@@ -36,7 +36,9 @@ pub struct HistoricalSignal {
     pub costs: CostModel,
     /// Intended position size in USD.
     pub position_usd: Decimal,
-    /// Model's expected gross return percent. NEVER used as realized return.
+    /// Model's expected gross return percent. NEVER used in the entry
+    /// decision (economic gate, signal score, or acceptance filtering);
+    /// recorded for analysis only.
     pub expected_gross_return_pct: Decimal,
     /// Token decimals (typically 6 for SPL tokens).
     pub token_decimals: u8,
@@ -155,22 +157,17 @@ pub struct SignalRejection {
     pub signal_timestamp: String,
 }
 
-/// Pre-filter signals: reject future-dated ones, separate accepted/rejected.
+/// Pre-filter signals: reject structurally invalid ones before simulation.
+///
+/// This must NOT consult the wall clock: the entry decision is a pure
+/// function of the historical record and the production config, so running
+/// the backtest at a different time cannot change any decision.
 pub fn prefilter_signals(
     signals: &mut Vec<HistoricalSignal>,
 ) -> (Vec<HistoricalSignal>, Vec<SignalRejection>) {
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
-    let now = Utc::now();
     for signal in signals.drain(..) {
-        if signal.signal_timestamp > now {
-            rejected.push(SignalRejection {
-                reason: "future-dated signal".into(),
-                mint: signal.mint.clone(),
-                signal_timestamp: signal.signal_timestamp.to_rfc3339(),
-            });
-            continue;
-        }
         if signal.price_history.is_empty() {
             rejected.push(SignalRejection {
                 reason: "empty price_history".into(),
