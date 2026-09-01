@@ -9,6 +9,8 @@ pub enum ExitReason {
     TimeLimit,
     LiquidityDeterioration,
     SignalInvalidated,
+    /// Backtest-only: insufficient future data to determine a valid exit.
+    Censored,
 }
 impl ExitReason {
     pub fn as_str(&self) -> &str {
@@ -19,6 +21,7 @@ impl ExitReason {
             Self::TimeLimit => "time_limit",
             Self::LiquidityDeterioration => "liquidity_deterioration",
             Self::SignalInvalidated => "signal_invalidated",
+            Self::Censored => "censored",
         }
     }
 }

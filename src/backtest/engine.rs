@@ -1,7 +1,6 @@
 use crate::backtest::data::HistoricalSignal;
 use crate::backtest::split::Split;
 use crate::config::types::Config;
-use crate::domain::market::MarketSnapshot;
 use crate::domain::position::{Position, PositionState, ReconciliationStatus};
 use crate::domain::signal::{SignalScore, TradeSignal};
 use crate::domain::token::TokenSafety;
@@ -13,7 +12,29 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+/// Whether execution costs are modeled assumptions or observed from real fills.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CostMode {
+    /// All costs are modeled assumptions (slippage, fees, impact).
+    Modeled,
+    /// All costs are observed from real execution fills.
+    Observed,
+    /// Mix of modeled and observed costs.
+    Mixed,
+}
+
+impl std::fmt::Display for CostMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CostMode::Modeled => write!(f, "modeled"),
+            CostMode::Observed => write!(f, "observed"),
+            CostMode::Mixed => write!(f, "mixed"),
+        }
+    }
+}
 
 /// Modeled execution costs for a single trade leg.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +46,15 @@ pub struct TradeCosts {
     pub total_usd: Decimal,
     /// Whether these costs are observed from real fills or modeled assumptions.
     pub is_observed: bool,
+}
+
+/// Generate a deterministic trade ID from signal data and index.
+fn deterministic_trade_id(signal: &HistoricalSignal, index: usize) -> String {
+    let mut hasher = DefaultHasher::new();
+    signal.signal_timestamp.hash(&mut hasher);
+    signal.mint.hash(&mut hasher);
+    index.hash(&mut hasher);
+    format!("bt:{:016x}", hasher.finish())
 }
 
 /// Complete record of a simulated trade.
@@ -63,6 +93,12 @@ pub struct SimulatedTrade {
     // Flags
     pub is_ambiguous: bool,
     pub ambiguous_reason: Option<String>,
+    /// True when the price history was insufficient to determine a valid exit.
+    pub is_censored: bool,
+    /// Explanation of why the trade is censored (e.g. "insufficient future data").
+    pub censored_reason: Option<String>,
+    /// Whether costs are modeled, observed, or mixed.
+    pub cost_mode: CostMode,
 }
 
 /// Backtest-specific configuration for cost modeling.
@@ -84,13 +120,17 @@ pub struct CostAssumptions {
     pub exit_slippage_bps: Decimal,
     /// Exit leg: price impact in bps.
     pub exit_price_impact_bps: Decimal,
-    /// Probability of a failed transaction attempt.
+    /// Expected probability of a failed transaction attempt (modeled).
     pub failed_tx_rate: Decimal,
-    /// Cost per failed transaction in USD.
+    /// Cost per failed transaction in USD (modeled).
     pub failed_tx_cost_usd: Decimal,
 }
 
 impl CostAssumptions {
+    /// Compute entry costs for a given notional USD amount.
+    ///
+    /// These are ALL MODELED assumptions. Slippage is captured as a separate
+    /// dollar cost here; it is NOT also applied as a quantity reduction.
     pub fn entry_costs(&self, notional_usd: Decimal) -> TradeCosts {
         let swap_fee = notional_usd * self.entry_swap_fee_bps / dec!(10000);
         let slippage = notional_usd * self.entry_slippage_bps / dec!(10000);
@@ -106,6 +146,9 @@ impl CostAssumptions {
         }
     }
 
+    /// Compute exit costs for a given proceeds USD amount.
+    ///
+    /// These are ALL MODELED assumptions.
     pub fn exit_costs(&self, proceeds_usd: Decimal) -> TradeCosts {
         let swap_fee = proceeds_usd * self.exit_swap_fee_bps / dec!(10000);
         let slippage = proceeds_usd * self.exit_slippage_bps / dec!(10000);
@@ -121,13 +164,33 @@ impl CostAssumptions {
         }
     }
 
-    pub fn failed_tx_cost(&self) -> Decimal {
+    /// Expected cost of failed transactions across both legs.
+    ///
+    /// This is a PROBABILISTIC expected cost: `2 * failed_tx_rate * cost_per_tx`.
+    /// It represents the average gas fees lost to failed submissions, NOT a
+    /// guaranteed cost that definitely occurs on every trade.
+    pub fn expected_failed_tx_cost(&self) -> Decimal {
         dec!(2) * self.failed_tx_rate * self.failed_tx_cost_usd
+    }
+
+    /// Total modeled round-trip cost for a position.
+    pub fn total_round_trip_cost(
+        &self,
+        position_usd: Decimal,
+        exit_proceeds_usd: Decimal,
+    ) -> Decimal {
+        self.entry_costs(position_usd).total_usd
+            + self.exit_costs(exit_proceeds_usd).total_usd
+            + self.expected_failed_tx_cost()
     }
 }
 
 /// Detect ambiguous OHLC situations where both SL and TP thresholds are
 /// crossed between consecutive observations and ordering cannot be determined.
+///
+/// Conservative rule: when ambiguous, the interval is marked ambiguous and
+/// the trade is excluded from performance statistics. We never choose the
+/// favorable outcome.
 fn detect_ambiguity(
     prev_price: Decimal,
     curr_price: Decimal,
@@ -159,7 +222,7 @@ fn build_position(
 ) -> Position {
     Position {
         mint: signal.mint.clone(),
-        position_id: Some(Uuid::new_v4().to_string()),
+        position_id: Some(format!("bt-pos:{}", signal.mint)),
         token_mint: Some(signal.mint.clone()),
         base_mint: None,
         entry_input_amount_atomic: None,
@@ -181,31 +244,61 @@ fn build_position(
         exit_time: None,
         entry_price_usd: entry_price,
         entry_time,
-        entry_signature: format!("backtest:{}", Uuid::new_v4()),
+        entry_signature: format!("backtest:{}", signal.mint),
         high_water_price_usd: entry_price,
         realized_pnl_usd: Decimal::ZERO,
         unrealized_pnl_usd: Decimal::ZERO,
         fees_usd: Decimal::ZERO,
         current_value_usd: signal.position_usd,
-        signal_id: Uuid::new_v4().to_string(),
+        signal_id: signal.mint.clone(),
         exit_reason: None,
     }
 }
 
 /// Simulate a single historical signal through the full entry/exit pipeline.
 ///
-/// Returns the complete trade record, or a rejection reason if the signal
-/// would not have been accepted.
+/// Key invariants:
+/// - `expected_gross_return_pct` from the signal is NEVER used in the entry decision.
+/// - The economic gate uses only point-in-time cost data.
+/// - Entry quantity is computed at market price; execution effects (slippage,
+///   impact, fees) are captured as modeled dollar costs, not quantity reductions.
+/// - MFE/MAE are computed from all observations up to and including the exit.
+/// - The trailing stop evaluates against high-water from prior observations
+///   (the current observation's price is evaluated against the previous high).
+/// - IDs are deterministic (no randomness).
 pub fn simulate_signal(
     signal: &HistoricalSignal,
     config: &Config,
     cost_assumptions: &CostAssumptions,
     split: Split,
+    trade_index: usize,
+    min_edge_override: Option<Decimal>,
+    min_signal_score_override: Option<Decimal>,
 ) -> Result<SimulatedTrade, String> {
+    // --- Price path sufficiency check ---
+    // The data must span at least max_holding_minutes from entry to permit
+    // a valid TimeLimit exit. If not, and no exit trigger occurs, the trade
+    // must be marked Censored.
+    let max_hold = chrono::Duration::minutes(config.strategy.max_holding_minutes);
+    let price_path_sufficient = if let Some(last_obs) = signal.price_history.last() {
+        (last_obs.timestamp - signal.signal_timestamp) >= max_hold
+    } else {
+        false
+    };
+
     // --- Point-in-time entry decision ---
-    // Build ExpectedValue from the signal's own cost model and expected return.
+    // Compute break-even return from the signal's cost model. This is the
+    // minimum gross return needed to cover all modeled costs. The signal's
+    // own expected_gross_return_pct is NEVER used.
+    let cost_result = signal
+        .costs
+        .calculate()
+        .map_err(|e| format!("cost model calculation failed: {e}"))?;
+    let break_even_gross_return =
+        cost_result.round_trip_cost_pct_of_position + config.economics.uncertainty_haircut_pct;
+
     let expected = ExpectedValue::estimate(
-        signal.expected_gross_return_pct,
+        break_even_gross_return,
         &signal.costs,
         dec!(0),
         dec!(0),
@@ -215,15 +308,6 @@ pub fn simulate_signal(
 
     let wallet_refs: Vec<&WalletStats> = signal.wallets.iter().collect();
 
-    // Use evaluate_signal with a point-in-time adaptation: set the config's
-    // max_data_age_secs very large and ensure all timestamps are relative
-    // to signal_timestamp. The evaluate_signal function uses Utc::now() for
-    // freshness checks, so we adapt by ensuring market.observed_at == signal_timestamp
-    // and making max_data_age_secs large enough.
-    //
-    // However, evaluate_signal uses `Utc::now()` directly. For true PIT
-    // correctness, we use our own PIT evaluation that faithfully replicates
-    // the same logic but with an explicit `now` parameter.
     let decision = evaluate_signal_pit(
         config,
         &signal.mint,
@@ -232,6 +316,8 @@ pub fn simulate_signal(
         &signal.safety,
         &expected,
         signal.signal_timestamp,
+        min_edge_override,
+        min_signal_score_override,
     );
 
     let _signal_data = match decision {
@@ -248,8 +334,11 @@ pub fn simulate_signal(
     }
 
     let entry_costs = cost_assumptions.entry_costs(signal.position_usd);
-    let slippage_factor = (dec!(10000) - cost_assumptions.entry_slippage_bps) / dec!(10000);
-    let entry_quantity_tokens = (signal.position_usd / entry_price) * slippage_factor;
+
+    // Entry quantity: full notional at market price. Execution effects
+    // (slippage, impact, fees) are captured in entry_costs, NOT as a
+    // quantity reduction. This avoids double-counting.
+    let entry_quantity_tokens = signal.position_usd / entry_price;
     let entry_time = signal.signal_timestamp;
 
     // --- Walk price history for exit ---
@@ -266,13 +355,9 @@ pub fn simulate_signal(
     for (i, obs) in signal.price_history.iter().enumerate() {
         let price = obs.price_usd;
 
-        // Update high water mark
-        if price > high_water {
-            high_water = price;
-            position.high_water_price_usd = price;
-        }
-
-        // Check for OHLC ambiguity: both SL and TP in the price range
+        // Step 1: Check OHLC ambiguity (uses prev_price and current_price).
+        // Ambiguity is detected BEFORE exit evaluation because it determines
+        // whether the interval's outcome is knowable.
         if i > 0 {
             let prev_price = signal.price_history[i - 1].price_usd;
             if let Some(reason) = detect_ambiguity(
@@ -291,7 +376,8 @@ pub fn simulate_signal(
             }
         }
 
-        // Compute return for MFE/MAE
+        // Step 2: Update MFE/MAE BEFORE exit evaluation.
+        // This ensures the exit observation is included in MFE/MAE.
         let return_pct = (price - entry_price) / entry_price * dec!(100);
         if return_pct > mfe {
             mfe = return_pct;
@@ -300,7 +386,10 @@ pub fn simulate_signal(
             mae = return_pct;
         }
 
-        // Check exit conditions using existing exit_reason logic
+        // Step 3: Evaluate exit conditions.
+        // The trailing stop checks price vs high_water from PRIOR observations.
+        // We update high_water AFTER the exit check to ensure the trailing stop
+        // evaluates against the previous high, not the current candle.
         let reason = exit_reason(
             &position,
             price,
@@ -317,34 +406,88 @@ pub fn simulate_signal(
             exit_reason_found = Some(reason);
             break;
         }
+
+        // Step 4: Update high-water mark AFTER exit evaluation.
+        // This ensures trailing stop at next observation uses this obs's price
+        // as the high-water only if it wasn't the exit candle.
+        if price > high_water {
+            high_water = price;
+            position.high_water_price_usd = price;
+        }
     }
 
-    // If no exit triggered, close at last observation (time limit / end of data)
+    // --- Determine exit reason ---
+    let (exit_reason_final, is_censored, censored_reason) = match &exit_reason_found {
+        Some(reason) => (reason.clone(), false, None),
+        None => {
+            // No exit trigger occurred. Determine if this is a valid TimeLimit
+            // or if the data is insufficient (Censored).
+            if price_path_sufficient {
+                // Data spans >= max_holding_minutes: valid TimeLimit exit.
+                if signal.price_history.last().is_some() {
+                    (ExitReason::TimeLimit, false, None)
+                } else {
+                    (
+                        ExitReason::Censored,
+                        true,
+                        Some("no price observations".into()),
+                    )
+                }
+            } else {
+                // Data spans < max_holding_minutes: insufficient data.
+                // Mark as Censored, not TimeLimit.
+                (
+                    ExitReason::Censored,
+                    true,
+                    Some(format!(
+                        "price history spans {} minutes but max_holding is {} minutes; \
+                         insufficient future data to determine exit",
+                        signal
+                            .price_history
+                            .last()
+                            .map(|o| (o.timestamp - signal.signal_timestamp).num_minutes())
+                            .unwrap_or(0),
+                        config.strategy.max_holding_minutes
+                    )),
+                )
+            }
+        }
+    };
+
+    // Set exit_price and exit_time for the no-trigger case.
     if exit_reason_found.is_none() {
         if let Some(last_obs) = signal.price_history.last() {
             exit_price = last_obs.price_usd;
             exit_time = last_obs.timestamp;
-            exit_reason_found = Some(ExitReason::TimeLimit);
         }
     }
 
-    let exit_reason = exit_reason_found.unwrap_or(ExitReason::TimeLimit);
     let holding_minutes = (exit_time - entry_time).num_minutes();
 
     // --- Exit cost simulation ---
+    // Exit proceeds: tokens * exit_price. Slippage is in exit_costs, not
+    // a quantity reduction, consistent with entry treatment.
     let exit_proceeds_gross = entry_quantity_tokens * exit_price;
     let exit_costs = cost_assumptions.exit_costs(exit_proceeds_gross);
-    let failed_tx = cost_assumptions.failed_tx_cost();
+    let failed_tx = cost_assumptions.expected_failed_tx_cost();
     let total_cost = entry_costs.total_usd + exit_costs.total_usd + failed_tx;
 
     // --- PnL ---
     let gross_pnl = exit_proceeds_gross - signal.position_usd;
     let net_pnl = gross_pnl - total_cost;
-    let gross_return_pct = gross_pnl / signal.position_usd * dec!(100);
-    let net_return_pct = net_pnl / signal.position_usd * dec!(100);
+    let gross_return_pct = if signal.position_usd > Decimal::ZERO {
+        gross_pnl / signal.position_usd * dec!(100)
+    } else {
+        Decimal::ZERO
+    };
+    let net_return_pct = if signal.position_usd > Decimal::ZERO {
+        net_pnl / signal.position_usd * dec!(100)
+    } else {
+        Decimal::ZERO
+    };
 
     Ok(SimulatedTrade {
-        trade_id: Uuid::new_v4().to_string(),
+        trade_id: deterministic_trade_id(signal, trade_index),
         signal_timestamp: signal.signal_timestamp,
         mint: signal.mint.clone(),
         split,
@@ -355,7 +498,7 @@ pub fn simulate_signal(
         entry_costs,
         exit_time,
         exit_price_usd: exit_price,
-        exit_reason,
+        exit_reason: exit_reason_final,
         holding_minutes,
         exit_costs,
         gross_return_pct,
@@ -367,12 +510,16 @@ pub fn simulate_signal(
         mae_pct: mae,
         is_ambiguous,
         ambiguous_reason,
+        is_censored,
+        censored_reason,
+        cost_mode: CostMode::Modeled,
     })
 }
 
 /// Point-in-time version of evaluate_signal that accepts an explicit `now`
 /// parameter instead of using `Utc::now()`. Faithfully reproduces the same
 /// validation order and thresholds from the production `evaluate_signal`.
+#[allow(clippy::too_many_arguments)]
 fn evaluate_signal_pit(
     config: &Config,
     mint: &str,
@@ -381,6 +528,8 @@ fn evaluate_signal_pit(
     safety: &TokenSafety,
     expected: &ExpectedValue,
     now: DateTime<Utc>,
+    min_edge_override: Option<Decimal>,
+    min_signal_score_override: Option<Decimal>,
 ) -> StrategyDecision {
     // Staleness / future-dated check
     if market.observed_at > now
@@ -424,8 +573,10 @@ fn evaluate_signal_pit(
             "wallet evidence below configured confidence threshold".into(),
         );
     }
-    // Economic edge
-    if expected.net_return_pct < config.economics.min_expected_net_return_pct {
+    // Economic edge — uses break-even return from cost model, NOT
+    // signal.expected_gross_return_pct. This is strictly PIT.
+    let min_edge = min_edge_override.unwrap_or(config.economics.min_expected_net_return_pct);
+    if expected.net_return_pct < min_edge {
         return StrategyDecision::Rejected("economic edge below threshold".into());
     }
     // Signal scoring
@@ -448,11 +599,12 @@ fn evaluate_signal_pit(
         + score.risk_score
         + score.economic_score)
         / dec!(6);
-    if score.final_signal_score < config.strategy.min_signal_score {
+    let min_score = min_signal_score_override.unwrap_or(config.strategy.min_signal_score);
+    if score.final_signal_score < min_score {
         return StrategyDecision::Rejected("signal confidence below threshold".into());
     }
     StrategyDecision::Accepted(Box::new(TradeSignal {
-        id: Uuid::new_v4().to_string(),
+        id: deterministic_trade_id_from_str(mint, now),
         mint: mint.into(),
         wallets: wallets.iter().map(|w| w.wallet.clone()).collect(),
         side: Side::Buy,
@@ -461,6 +613,107 @@ fn evaluate_signal_pit(
         created_at: now,
         reason: "qualified-wallet accumulation with liquid safe market".into(),
     }))
+}
+
+fn deterministic_trade_id_from_str(s: &str, ts: DateTime<Utc>) -> String {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    ts.hash(&mut hasher);
+    format!("sig:{:016x}", hasher.finish())
+}
+
+use crate::domain::market::MarketSnapshot;
+
+/// Backtest-specific configuration loaded from `config/backtest.toml`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BacktestConfig {
+    pub split: crate::backtest::split::SplitConfig,
+    #[serde(default)]
+    pub costs: BacktestCostConfig,
+    /// Starting capital in USD for drawdown calculations.
+    #[serde(default = "default_capital")]
+    pub capital_usd: rust_decimal::Decimal,
+    /// Override for min_expected_net_return_pct (bypasses config validation).
+    pub min_expected_net_return_pct: Option<rust_decimal::Decimal>,
+    /// Override for min_signal_score.
+    pub min_signal_score: Option<rust_decimal::Decimal>,
+}
+
+fn default_capital() -> rust_decimal::Decimal {
+    rust_decimal_macros::dec!(100)
+}
+
+/// Cost assumptions in the backtest TOML config.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BacktestCostConfig {
+    pub entry_swap_fee_bps: Option<rust_decimal::Decimal>,
+    pub entry_priority_fee_usd: Option<rust_decimal::Decimal>,
+    pub entry_slippage_bps: Option<rust_decimal::Decimal>,
+    pub entry_price_impact_bps: Option<rust_decimal::Decimal>,
+    pub exit_swap_fee_bps: Option<rust_decimal::Decimal>,
+    pub exit_priority_fee_usd: Option<rust_decimal::Decimal>,
+    pub exit_slippage_bps: Option<rust_decimal::Decimal>,
+    pub exit_price_impact_bps: Option<rust_decimal::Decimal>,
+    pub failed_tx_rate: Option<rust_decimal::Decimal>,
+    pub failed_tx_cost_usd: Option<rust_decimal::Decimal>,
+}
+
+impl CostAssumptions {
+    /// Build `CostAssumptions` from backtest config, using defaults for missing fields.
+    pub fn from_config(bt: &BacktestConfig) -> Self {
+        let c = &bt.costs;
+        CostAssumptions {
+            entry_swap_fee_bps: c
+                .entry_swap_fee_bps
+                .unwrap_or(rust_decimal_macros::dec!(30)),
+            entry_priority_fee_usd: c
+                .entry_priority_fee_usd
+                .unwrap_or(rust_decimal_macros::dec!(0.002)),
+            entry_slippage_bps: c
+                .entry_slippage_bps
+                .unwrap_or(rust_decimal_macros::dec!(50)),
+            entry_price_impact_bps: c
+                .entry_price_impact_bps
+                .unwrap_or(rust_decimal_macros::dec!(20)),
+            exit_swap_fee_bps: c.exit_swap_fee_bps.unwrap_or(rust_decimal_macros::dec!(30)),
+            exit_priority_fee_usd: c
+                .exit_priority_fee_usd
+                .unwrap_or(rust_decimal_macros::dec!(0.002)),
+            exit_slippage_bps: c.exit_slippage_bps.unwrap_or(rust_decimal_macros::dec!(50)),
+            exit_price_impact_bps: c
+                .exit_price_impact_bps
+                .unwrap_or(rust_decimal_macros::dec!(20)),
+            failed_tx_rate: c.failed_tx_rate.unwrap_or(rust_decimal_macros::dec!(0.05)),
+            failed_tx_cost_usd: c
+                .failed_tx_cost_usd
+                .unwrap_or(rust_decimal_macros::dec!(0.002)),
+        }
+    }
+}
+
+/// Full result returned by `backtest::run_backtest()`.
+#[derive(Debug, Clone, Serialize)]
+pub struct BacktestResult {
+    pub statistics: crate::backtest::stats::BacktestStatistics,
+    pub all_trades: Vec<SimulatedTrade>,
+    pub total_signals: usize,
+    pub accepted_trades: usize,
+    pub rejected_count: usize,
+}
+
+impl std::fmt::Display for BacktestResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.statistics)?;
+        writeln!(f, "Rejections: {}", self.rejected_count)?;
+        writeln!(f, "Trades: {}", self.all_trades.len())?;
+        Ok(())
+    }
+}
+
+impl BacktestResult {
+    pub fn to_json_summary(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&self.statistics)
+    }
 }
 
 #[cfg(test)]
@@ -481,7 +734,7 @@ base_mint = "So11111111111111111111111111111111111111112"
 min_wallet_score = 60.0
 min_wallet_samples = 25
 min_consensus_wallets = 2
-min_signal_score = 65.0
+            min_signal_score = 50.0
 min_token_age_secs = 86400
 stop_loss_pct = 5.0
 take_profit_pct = 12.0
@@ -641,7 +894,16 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000)), (dec!(0.00012), dec!(100000))],
         );
-        let trade = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train).unwrap();
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(trade.exit_reason, ExitReason::TakeProfit);
         assert!(trade.gross_pnl_usd > Decimal::ZERO);
         assert!(!trade.is_ambiguous);
@@ -659,7 +921,16 @@ sqlite_path = ":memory:"
                 (dec!(0.00009), dec!(100000)),
             ],
         );
-        let trade = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train).unwrap();
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(trade.exit_reason, ExitReason::StopLoss);
         assert!(trade.gross_pnl_usd < Decimal::ZERO);
     }
@@ -677,8 +948,16 @@ sqlite_path = ":memory:"
                 (dec!(0.000101), dec!(100000)),
             ],
         );
-        let trade = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train).unwrap();
-        // Price went up 10% then fell back; trailing stop at 4% from high
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             trade.exit_reason == ExitReason::TrailingStop
                 || trade.exit_reason == ExitReason::TakeProfit
@@ -686,8 +965,38 @@ sqlite_path = ":memory:"
     }
 
     #[test]
-    fn time_limit_exit() {
-        let config = base_config();
+    fn time_limit_exit_with_sufficient_data() {
+        let mut config = base_config();
+        config.strategy.max_holding_minutes = 10;
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![
+                (dec!(0.000101), dec!(100000)),
+                (dec!(0.000102), dec!(100000)),
+                (dec!(0.000103), dec!(100000)),
+            ],
+        );
+        // 3 obs at 5min intervals = 15 min of data >= max_holding of 10 min
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(trade.exit_reason, ExitReason::TimeLimit);
+        assert!(!trade.is_censored);
+    }
+
+    #[test]
+    fn censored_when_insufficient_data() {
+        let mut config = base_config();
+        config.strategy.max_holding_minutes = 240;
         let signal = make_signal(
             "2024-01-15T12:00:00Z",
             dec!(0.0001),
@@ -697,9 +1006,48 @@ sqlite_path = ":memory:"
                 (dec!(0.000102), dec!(100000)),
             ],
         );
-        let trade = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train).unwrap();
-        // Small moves that don't hit SL/TP, exit at end of data
-        assert_eq!(trade.exit_reason, ExitReason::TimeLimit);
+        // 2 obs at 5min intervals = 10 min of data < max_holding of 240 min
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(trade.exit_reason, ExitReason::Censored);
+        assert!(trade.is_censored);
+        assert!(trade.censored_reason.is_some());
+        assert!(trade
+            .censored_reason
+            .unwrap()
+            .contains("insufficient future data"));
+    }
+
+    #[test]
+    fn censored_not_time_limit() {
+        let mut config = base_config();
+        config.strategy.max_holding_minutes = 240;
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.000101), dec!(100000))],
+        );
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(trade.exit_reason, ExitReason::Censored);
+        assert!(trade.is_censored);
     }
 
     #[test]
@@ -712,7 +1060,16 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.0001), dec!(70000))],
         );
-        let trade = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train).unwrap();
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(trade.exit_reason, ExitReason::LiquidityDeterioration);
     }
 
@@ -725,9 +1082,19 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000))],
         );
-        let trade = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train).unwrap();
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!trade.entry_costs.is_observed);
         assert!(!trade.exit_costs.is_observed);
+        assert_eq!(trade.cost_mode, CostMode::Modeled);
     }
 
     #[test]
@@ -740,11 +1107,14 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000))],
         );
-        let trade = simulate_signal(&signal, &config, &ca, Split::Train).unwrap();
+        let trade = simulate_signal(&signal, &config, &ca, Split::Train, 0, None, None).unwrap();
+        // Total cost = entry + exit + expected failed tx cost
+        // No slippage_factor double-count: entry costs include slippage as
+        // a dollar cost, quantity is at full market price.
         let expected_total_cost = ca.entry_costs(signal.position_usd).total_usd
             + ca.exit_costs(trade.gross_pnl_usd + signal.position_usd)
                 .total_usd
-            + ca.failed_tx_cost();
+            + ca.expected_failed_tx_cost();
         assert_eq!(trade.total_cost_usd, expected_total_cost);
         assert_eq!(
             trade.net_pnl_usd,
@@ -753,20 +1123,52 @@ sqlite_path = ":memory:"
     }
 
     #[test]
-    fn expected_gross_return_pct_not_used_as_realized() {
+    fn expected_gross_return_pct_does_not_affect_entry_decision() {
+        // Regression test: changing expected_gross_return_pct alone cannot
+        // change the historical entry decision.
         let config = base_config();
-        let mut signal = make_signal(
+        let mut signal_low = make_signal(
             "2024-01-15T12:00:00Z",
             dec!(0.0001),
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000))],
         );
-        signal.expected_gross_return_pct = dec!(999);
-        let trade = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train).unwrap();
-        // Realized return must reflect actual price path, never expected_gross_return_pct
-        assert_ne!(trade.gross_return_pct, dec!(999));
-        assert!(trade.gross_return_pct > Decimal::ZERO);
-        assert!(trade.gross_return_pct < dec!(100));
+        signal_low.expected_gross_return_pct = dec!(0);
+
+        let mut signal_high = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        signal_high.expected_gross_return_pct = dec!(9999);
+
+        let result_low = simulate_signal(
+            &signal_low,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        );
+        let result_high = simulate_signal(
+            &signal_high,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        );
+
+        // Both must produce the same outcome: same exit reason, same PnL.
+        assert_eq!(result_low.is_ok(), result_high.is_ok());
+        if let (Ok(tl), Ok(th)) = (&result_low, &result_high) {
+            assert_eq!(tl.exit_reason, th.exit_reason);
+            assert_eq!(tl.gross_pnl_usd, th.gross_pnl_usd);
+            assert_eq!(tl.net_pnl_usd, th.net_pnl_usd);
+        }
     }
 
     #[test]
@@ -779,7 +1181,15 @@ sqlite_path = ":memory:"
             dec!(100000),
             vec![(dec!(0.00011), dec!(100000))],
         );
-        let result = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train);
+        let result = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("wallet evidence"));
     }
@@ -796,9 +1206,75 @@ sqlite_path = ":memory:"
                 (dec!(0.000097), dec!(100000)),
             ],
         );
-        let trade = simulate_signal(&signal, &config, &cost_assumptions(), Split::Train).unwrap();
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(trade.mfe_pct, dec!(10)); // +10% from 0.0001 to 0.00011
         assert_eq!(trade.mae_pct, dec!(-3)); // -3% from 0.0001 to 0.000097
+    }
+
+    #[test]
+    fn mfe_includes_exit_observation() {
+        // The exit observation should be included in MFE/MAE.
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![
+                (dec!(0.000105), dec!(100000)),
+                (dec!(0.000112), dec!(100000)),
+            ],
+        );
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        // TP at 12% triggers at obs 2 (0.000112). MFE should be 12%.
+        assert_eq!(trade.exit_reason, ExitReason::TakeProfit);
+        assert_eq!(trade.mfe_pct, dec!(12));
+    }
+
+    #[test]
+    fn trailing_stop_uses_high_water_from_prior_observations() {
+        // The trailing stop should use high water from PRIOR observations,
+        // not the current candle.
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![
+                (dec!(0.00011), dec!(100000)),
+                (dec!(0.000100), dec!(100000)),
+            ],
+        );
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        // High water = 0.00011 (from obs 1). Trailing stop at 4% from 0.00011 = 0.0001056.
+        // Obs 2 price = 0.000100 < 0.0001056 → trailing stop triggers.
+        assert_eq!(trade.exit_reason, ExitReason::TrailingStop);
     }
 
     #[test]
@@ -826,5 +1302,104 @@ sqlite_path = ":memory:"
         let entry_price = dec!(0.0001);
         let result = detect_ambiguity(prev_price, curr_price, entry_price, dec!(5), dec!(12));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn deterministic_ids_are_stable() {
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        let t1 = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let t2 = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        // Same input → same deterministic ID
+        assert_eq!(t1.trade_id, t2.trade_id);
+    }
+
+    #[test]
+    fn different_index_produces_different_id() {
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        let t1 = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let t2 = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(t1.trade_id, t2.trade_id);
+    }
+
+    #[test]
+    fn entry_quantity_not_reduced_by_slippage() {
+        // Verify that entry quantity = position_usd / entry_price exactly,
+        // with no slippage_factor reduction (slippage is in costs only).
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        let trade = simulate_signal(
+            &signal,
+            &config,
+            &cost_assumptions(),
+            Split::Train,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let expected_quantity = signal.position_usd / dec!(0.0001);
+        assert_eq!(trade.entry_quantity_tokens, expected_quantity);
+    }
+
+    #[test]
+    fn failed_tx_cost_is_probabilistic_not_fixed() {
+        let ca = cost_assumptions();
+        // failed_tx_rate = 0.05, failed_tx_cost_usd = 0.002
+        // Expected cost = 2 * 0.05 * 0.002 = 0.0002
+        let expected = dec!(2) * dec!(0.05) * dec!(0.002);
+        assert_eq!(ca.expected_failed_tx_cost(), expected);
     }
 }

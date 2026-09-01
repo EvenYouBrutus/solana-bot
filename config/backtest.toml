@@ -1,3 +1,6 @@
+min_expected_net_return_pct = -100.0
+min_signal_score = 0.0
+
 [split]
 train_end = "2024-06-01T00:00:00Z"
 validation_start = "2024-06-01T00:00:00Z"

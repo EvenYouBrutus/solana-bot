@@ -117,7 +117,80 @@ fn validate_signal(signal: &HistoricalSignal, line: usize) -> Result<(), String>
     if signal.position_usd <= Decimal::ZERO {
         return Err(format!("line {line}: position_usd must be positive"));
     }
+    // Strict PIT validation: all decision data must be <= signal_timestamp
+    if signal.market.observed_at > signal.signal_timestamp {
+        return Err(format!(
+            "line {line}: market.observed_at ({}) is AFTER signal_timestamp ({}) — look-ahead bias",
+            signal.market.observed_at, signal.signal_timestamp
+        ));
+    }
+    if signal.safety.observed_at > signal.signal_timestamp {
+        return Err(format!(
+            "line {line}: safety.observed_at ({}) is AFTER signal_timestamp ({}) — look-ahead bias",
+            signal.safety.observed_at, signal.signal_timestamp
+        ));
+    }
+    if signal.costs.observed_at > signal.signal_timestamp {
+        return Err(format!(
+            "line {line}: costs.observed_at ({}) is AFTER signal_timestamp ({}) — look-ahead bias",
+            signal.costs.observed_at, signal.signal_timestamp
+        ));
+    }
+    for (i, wallet) in signal.wallets.iter().enumerate() {
+        if wallet.updated_at > signal.signal_timestamp {
+            return Err(format!(
+                "line {line}: wallet[{}].updated_at ({}) is AFTER signal_timestamp ({}) — look-ahead bias",
+                i, wallet.updated_at, signal.signal_timestamp
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Rejection reason with structured data for the rejection summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalRejection {
+    pub reason: String,
+    pub mint: String,
+    pub signal_timestamp: String,
+}
+
+/// Pre-filter signals: reject future-dated ones, separate accepted/rejected.
+pub fn prefilter_signals(
+    signals: &mut Vec<HistoricalSignal>,
+) -> (Vec<HistoricalSignal>, Vec<SignalRejection>) {
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    let now = Utc::now();
+    for signal in signals.drain(..) {
+        if signal.signal_timestamp > now {
+            rejected.push(SignalRejection {
+                reason: "future-dated signal".into(),
+                mint: signal.mint.clone(),
+                signal_timestamp: signal.signal_timestamp.to_rfc3339(),
+            });
+            continue;
+        }
+        if signal.price_history.is_empty() {
+            rejected.push(SignalRejection {
+                reason: "empty price_history".into(),
+                mint: signal.mint.clone(),
+                signal_timestamp: signal.signal_timestamp.to_rfc3339(),
+            });
+            continue;
+        }
+        // Mint consistency check
+        if signal.market.mint != signal.mint {
+            rejected.push(SignalRejection {
+                reason: "mint mismatch (market.mint != signal.mint)".into(),
+                mint: signal.mint.clone(),
+                signal_timestamp: signal.signal_timestamp.to_rfc3339(),
+            });
+            continue;
+        }
+        accepted.push(signal);
+    }
+    (accepted, rejected)
 }
 
 #[cfg(test)]
@@ -352,6 +425,122 @@ mod tests {
         let result = load_historical_signals(&path).unwrap();
         assert_eq!(result.rejected_count, 1);
         assert!(result.rejection_reasons[0].contains("JSON parse error"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reject_market_observed_after_signal() {
+        let dir = std::env::temp_dir().join("backtest_data_test_market_pit");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut signal: HistoricalSignal = serde_json::from_str(&sample_signal_json(
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:05:00Z",
+        ))
+        .unwrap();
+        signal.market.observed_at = "2024-01-15T12:01:00Z".parse().unwrap();
+        let path = write_jsonl(
+            &dir,
+            "signals.jsonl",
+            &serde_json::to_string(&signal).unwrap(),
+        );
+        let result = load_historical_signals(&path).unwrap();
+        assert_eq!(result.rejected_count, 1);
+        assert!(result.rejection_reasons[0].contains("market.observed_at"));
+        assert!(result.rejection_reasons[0].contains("look-ahead bias"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reject_safety_observed_after_signal() {
+        let dir = std::env::temp_dir().join("backtest_data_test_safety_pit");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut signal: HistoricalSignal = serde_json::from_str(&sample_signal_json(
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:05:00Z",
+        ))
+        .unwrap();
+        signal.safety.observed_at = "2024-01-15T12:01:00Z".parse().unwrap();
+        let path = write_jsonl(
+            &dir,
+            "signals.jsonl",
+            &serde_json::to_string(&signal).unwrap(),
+        );
+        let result = load_historical_signals(&path).unwrap();
+        assert_eq!(result.rejected_count, 1);
+        assert!(result.rejection_reasons[0].contains("safety.observed_at"));
+        assert!(result.rejection_reasons[0].contains("look-ahead bias"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reject_wallet_updated_after_signal() {
+        let dir = std::env::temp_dir().join("backtest_data_test_wallet_pit");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut signal: HistoricalSignal = serde_json::from_str(&sample_signal_json(
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:05:00Z",
+        ))
+        .unwrap();
+        signal.wallets[0].updated_at = "2024-01-15T12:01:00Z".parse().unwrap();
+        let path = write_jsonl(
+            &dir,
+            "signals.jsonl",
+            &serde_json::to_string(&signal).unwrap(),
+        );
+        let result = load_historical_signals(&path).unwrap();
+        assert_eq!(result.rejected_count, 1);
+        assert!(result.rejection_reasons[0].contains("wallet[0].updated_at"));
+        assert!(result.rejection_reasons[0].contains("look-ahead bias"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reject_costs_observed_after_signal() {
+        let dir = std::env::temp_dir().join("backtest_data_test_costs_pit");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut signal: HistoricalSignal = serde_json::from_str(&sample_signal_json(
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:05:00Z",
+        ))
+        .unwrap();
+        signal.costs.observed_at = "2024-01-15T12:01:00Z".parse().unwrap();
+        let path = write_jsonl(
+            &dir,
+            "signals.jsonl",
+            &serde_json::to_string(&signal).unwrap(),
+        );
+        let result = load_historical_signals(&path).unwrap();
+        assert_eq!(result.rejected_count, 1);
+        assert!(result.rejection_reasons[0].contains("costs.observed_at"));
+        assert!(result.rejection_reasons[0].contains("look-ahead bias"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reject_mint_mismatch() {
+        let dir = std::env::temp_dir().join("backtest_data_test_mint_mismatch");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut signal: HistoricalSignal = serde_json::from_str(&sample_signal_json(
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:05:00Z",
+        ))
+        .unwrap();
+        signal.market.mint = "WRONG_MINT_ADDRESS".into();
+        let path = write_jsonl(
+            &dir,
+            "signals.jsonl",
+            &serde_json::to_string(&signal).unwrap(),
+        );
+        let mut result = load_historical_signals(&path).unwrap();
+        let (accepted, rejected) = prefilter_signals(&mut result.signals);
+        assert_eq!(accepted.len(), 0);
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].reason.contains("mint mismatch"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
