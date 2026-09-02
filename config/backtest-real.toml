@@ -1,0 +1,48 @@
+# Real historical backtest config.
+#
+# The accompanying dataset (data/historical_real.jsonl) is built by
+# `cargo run --release -- historical-build --start ... --end ... --output data/historical_real.jsonl`.
+# Once produced, run:
+#
+#   cargo run --release -- historical-validate --input data/historical_real.jsonl
+#
+# and then:
+#
+#   cargo run --release -- backtest \
+#       --config config/local.toml \
+#       --bt-config config/backtest-real.toml \
+#       --input data/historical_real.jsonl \
+#       --format text \
+#       --trades data/backtest_trades.json
+#
+# This file does NOT modify any production strategy threshold. The
+# production thresholds from config/local.toml (min_signal_score,
+# min_expected_net_return_pct, round_trip_cost_threshold_pct) are
+# used unchanged for the entry decision.
+
+is_synthetic_data = false
+
+# Chronological boundaries for the three splits. Adjust to the actual
+# date range of the produced dataset; the values below cover Q1-Q4 2024
+# and work for any dataset that overlaps that window.
+[split]
+train_end = "2024-07-01T00:00:00Z"
+validation_start = "2024-07-01T00:00:00Z"
+validation_end = "2024-10-01T00:00:00Z"
+oos_start = "2024-10-01T00:00:00Z"
+
+# Modeled costs. These are conservative defaults for the historic
+# reconstruction; the per-signal `costs` field on each record carries
+# the point-in-time observed cost (see `src/historical/cost.rs`). Both
+# are documented as MODELED — no observed fills.
+[costs]
+entry_swap_fee_bps = 30
+entry_priority_fee_usd = 0.002
+entry_slippage_bps = 50
+entry_price_impact_bps = 20
+exit_swap_fee_bps = 30
+exit_priority_fee_usd = 0.002
+exit_slippage_bps = 50
+exit_price_impact_bps = 20
+failed_tx_rate = 0.05
+failed_tx_cost_usd = 0.002

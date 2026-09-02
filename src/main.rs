@@ -10,6 +10,7 @@ use solana_smart_money_bot::{
     data::rpc::RpcPool,
     economics::{break_even_calculator, BreakEvenInputs},
     execution::{DeterministicExecutor, Executor, JupiterExecutor, PaperExecutor},
+    historical::{self, ohlcv::OhlcvInterval, BuildOptions, HistoricalBuilder},
     history, observability,
     report::PerformanceReport,
     runtime::{self, SessionDeps},
@@ -120,6 +121,63 @@ enum Command {
     ValidateHistory {
         /// Path to the JSONL dataset (the file produced by
         /// `collect-history` or any other pipeline).
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Build a REAL historical dataset from OHLCV + RPC sources.
+    ///
+    /// Required environment variables:
+    /// - `BIRDEYE_API_KEY` for the OHLCV provider.
+    /// - `SOLANA_RPC_URL` (or `HELIUS_API_KEY`) for wallet and safety
+    ///   reconstruction.
+    ///
+    /// Writes JSONL signals to `--output` and a resume marker to
+    /// `<output>.resume.json` so re-runs skip already-built signals.
+    HistoricalBuild {
+        /// Start timestamp (RFC3339, UTC).
+        #[arg(long)]
+        start: String,
+        /// End timestamp (RFC3339, UTC).
+        #[arg(long)]
+        end: String,
+        /// Comma-separated mints to build signals for.
+        #[arg(long, value_delimiter = ',')]
+        mints: Vec<String>,
+        /// Candle interval (1m|5m|15m|1h|4h|1d).
+        #[arg(long, default_value = "1h")]
+        interval: String,
+        /// Signals per mint.
+        #[arg(long, default_value = "5")]
+        signals_per_mint: usize,
+        /// Output JSONL path.
+        #[arg(long, default_value = "data/historical_real.jsonl")]
+        output: PathBuf,
+        /// Cache directory for downloaded OHLCV/wallet data.
+        #[arg(long, default_value = "data/historical_cache")]
+        cache_dir: PathBuf,
+        /// Position size in USD.
+        #[arg(long, default_value = "4")]
+        position_usd: String,
+        /// Token decimals.
+        #[arg(long, default_value = "6")]
+        token_decimals: u8,
+        /// Base mint decimals.
+        #[arg(long, default_value = "9")]
+        base_mint_decimals: u8,
+        /// SOL price in USD.
+        #[arg(long, default_value = "150")]
+        sol_price_usd: String,
+        /// Future observation window in minutes.
+        #[arg(long, default_value = "240")]
+        future_window_minutes: i64,
+        /// Comma-separated wallet pubkeys to reconstruct PIT. When
+        /// empty, signals are produced with no wallets and the engine
+        /// rejects them as insufficient wallet consensus.
+        #[arg(long, value_delimiter = ',', default_value = "")]
+        wallet_pubkeys: Vec<String>,
+    },
+    /// Validate a real historical dataset.
+    HistoricalValidate {
         #[arg(long)]
         input: PathBuf,
     },
@@ -464,6 +522,151 @@ async fn main() -> anyhow::Result<()> {
             iterations,
         } => collect_history_cmd(config, output, iterations).await?,
         Command::ValidateHistory { input } => validate_history_cmd(input)?,
+        Command::HistoricalBuild {
+            start,
+            end,
+            mints,
+            interval,
+            signals_per_mint,
+            output,
+            cache_dir,
+            position_usd,
+            token_decimals,
+            base_mint_decimals,
+            sol_price_usd,
+            future_window_minutes,
+            wallet_pubkeys,
+        } => {
+            historical_build_cmd(
+                start,
+                end,
+                mints,
+                interval,
+                signals_per_mint,
+                output,
+                cache_dir,
+                position_usd,
+                token_decimals,
+                base_mint_decimals,
+                sol_price_usd,
+                future_window_minutes,
+                wallet_pubkeys,
+            )
+            .await?
+        }
+        Command::HistoricalValidate { input } => historical_validate_cmd(input)?,
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn historical_build_cmd(
+    start: String,
+    end: String,
+    mints: Vec<String>,
+    interval: String,
+    signals_per_mint: usize,
+    output: PathBuf,
+    cache_dir: PathBuf,
+    position_usd: String,
+    token_decimals: u8,
+    base_mint_decimals: u8,
+    sol_price_usd: String,
+    future_window_minutes: i64,
+    wallet_pubkeys: Vec<String>,
+) -> anyhow::Result<()> {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+    let start_ts: chrono::DateTime<chrono::Utc> = start.parse().context("start must be RFC3339")?;
+    let end_ts: chrono::DateTime<chrono::Utc> = end.parse().context("end must be RFC3339")?;
+    if mints.is_empty() {
+        anyhow::bail!("at least one mint is required (--mints MINT1,MINT2,...)");
+    }
+    if start_ts >= end_ts {
+        anyhow::bail!("start must be strictly before end");
+    }
+    let interval_enum =
+        OhlcvInterval::parse(&interval).context(format!("unknown interval {interval}"))?;
+    let position_usd_dec =
+        Decimal::from_str(&position_usd).context("position_usd must be a decimal")?;
+    if position_usd_dec <= Decimal::ZERO {
+        anyhow::bail!("position_usd must be positive");
+    }
+    let sol_price_dec =
+        Decimal::from_str(&sol_price_usd).context("sol_price_usd must be a decimal")?;
+    if sol_price_dec <= Decimal::ZERO {
+        anyhow::bail!("sol_price_usd must be positive");
+    }
+    // The historical pipeline needs an RPC pool for safety + wallet
+    // reconstruction. Fall back to env vars / Helius / public Solana.
+    let rpc_endpoint = std::env::var("SOLANA_RPC_URL")
+        .ok()
+        .or_else(|| {
+            std::env::var("HELIUS_API_KEY")
+                .ok()
+                .map(|k| format!("https://mainnet.helius-rpc.com/?api-key={k}"))
+        })
+        .unwrap_or_else(|| "https://api.mainnet-beta.solana.com".to_string());
+    let rpc = Arc::new(
+        RpcPool::with_attempts(vec![rpc_endpoint], Duration::from_secs(15), 3)
+            .context("create RPC pool")?,
+    );
+    let opts = BuildOptions {
+        mints,
+        start: start_ts,
+        end: end_ts,
+        interval: interval_enum,
+        signals_per_mint,
+        output: output.clone(),
+        cache_dir,
+        position_usd: position_usd_dec,
+        token_decimals,
+        base_mint_decimals,
+        sol_price_usd: sol_price_dec,
+        priority_fee_lamports: 10_000,
+        swap_fee_bps: Decimal::from(30),
+        future_window_minutes,
+        max_wallet_signatures: 1000,
+        wallet_pubkeys,
+    };
+    let mut builder = HistoricalBuilder::new(opts, rpc).await?;
+    let report = builder.run().await?;
+    println!("=== Historical Build Report ===");
+    println!("output:           {}", report.output.display());
+    println!("total signals:    {}", report.total_signals);
+    println!("accepted signals: {}", report.accepted_signals);
+    println!("skipped signals:  {}", report.skipped_signals);
+    println!("unique tokens:    {}", report.unique_tokens);
+    if let Some((from, to)) = report.date_range {
+        println!(
+            "date range:       {} -> {}",
+            from.to_rfc3339(),
+            to.to_rfc3339()
+        );
+    }
+    println!("providers:        {}", report.providers.join(", "));
+    if report.accepted_signals == 0 {
+        anyhow::bail!("no signals accepted; refusing to emit an empty dataset");
+    }
+    Ok(())
+}
+
+fn historical_validate_cmd(input: PathBuf) -> anyhow::Result<()> {
+    let path = input.clone();
+    let validator = historical::HistoricalValidator::new(input);
+    let report = validator
+        .validate()
+        .map_err(|e| anyhow::anyhow!("validate {}: {e}", path.display()))?;
+    historical::validate::print_summary(&report);
+    if !report.is_clean() {
+        anyhow::bail!(
+            "dataset not clean: rejected={}, pit={}, missing={}, dup={}, chrono_ok={}",
+            report.rejected_records,
+            report.pit_violations,
+            report.missing_data_records,
+            report.duplicate_records,
+            report.chronological_order_ok
+        );
     }
     Ok(())
 }

@@ -8,6 +8,7 @@ pub mod domain;
 pub mod economics;
 pub mod execution;
 pub mod exit_monitor;
+pub mod historical;
 pub mod history;
 pub mod observability;
 pub mod portfolio;
