@@ -142,21 +142,25 @@ TP = "0.000112"
 # The score breakdown with score=85,82; buy_sell=0.70; vol=12; liq=150000:
 # wallet_score=83.5, consensus=40, liquidity=100, momentum=35,
 # risk=88, economic~=50.5  -> mean ~66.2 (above 65)
+# Synthetic wallet addresses. These are valid 32-44 char base58 strings
+# (no 0/O/I/l) so the strict loader validation accepts them, but they
+# are obviously synthetic markers — not real Solana pubkeys.
+# Base58 excludes: 0, O (uppercase o), I (uppercase i), l (lowercase L).
 ACCEPTED_WALLETS_TRAIN = [
-    wallet("0xTRAIN1", 85, "2024-01-15T11:50:00Z"),
-    wallet("0xTRAIN2", 82, "2024-01-15T11:55:00Z"),
+    wallet("SynTH2Aaaaaa1aaaaaaaaaaaaaaaaaaaaa2", 85, "2024-01-15T11:50:00Z"),
+    wallet("SynTH2Bbbbb2bbbbbbbbbbbbbbbbbbbbb3", 82, "2024-01-15T11:55:00Z"),
 ]
 ACCEPTED_WALLETS_VAL = [
-    wallet("0xVAL1", 85, "2024-06-15T09:50:00Z"),
-    wallet("0xVAL2", 82, "2024-06-15T09:55:00Z"),
+    wallet("SynVA2Aaaaaa3aaaaaaaaaaaaaaaaaaaaaa4", 85, "2024-06-15T09:50:00Z"),
+    wallet("SynVA2Bbbbb4bbbbbbbbbbbbbbbbbbbbbb5", 82, "2024-06-15T09:55:00Z"),
 ]
 ACCEPTED_WALLETS_OOS_POS = [
-    wallet("0xOOS_P1", 85, "2024-09-10T08:50:00Z"),
-    wallet("0xOOS_P2", 82, "2024-09-10T08:55:00Z"),
+    wallet("SynPZAaaaa5aaaaaaaaaaaaaaaaaaaaaaa6a", 85, "2024-09-10T08:50:00Z"),
+    wallet("SynPZBbbbb6bbbbbbbbbbbbbbbbbbbbbbb7b", 82, "2024-09-10T08:55:00Z"),
 ]
 ACCEPTED_WALLETS_OOS_NEG = [
-    wallet("0xOOS_N1", 85, "2024-10-25T14:50:00Z"),
-    wallet("0xOOS_N2", 82, "2024-10-25T14:55:00Z"),
+    wallet("SynNAAaaaa7aaaaaaaaaaaaaaaaaaaaaaa8a", 85, "2024-10-25T14:50:00Z"),
+    wallet("SynNABbbbb8bbbbbbbbbbbbbbbbbbbbbbb9b", 82, "2024-10-25T14:55:00Z"),
 ]
 
 records = []
@@ -412,8 +416,8 @@ records.append(make_signal(
     "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
     0.000100, 150000,
     [
-        wallet("0xBAD1", 50, "2024-12-10T08:50:00Z"),
-        wallet("0xBAD2", 55, "2024-12-10T08:55:00Z"),
+        wallet("SynBadAaaaaaaaaa1aaaaaaaaaaaaaaaa2", 50, "2024-12-10T08:50:00Z"),
+        wallet("SynBadBbbbbbbbb2bbbbbbbbbbbbbbbbbb3", 55, "2024-12-10T08:55:00Z"),
     ],
     [
         obs("2024-12-10T09:05:00Z", 0.000112),

@@ -2,6 +2,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use solana_smart_money_bot::{
     backtest::{self, BacktestConfig},
+    collector::{self, CandidateCollector},
     config::{
         load,
         types::{Config, Mode},
@@ -9,7 +10,7 @@ use solana_smart_money_bot::{
     data::rpc::RpcPool,
     economics::{break_even_calculator, BreakEvenInputs},
     execution::{DeterministicExecutor, Executor, JupiterExecutor, PaperExecutor},
-    observability,
+    history, observability,
     report::PerformanceReport,
     runtime::{self, SessionDeps},
     storage::StateStore,
@@ -89,6 +90,38 @@ enum Command {
         /// Optional path to write trade-by-trade JSON output
         #[arg(long)]
         trades: Option<PathBuf>,
+    },
+    /// Collect real historical observations by polling the live
+    /// Jupiter quote path. Appends `CandidateInput` records to a
+    /// JSONL file. Each record carries a real on-chain market snapshot,
+    /// route-availability check, and a calibrated cost model.
+    ///
+    /// This is NOT a full historical reconstruction. See
+    /// `docs/HISTORICAL_DATA_PIPELINE.md` for the full list of
+    /// MISSING historical inputs. Use this only to produce
+    /// observation recordings for a synthetic-fixture integration
+    /// test, never as evidence of real strategy performance.
+    CollectHistory {
+        #[arg(long)]
+        config: PathBuf,
+        /// Output JSONL path.
+        #[arg(long, default_value = "data/historical_candidates.jsonl")]
+        output: PathBuf,
+        /// Number of polling iterations. Each iteration is one call to
+        /// the existing live collector. With the rate-limited backoff,
+        /// each iteration is a real HTTP call to Jupiter.
+        #[arg(long, default_value = "1")]
+        iterations: u32,
+    },
+    /// Validate a JSONL historical dataset and print a report of its
+    /// structural soundness, PIT violations, and known missing inputs.
+    /// Does NOT fabricate or relax any constraint. A dataset that
+    /// cannot honestly back the strategy is reported as unfit.
+    ValidateHistory {
+        /// Path to the JSONL dataset (the file produced by
+        /// `collect-history` or any other pipeline).
+        #[arg(long)]
+        input: PathBuf,
     },
 }
 
@@ -322,6 +355,81 @@ fn backtest_cmd(
     Ok(())
 }
 
+async fn collect_history_cmd(
+    config_path: PathBuf,
+    output: PathBuf,
+    iterations: u32,
+) -> anyhow::Result<()> {
+    eprintln!(
+        "WARNING: collect-history records live observations into a JSONL file.\n\
+         This is a real-data recording pipeline, NOT a historical reconstruction.\n\
+         See docs/HISTORICAL_DATA_PIPELINE.md for the full list of fields that\n\
+         cannot be reconstructed from the current RPC pool (wallet PnL, post-signal\n\
+         price path, historical holder distribution, threat-intel features).\n\
+         The recorded dataset CANNOT be used for a real backtest with\n\
+         is_synthetic_data = false."
+    );
+    let (c, _state, rpc) = base_setup(&config_path)?;
+    observability::init(c.observability.log_format == "json");
+    rpc.health().await.context("RPC health check")?;
+    let executor = build_executor(&c, rpc.clone())?;
+    executor.health().await.context("execution health check")?;
+    let mut recorder = history::HistoryRecorder::new(output.clone());
+    let mut collector = CandidateCollector::new();
+    for i in 0..iterations {
+        match collector.collect_live(&c, &executor).await {
+            collector::CollectResult::Candidates(cands) => {
+                for c in &cands {
+                    match recorder.record(c) {
+                        Ok(true) => {
+                            tracing::info!(iteration = i, mint = %c.mint, "recorded");
+                        }
+                        Ok(false) => {
+                            tracing::debug!(
+                                iteration = i,
+                                mint = %c.mint,
+                                "skipped (duplicate or empty mint)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to append to history file");
+                        }
+                    }
+                }
+            }
+            collector::CollectResult::RateLimited { backoff_secs } => {
+                tracing::warn!(backoff_secs, "rate limited, sleeping");
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            }
+            collector::CollectResult::Transient(msg) => {
+                tracing::warn!(reason = %msg, "transient collection error");
+            }
+        }
+    }
+    println!(
+        "wrote {} records to {}",
+        recorder.recorded_count(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn validate_history_cmd(input: PathBuf) -> anyhow::Result<()> {
+    let validator = history::HistoryValidator::new(input);
+    let report = validator
+        .validate()
+        .map_err(|e| anyhow::anyhow!("validate {}: {e}", validator.path().display()))?;
+    history::print_validation_report(&report);
+    if !report.unparseable_lines.is_empty() || !report.duplicate_mints.is_empty() {
+        anyhow::bail!(
+            "dataset has {} unparseable line(s) and {} duplicate mint(s); refusing to certify",
+            report.unparseable_lines.len(),
+            report.duplicate_mints.len()
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -350,6 +458,12 @@ async fn main() -> anyhow::Result<()> {
             format,
             trades,
         } => backtest_cmd(config, backtest_config, input, &format, trades)?,
+        Command::CollectHistory {
+            config,
+            output,
+            iterations,
+        } => collect_history_cmd(config, output, iterations).await?,
+        Command::ValidateHistory { input } => validate_history_cmd(input)?,
     }
     Ok(())
 }

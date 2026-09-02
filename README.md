@@ -16,6 +16,8 @@ This repository does **not** yet include a verified historical-indexer/DEX colle
 
 Paper mode fetches real Jupiter quotes but does not sign or broadcast. Replay currently reuses the paper executor over a static chronological JSONL feed; it is not a complete realistic backtester. Do not infer expected returns from the `expected_gross_return_pct` input: it is an externally supplied hypothesis that is cost-gated, not proof.
 
+The backtest engine produces deterministic trade IDs (no randomness, no wall-clock input) and supports train/validation/OOS splitting with exact boundary enforcement. Statistical reporting includes net PnL, win rate, profit factor, Sharpe-like and Sortino-like ratios, maximum drawdown, and an OOS verdict based on bootstrap confidence intervals. All performance metrics exclude censored and ambiguous trades.
+
 ## Setup
 
 Install a current Rust toolchain, copy the configuration, and configure at least two independent RPC endpoints for any serious operation:
@@ -50,6 +52,19 @@ cargo run -- run --config config/live.toml
 ```
 
 Never put that value in TOML, Git, logs, or a database. Review every allowlisted program for the specific Jupiter routes you permit. The safest default is an empty allowlist, which prevents live mode from starting.
+
+## Backtest
+
+Run a deterministic OHLC-aware backtest over historical JSONL signals:
+
+```bash
+cargo run -- backtest \
+  --config config/local.toml \
+  --bt-config config/backtest.toml \
+  --input data/sample_historical.jsonl
+```
+
+The backtest walks each signal through the production entry/exit pipeline using only point-in-time data. Price observations can include optional OHLC fields (`open_usd`, `high_usd`, `low_usd`, `close_usd`, `volume`); when absent, `price_usd` is used for all. Censored trades (insufficient history, no terminal event) and ambiguous trades (SL and TP both crossed within an interval) are flagged separately and excluded from all performance statistics. Execution costs are modeled per trade leg (swap fee, priority fee, slippage, price impact) plus probabilistic expected failed-transaction cost. The engine is fully deterministic: same config and input always produces identical trade IDs, exits, and statistics.
 
 ## Operations and validation
 

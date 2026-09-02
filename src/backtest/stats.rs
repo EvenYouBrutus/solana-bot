@@ -327,10 +327,12 @@ pub fn compute_statistics(
         Decimal::ZERO
     };
 
-    // Aggregate PnL includes ALL trades (including ambiguous/censored).
-    let gross_pnl: Decimal = trades.iter().map(|t| t.gross_pnl_usd).sum();
-    let net_pnl: Decimal = trades.iter().map(|t| t.net_pnl_usd).sum();
-    let total_costs: Decimal = trades.iter().map(|t| t.total_cost_usd).sum();
+    // Aggregate PnL includes ONLY usable trades (non-ambiguous, non-censored).
+    // Censored trades have UNKNOWN realized PnL and must NOT contribute to
+    // realized PnL, expectancy, profit factor, or drawdown.
+    let gross_pnl: Decimal = usable.iter().map(|t| t.gross_pnl_usd).sum();
+    let net_pnl: Decimal = usable.iter().map(|t| t.net_pnl_usd).sum();
+    let total_costs: Decimal = usable.iter().map(|t| t.total_cost_usd).sum();
 
     // Max drawdown: measured from equity peaks including starting capital.
     // equity_0 = starting_capital_usd
@@ -1147,5 +1149,102 @@ mod tests {
         // short-circuits on these counts before reaching the CI check,
         // so leaving the CI fields at 0 is safe.
         compute_oos_verdict(&s)
+    }
+
+    // =========================================================================
+    // Regression tests for corrected behaviors
+    // =========================================================================
+
+    #[test]
+    fn aggregate_pnl_excludes_censored_trades() {
+        // Regression: censored trades must NOT contribute to aggregate PnL.
+        let trades = vec![
+            make_trade(dec!(1), dec!(10), 30, false, false),
+            make_trade(dec!(-1), dec!(-10), 30, false, false),
+            make_trade(dec!(5), dec!(50), 30, false, true), // censored: should be excluded
+        ];
+        let stats = compute_statistics(&trades, 3, 0, dec!(100), false);
+        // Without censored: net_pnl = 1 + (-1) = 0
+        assert_eq!(stats.net_pnl_usd, Decimal::ZERO);
+        // gross_pnl also excludes censored.
+        // make_trade sets gross_pnl = net_pnl + total_cost (0.088).
+        // Usable: (1 + 0.088) + (-1 + 0.088) = 0.176
+        assert_eq!(stats.gross_pnl_usd, dec!(0.176));
+        // total_costs excludes censored
+        let usable_costs = trades
+            .iter()
+            .filter(|t| !t.is_ambiguous && !t.is_censored)
+            .map(|t| t.total_cost_usd)
+            .sum::<Decimal>();
+        assert_eq!(stats.total_costs_usd, usable_costs);
+    }
+
+    #[test]
+    fn aggregate_pnl_excludes_ambiguous_trades() {
+        // Regression: ambiguous trades must NOT contribute to aggregate PnL.
+        let trades = vec![
+            make_trade(dec!(2), dec!(20), 30, false, false),
+            make_trade(dec!(-1), dec!(-10), 30, false, false),
+            make_trade(dec!(3), dec!(30), 30, true, false), // ambiguous: excluded
+        ];
+        let stats = compute_statistics(&trades, 3, 0, dec!(100), false);
+        // Only usable: 2 + (-1) = 1
+        assert_eq!(stats.net_pnl_usd, dec!(1));
+    }
+
+    #[test]
+    fn aggregate_pnl_excludes_both_ambiguous_and_censored() {
+        let trades = vec![
+            make_trade(dec!(1), dec!(10), 30, false, false),
+            make_trade(dec!(-1), dec!(-10), 30, false, false),
+            make_trade(dec!(0), dec!(0), 30, true, false),
+            make_trade(dec!(0), dec!(0), 30, false, true),
+            make_trade(dec!(0), dec!(0), 30, true, true),
+        ];
+        let stats = compute_statistics(&trades, 5, 0, dec!(100), false);
+        // Only 2 usable trades: net_pnl = 1 + (-1) = 0
+        assert_eq!(stats.net_pnl_usd, Decimal::ZERO);
+        // gross_pnl: (1 + 0.088) + (-1 + 0.088) = 0.176
+        assert_eq!(stats.gross_pnl_usd, dec!(0.176));
+    }
+
+    #[test]
+    fn rejection_count_includes_all_categories() {
+        // Regression: rejected_signals should include structural,
+        // strategy, and range-excluded rejections.
+        let trades = vec![make_trade(dec!(1), dec!(10), 30, false, false)];
+        // total_signals = 10, rejected = 7 (structural + strategy + range)
+        let stats = compute_statistics(&trades, 10, 7, dec!(100), false);
+        assert_eq!(stats.total_signals, 10);
+        assert_eq!(stats.rejected_signals, 7);
+        assert_eq!(stats.accepted_trades, 1);
+    }
+
+    #[test]
+    fn drawdown_excludes_censored_from_equity_curve() {
+        // Regression: censored trades must not affect the equity curve.
+        let trades = vec![
+            make_trade(dec!(5), dec!(50), 30, false, false),
+            make_trade(dec!(-3), dec!(-30), 30, false, false),
+            make_trade(dec!(-10), dec!(-100), 30, false, true), // censored: excluded
+        ];
+        let stats = compute_statistics(&trades, 3, 0, dec!(100), false);
+        // equity: 100 → 105 → 102 (censored trade excluded)
+        // dd = 3/105 ≈ 2.86%
+        assert!(stats.max_drawdown_pct > Decimal::ZERO);
+        assert!(stats.max_drawdown_pct < dec!(5));
+    }
+
+    #[test]
+    fn losing_streak_excludes_censored() {
+        // Censored trades should not count as losses in the losing streak.
+        let trades = vec![
+            make_trade(dec!(-1), dec!(-10), 30, false, false),
+            make_trade(dec!(-1), dec!(-10), 30, false, true), // censored
+            make_trade(dec!(-1), dec!(-10), 30, false, false),
+        ];
+        let stats = compute_statistics(&trades, 3, 0, dec!(100), false);
+        // Usable: loss, (censored excluded), loss → streak = 2
+        assert_eq!(stats.longest_losing_streak, 2);
     }
 }

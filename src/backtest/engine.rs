@@ -210,12 +210,13 @@ impl CostAssumptions {
 /// Detect ambiguous OHLC situations where both SL and TP thresholds are
 /// crossed between consecutive observations and ordering cannot be determined.
 ///
+/// Uses the effective high/low range of each candle to detect ambiguity.
 /// Conservative rule: when ambiguous, the interval is marked ambiguous and
 /// the trade is excluded from performance statistics. We never choose the
 /// favorable outcome.
 fn detect_ambiguity(
-    prev_price: Decimal,
-    curr_price: Decimal,
+    prev_obs: &crate::backtest::data::PriceObservation,
+    curr_obs: &crate::backtest::data::PriceObservation,
     entry_price: Decimal,
     sl_pct: Decimal,
     tp_pct: Decimal,
@@ -225,11 +226,13 @@ fn detect_ambiguity(
     }
     let sl_price = entry_price * (dec!(1) - sl_pct / dec!(100));
     let tp_price = entry_price * (dec!(1) + tp_pct / dec!(100));
-    let range_min = prev_price.min(curr_price);
-    let range_max = prev_price.max(curr_price);
-    if range_min <= sl_price && range_max >= tp_price {
+    // Use the high/low of the entire interval to detect whether both
+    // levels could have been crossed within the candle.
+    let interval_low = prev_obs.effective_low().min(curr_obs.effective_low());
+    let interval_high = prev_obs.effective_high().max(curr_obs.effective_high());
+    if interval_low <= sl_price && interval_high >= tp_price {
         Some(format!(
-            "SL ({sl_price}) and TP ({tp_price}) both within observed range [{range_min}, {range_max}]"
+            "SL ({sl_price}) and TP ({tp_price}) both within observed range [{interval_low}, {interval_high}]"
         ))
     } else {
         None
@@ -401,16 +404,16 @@ pub fn simulate_signal(
     let mut ambiguous_reason: Option<String> = None;
 
     for (i, obs) in signal.price_history.iter().enumerate() {
-        let price = obs.price_usd;
+        let price = obs.effective_close();
 
-        // Step 1: Check OHLC ambiguity (uses prev_price and current_price).
+        // Step 1: Check OHLC ambiguity (uses prev_obs and curr_obs).
         // Ambiguity is detected BEFORE exit evaluation because it determines
         // whether the interval's outcome is knowable.
         if i > 0 {
-            let prev_price = signal.price_history[i - 1].price_usd;
+            let prev_obs = &signal.price_history[i - 1];
             if let Some(reason) = detect_ambiguity(
-                prev_price,
-                price,
+                prev_obs,
+                obs,
                 entry_price,
                 config.strategy.stop_loss_pct,
                 config.strategy.take_profit_pct,
@@ -460,11 +463,14 @@ pub fn simulate_signal(
         }
 
         // Step 4: Update high-water mark AFTER exit evaluation.
-        // This ensures trailing stop at next observation uses this obs's price
+        // This ensures trailing stop at next observation uses this obs's high
         // as the high-water only if it wasn't the exit candle.
-        if price > high_water {
-            high_water = price;
-            position.high_water_price_usd = price;
+        // Use the effective high of the candle, not just the close, because
+        // the intra-candle high is what establishes the trailing stop anchor.
+        let eff_high = obs.effective_high();
+        if eff_high > high_water {
+            high_water = eff_high;
+            position.high_water_price_usd = eff_high;
         }
     }
 
@@ -494,14 +500,16 @@ pub fn simulate_signal(
         }
     };
 
-    // Set exit_price and exit_time for the no-trigger case. These mark where
-    // the observable data ends; censored trades are excluded from realized
-    // performance statistics.
-    if exit_reason_found.is_none() {
+    // For censored trades: the exit price is UNKNOWN. We set it to
+    // entry_price (no market PnL) rather than using the last observed
+    // price, which would incorrectly attribute a realized market PnL to
+    // a trade whose exit we cannot observe. Exit time is set to the last
+    // observation timestamp for recordkeeping only.
+    if is_censored {
         if let Some(last_obs) = signal.price_history.last() {
-            exit_price = last_obs.price_usd;
             exit_time = last_obs.timestamp;
         }
+        exit_price = entry_price;
     }
 
     let holding_minutes = (exit_time - entry_time).num_minutes();
@@ -1020,6 +1028,11 @@ sqlite_path = ":memory:"
                 timestamp: now + chrono::Duration::minutes((i as i64 + 1) * 5),
                 price_usd: p,
                 liquidity_usd: l,
+                open_usd: None,
+                high_usd: None,
+                low_usd: None,
+                close_usd: None,
+                volume: None,
             })
             .collect();
         HistoricalSignal {
@@ -1782,35 +1795,107 @@ sqlite_path = ":memory:"
         let entry = dec!(0.0001);
         let sl = entry * (dec!(1) - dec!(5) / dec!(100));
         let tp = entry * (dec!(1) + dec!(12) / dec!(100));
-        assert!(detect_ambiguity(sl, tp, entry, dec!(5), dec!(12)).is_some());
-        assert!(detect_ambiguity(sl + dec!(0.0000001), tp, entry, dec!(5), dec!(12)).is_none());
-        assert!(detect_ambiguity(sl, tp - dec!(0.0000001), entry, dec!(5), dec!(12)).is_none());
+        let make_obs = |p: Decimal| crate::backtest::data::PriceObservation {
+            timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
+            price_usd: p,
+            liquidity_usd: dec!(100000),
+            open_usd: None,
+            high_usd: None,
+            low_usd: None,
+            close_usd: None,
+            volume: None,
+        };
+        assert!(detect_ambiguity(&make_obs(sl), &make_obs(tp), entry, dec!(5), dec!(12)).is_some());
+        assert!(detect_ambiguity(
+            &make_obs(sl + dec!(0.0000001)),
+            &make_obs(tp),
+            entry,
+            dec!(5),
+            dec!(12)
+        )
+        .is_none());
+        assert!(detect_ambiguity(
+            &make_obs(sl),
+            &make_obs(tp - dec!(0.0000001)),
+            entry,
+            dec!(5),
+            dec!(12)
+        )
+        .is_none());
     }
 
     #[test]
     fn ambiguity_detected_when_sl_tp_both_crossed() {
+        let make_obs = |p: Decimal| crate::backtest::data::PriceObservation {
+            timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
+            price_usd: p,
+            liquidity_usd: dec!(100000),
+            open_usd: None,
+            high_usd: None,
+            low_usd: None,
+            close_usd: None,
+            volume: None,
+        };
         let prev_price = dec!(0.000094); // -6% from entry (below SL at -5%)
         let curr_price = dec!(0.000115); // +15% from entry (above TP at +12%)
         let entry_price = dec!(0.0001);
-        let result = detect_ambiguity(prev_price, curr_price, entry_price, dec!(5), dec!(12));
+        let result = detect_ambiguity(
+            &make_obs(prev_price),
+            &make_obs(curr_price),
+            entry_price,
+            dec!(5),
+            dec!(12),
+        );
         assert!(result.is_some());
     }
 
     #[test]
     fn no_ambiguity_when_only_sl_crossed() {
+        let make_obs = |p: Decimal| crate::backtest::data::PriceObservation {
+            timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
+            price_usd: p,
+            liquidity_usd: dec!(100000),
+            open_usd: None,
+            high_usd: None,
+            low_usd: None,
+            close_usd: None,
+            volume: None,
+        };
         let prev_price = dec!(0.0001);
         let curr_price = dec!(0.000094);
         let entry_price = dec!(0.0001);
-        let result = detect_ambiguity(prev_price, curr_price, entry_price, dec!(5), dec!(12));
+        let result = detect_ambiguity(
+            &make_obs(prev_price),
+            &make_obs(curr_price),
+            entry_price,
+            dec!(5),
+            dec!(12),
+        );
         assert!(result.is_none());
     }
 
     #[test]
     fn no_ambiguity_when_only_tp_crossed() {
+        let make_obs = |p: Decimal| crate::backtest::data::PriceObservation {
+            timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
+            price_usd: p,
+            liquidity_usd: dec!(100000),
+            open_usd: None,
+            high_usd: None,
+            low_usd: None,
+            close_usd: None,
+            volume: None,
+        };
         let prev_price = dec!(0.0001);
         let curr_price = dec!(0.000115);
         let entry_price = dec!(0.0001);
-        let result = detect_ambiguity(prev_price, curr_price, entry_price, dec!(5), dec!(12));
+        let result = detect_ambiguity(
+            &make_obs(prev_price),
+            &make_obs(curr_price),
+            entry_price,
+            dec!(5),
+            dec!(12),
+        );
         assert!(result.is_none());
     }
 
@@ -1867,5 +1952,240 @@ sqlite_path = ":memory:"
         // Expected cost = 2 * 0.05 * 0.002 = 0.0002
         let expected = dec!(2) * dec!(0.05) * dec!(0.002);
         assert_eq!(ca.expected_failed_tx_cost(), expected);
+    }
+
+    // =========================================================================
+    // Regression tests for corrected behaviors
+    // =========================================================================
+
+    #[test]
+    fn censored_trade_exit_price_equals_entry_price() {
+        // Censored trades must NOT use the last observed price as exit.
+        // The exit price must be the entry price (zero market PnL).
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.000101), dec!(100000))],
+        );
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        assert!(trade.is_censored);
+        assert_eq!(trade.exit_reason, ExitReason::Censored);
+        assert_eq!(trade.exit_price_usd, trade.entry_price_usd);
+        assert_eq!(trade.gross_pnl_usd, Decimal::ZERO);
+        // net_pnl should be -total_cost (costs incurred, market PnL unknown)
+        assert_eq!(trade.net_pnl_usd, -trade.total_cost_usd);
+    }
+
+    #[test]
+    fn censored_trade_pnl_not_last_observed_price() {
+        // Regression: the last observed price must NEVER be used as a
+        // realized exit for censored trades.
+        // Both prices stay within SL/TP band; only 2 obs, far below 240 min
+        // max_holding → no exit trigger, trade is censored.
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![
+                (dec!(0.000103), dec!(100000)), // +3% — within band
+                (dec!(0.000106), dec!(100000)), // +6% — within band, never exits
+            ],
+        );
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        assert!(trade.is_censored);
+        // The exit must be at entry, NOT at the last observed price
+        assert_eq!(trade.exit_price_usd, dec!(0.0001));
+        assert_eq!(trade.gross_pnl_usd, Decimal::ZERO);
+    }
+
+    #[test]
+    fn ambiguous_trade_exit_at_stop_level() {
+        // When ambiguity is detected, the exit must be at the stop level
+        // (conservative rule), not at the observed close.
+        // obs[0] is within the SL/TP band (so no exit on its own).
+        // obs[1] OHLC spans both SL and TP → ambiguity detected between obs0-obs1.
+        let config = base_config();
+        let entry = dec!(0.0001);
+        let sl = entry * (dec!(1) - dec!(5) / dec!(100)); // 0.000095
+        let tp = entry * (dec!(1) + dec!(12) / dec!(100)); // 0.000112
+
+        let mut signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            entry,
+            dec!(100000),
+            vec![
+                (dec!(0.000103), dec!(100000)), // +3% — within band, safe
+            ],
+        );
+        // obs[1]: close is within band but high/low span both SL and TP
+        signal
+            .price_history
+            .push(crate::backtest::data::PriceObservation {
+                timestamp: "2024-01-15T12:10:00Z".parse().unwrap(),
+                price_usd: dec!(0.000103),
+                liquidity_usd: dec!(100000),
+                open_usd: Some(dec!(0.000103)),
+                high_usd: Some(tp + dec!(0.00001)), // goes above TP
+                low_usd: Some(sl - dec!(0.00001)),  // goes below SL
+                close_usd: Some(dec!(0.000103)),
+                volume: None,
+            });
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        assert!(trade.is_ambiguous);
+        assert_eq!(trade.exit_reason, ExitReason::StopLoss);
+        // Exit at SL level, not at close (0.000103)
+        assert_eq!(trade.exit_price_usd, sl);
+    }
+
+    #[test]
+    fn ohlc_ambiguity_uses_high_low_not_just_close() {
+        // With explicit OHLC, ambiguity should be detected when the
+        // high/low range spans both SL and TP levels, even if the
+        // close prices are on the same side.
+        let entry = dec!(0.0001);
+        let sl = entry * (dec!(1) - dec!(5) / dec!(100)); // 0.000095
+        let tp = entry * (dec!(1) + dec!(12) / dec!(100)); // 0.000112
+
+        let prev_obs = crate::backtest::data::PriceObservation {
+            timestamp: "2024-01-15T12:05:00Z".parse().unwrap(),
+            price_usd: entry,
+            liquidity_usd: dec!(100000),
+            open_usd: Some(entry),
+            high_usd: Some(tp + dec!(0.00001)), // goes above TP
+            low_usd: Some(sl - dec!(0.00001)),  // goes below SL
+            close_usd: Some(entry),
+            volume: None,
+        };
+        let curr_obs = crate::backtest::data::PriceObservation {
+            timestamp: "2024-01-15T12:10:00Z".parse().unwrap(),
+            price_usd: entry,
+            liquidity_usd: dec!(100000),
+            open_usd: Some(entry),
+            high_usd: Some(tp + dec!(0.00001)),
+            low_usd: Some(sl - dec!(0.00001)),
+            close_usd: Some(entry),
+            volume: None,
+        };
+        // Even though both closes are at entry, the high/low span both levels
+        assert!(detect_ambiguity(&prev_obs, &curr_obs, entry, dec!(5), dec!(12)).is_some());
+    }
+
+    #[test]
+    fn ohlc_backward_compat_only_close() {
+        // When only price_usd is provided (no OHLC fields), the system
+        // should work identically to the pre-OHLC behavior.
+        let config = base_config();
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.000112), dec!(100000))],
+        );
+        // All OHLC fields are None, should still work
+        assert!(signal.price_history[0].open_usd.is_none());
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        assert_eq!(trade.exit_reason, ExitReason::TakeProfit);
+        assert_eq!(trade.exit_price_usd, dec!(0.000112));
+    }
+
+    #[test]
+    fn trailing_stop_uses_high_water_from_candle_high() {
+        // High water mark should use the candle's effective high, not just
+        // the close.
+        let config = base_config();
+        let mut signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![
+                (dec!(0.000105), dec!(100000)),
+                (dec!(0.000100), dec!(100000)),
+            ],
+        );
+        // Set the first candle's high above the close
+        signal.price_history[0].high_usd = Some(dec!(0.00011));
+        let trade =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap();
+        // High water = 0.00011 (from candle high). Trailing stop at 4% from
+        // 0.00011 = 0.0001056. Obs 2 close = 0.000100 < 0.0001056 → exit.
+        assert_eq!(trade.exit_reason, ExitReason::TrailingStop);
+    }
+
+    #[test]
+    fn all_costs_counted_exactly_once() {
+        // Entry: swap_fee=0.012, priority=0.002, slippage=0.02, impact=0.008
+        // = 0.042
+        // Exit: swap_fee=0.01344, priority=0.002, slippage=0.0224, impact=0.00896
+        // = 0.0468
+        // Failed tx: 0.0002
+        // Total = 0.042 + 0.0468 + 0.0002 = 0.089
+        let config = base_config();
+        let ca = symmetric_ca(
+            dec!(30),
+            dec!(0.002),
+            dec!(50),
+            dec!(20),
+            dec!(0.05),
+            dec!(0.002),
+        );
+        let signal = tp_signal();
+        let trade = simulate_signal(&signal, &config, &ca, Split::Train, 0).unwrap();
+        // Verify each cost component appears exactly once
+        let sum_entry = trade.entry_costs.swap_fee_usd
+            + trade.entry_costs.priority_fee_usd
+            + trade.entry_costs.slippage_cost_usd
+            + trade.entry_costs.price_impact_cost_usd;
+        assert_eq!(sum_entry, trade.entry_costs.total_usd);
+        let sum_exit = trade.exit_costs.swap_fee_usd
+            + trade.exit_costs.priority_fee_usd
+            + trade.exit_costs.slippage_cost_usd
+            + trade.exit_costs.price_impact_cost_usd;
+        assert_eq!(sum_exit, trade.exit_costs.total_usd);
+        assert_eq!(
+            trade.total_cost_usd,
+            trade.entry_costs.total_usd + trade.exit_costs.total_usd + ca.expected_failed_tx_cost()
+        );
+        // net_pnl = gross_pnl - total_cost
+        assert_eq!(
+            trade.net_pnl_usd,
+            trade.gross_pnl_usd - trade.total_cost_usd
+        );
+    }
+
+    #[test]
+    fn future_wallet_quality_rejected_in_entry_decision() {
+        let mut config = base_config();
+        config.strategy.min_wallet_score = dec!(90.0);
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        let err =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap_err();
+        assert!(err.contains("wallet evidence"));
+    }
+
+    #[test]
+    fn future_min_consensus_wallets_rejected() {
+        let mut config = base_config();
+        config.strategy.min_consensus_wallets = 10;
+        let signal = make_signal(
+            "2024-01-15T12:00:00Z",
+            dec!(0.0001),
+            dec!(100000),
+            vec![(dec!(0.00011), dec!(100000))],
+        );
+        let err =
+            simulate_signal(&signal, &config, &cost_assumptions(), Split::Train, 0).unwrap_err();
+        assert!(err.contains("insufficient independent qualified wallet consensus"));
     }
 }

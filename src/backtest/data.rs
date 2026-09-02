@@ -3,14 +3,58 @@ use crate::economics::CostModel;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
-/// A single price/liquidity observation at a specific point in time.
+/// A single OHLCV+liquidity observation at a specific point in time.
+///
+/// For backward compatibility, `price_usd` is always present and treated
+/// as the close price. When `open_usd`, `high_usd`, `low_usd`, `close_usd`,
+/// and `volume` are absent, they are derived from `price_usd` so that
+/// close-price-only datasets remain valid without modification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriceObservation {
     pub timestamp: DateTime<Utc>,
+    /// Close price (always present; legacy field).
     pub price_usd: Decimal,
     pub liquidity_usd: Decimal,
+    /// Open price for the candle. Defaults to `price_usd` when absent.
+    #[serde(default)]
+    pub open_usd: Option<Decimal>,
+    /// High price for the candle. Defaults to `price_usd` when absent.
+    #[serde(default)]
+    pub high_usd: Option<Decimal>,
+    /// Low price for the candle. Defaults to `price_usd` when absent.
+    #[serde(default)]
+    pub low_usd: Option<Decimal>,
+    /// Close price for the candle. Defaults to `price_usd` when absent.
+    #[serde(default)]
+    pub close_usd: Option<Decimal>,
+    /// Volume traded during the candle (optional, informational).
+    #[serde(default)]
+    pub volume: Option<Decimal>,
+}
+
+impl PriceObservation {
+    /// Effective open price: explicit OHLC open, or the close price.
+    pub fn effective_open(&self) -> Decimal {
+        self.open_usd.unwrap_or(self.price_usd)
+    }
+
+    /// Effective high price: explicit OHLC high, or the close price.
+    pub fn effective_high(&self) -> Decimal {
+        self.high_usd.unwrap_or(self.price_usd)
+    }
+
+    /// Effective low price: explicit OHLC low, or the close price.
+    pub fn effective_low(&self) -> Decimal {
+        self.low_usd.unwrap_or(self.price_usd)
+    }
+
+    /// Effective close price: explicit OHLC close, or the close price.
+    pub fn effective_close(&self) -> Decimal {
+        self.close_usd.unwrap_or(self.price_usd)
+    }
 }
 
 /// A historical signal record with full decision context and subsequent price path.
@@ -58,21 +102,39 @@ pub struct LoadResult {
 }
 
 /// Load historical signals from a JSONL file with strict validation.
+///
+/// The validation is fail-closed: any structural problem rejects the
+/// record. This protects the backtest from look-ahead bias, malformed
+/// inputs, and survivorship-bias sampling.
 pub fn load_historical_signals(path: &Path) -> Result<LoadResult, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let mut signals = Vec::new();
     let mut rejection_reasons = Vec::new();
     let mut rejected_count = 0;
+    let mut seen_signal_keys: HashSet<(String, DateTime<Utc>)> = HashSet::new();
 
     for (line_num, line) in content.lines().enumerate() {
         let line = line.trim();
-        if line.is_empty() {
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
         match serde_json::from_str::<HistoricalSignal>(line) {
             Ok(signal) => match validate_signal(&signal, line_num + 1) {
-                Ok(()) => signals.push(signal),
+                Ok(()) => {
+                    // Reject duplicate signals: same (mint, signal_timestamp)
+                    // is the same observation, regardless of body.
+                    let key = (signal.mint.clone(), signal.signal_timestamp);
+                    if !seen_signal_keys.insert(key) {
+                        rejected_count += 1;
+                        rejection_reasons.push(format!(
+                            "line {}: duplicate signal (same mint + signal_timestamp)",
+                            line_num + 1
+                        ));
+                        continue;
+                    }
+                    signals.push(signal);
+                }
                 Err(reason) => {
                     rejected_count += 1;
                     rejection_reasons.push(reason);
@@ -95,10 +157,33 @@ pub fn load_historical_signals(path: &Path) -> Result<LoadResult, String> {
     })
 }
 
+/// Loose Solana base58 mint check: 32-44 chars from the base58
+/// alphabet (excluding 0/O/I/l for human-readability reasons). Not a
+/// full base58 decode, but enough to reject empty strings, whitespace,
+/// and clearly invalid inputs. Combined with the 32-44 char length
+/// check, this catches the most common data-entry mistakes.
+fn is_valid_solana_mint(s: &str) -> bool {
+    let len = s.len();
+    if !(32..=44).contains(&len) {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() && c != '0' && c != 'O' && c != 'I' && c != 'l')
+}
+
+/// Strict, fail-closed structural + PIT validation. Every check that
+/// could allow a look-ahead bias, malformed observation, or invalid
+/// value REJECTS the record.
 fn validate_signal(signal: &HistoricalSignal, line: usize) -> Result<(), String> {
     if signal.price_history.is_empty() {
         return Err(format!(
             "line {line}: price_history is empty; cannot determine trade outcome"
+        ));
+    }
+    if !is_valid_solana_mint(&signal.mint) {
+        return Err(format!(
+            "line {line}: invalid mint address {:?} (expected 32-44 base58 chars)",
+            signal.mint
         ));
     }
     for window in signal.price_history.windows(2) {
@@ -115,15 +200,94 @@ fn validate_signal(signal: &HistoricalSignal, line: usize) -> Result<(), String>
                 obs.timestamp, signal.signal_timestamp
             ));
         }
+        if obs.price_usd <= Decimal::ZERO {
+            return Err(format!(
+                "line {line}: price observation {} has non-positive price_usd {}",
+                obs.timestamp, obs.price_usd
+            ));
+        }
+        if obs.liquidity_usd < Decimal::ZERO {
+            return Err(format!(
+                "line {line}: price observation {} has negative liquidity_usd {}",
+                obs.timestamp, obs.liquidity_usd
+            ));
+        }
+        // Validate OHLC consistency when explicit fields are present.
+        if let Some(open) = obs.open_usd {
+            if open <= Decimal::ZERO {
+                return Err(format!(
+                    "line {line}: price observation {} has non-positive open_usd {}",
+                    obs.timestamp, open
+                ));
+            }
+        }
+        if let Some(high) = obs.high_usd {
+            if high <= Decimal::ZERO {
+                return Err(format!(
+                    "line {line}: price observation {} has non-positive high_usd {}",
+                    obs.timestamp, high
+                ));
+            }
+        }
+        if let Some(low) = obs.low_usd {
+            if low <= Decimal::ZERO {
+                return Err(format!(
+                    "line {line}: price observation {} has non-positive low_usd {}",
+                    obs.timestamp, low
+                ));
+            }
+        }
+        if let Some(close) = obs.close_usd {
+            if close <= Decimal::ZERO {
+                return Err(format!(
+                    "line {line}: price observation {} has non-positive close_usd {}",
+                    obs.timestamp, close
+                ));
+            }
+        }
+        // OHLC consistency: high >= low.
+        let eff_high = obs.effective_high();
+        let eff_low = obs.effective_low();
+        if eff_high < eff_low {
+            return Err(format!(
+                "line {line}: price observation {} has high ({}) < low ({})",
+                obs.timestamp, eff_high, eff_low
+            ));
+        }
     }
     if signal.position_usd <= Decimal::ZERO {
         return Err(format!("line {line}: position_usd must be positive"));
     }
-    // Strict PIT validation: all decision data must be <= signal_timestamp
+    if signal.expected_gross_return_pct < Decimal::ZERO {
+        return Err(format!(
+            "line {line}: expected_gross_return_pct must be non-negative"
+        ));
+    }
+    if signal.token_decimals > 18 {
+        return Err(format!(
+            "line {line}: token_decimals ({}) implausibly large (max 18)",
+            signal.token_decimals
+        ));
+    }
+    if signal.base_mint_decimals > 18 {
+        return Err(format!(
+            "line {line}: base_mint_decimals ({}) implausibly large (max 18)",
+            signal.base_mint_decimals
+        ));
+    }
+    // Strict PIT validation: all decision data must be <= signal_timestamp.
     if signal.market.observed_at > signal.signal_timestamp {
         return Err(format!(
             "line {line}: market.observed_at ({}) is AFTER signal_timestamp ({}) — look-ahead bias",
             signal.market.observed_at, signal.signal_timestamp
+        ));
+    }
+    if signal.market.price_usd <= Decimal::ZERO {
+        return Err(format!("line {line}: market.price_usd must be positive"));
+    }
+    if signal.market.liquidity_usd < Decimal::ZERO {
+        return Err(format!(
+            "line {line}: market.liquidity_usd must be non-negative"
         ));
     }
     if signal.safety.observed_at > signal.signal_timestamp {
@@ -132,11 +296,23 @@ fn validate_signal(signal: &HistoricalSignal, line: usize) -> Result<(), String>
             signal.safety.observed_at, signal.signal_timestamp
         ));
     }
+    if signal.safety.token_age_secs < 0 {
+        return Err(format!(
+            "line {line}: safety.token_age_secs must be non-negative"
+        ));
+    }
     if signal.costs.observed_at > signal.signal_timestamp {
         return Err(format!(
             "line {line}: costs.observed_at ({}) is AFTER signal_timestamp ({}) — look-ahead bias",
             signal.costs.observed_at, signal.signal_timestamp
         ));
+    }
+    // Wallet PIT: every wallet.updated_at must be <= signal_timestamp
+    // AND <= market.observed_at (the strictest PIT anchor). Wallets
+    // updated after the market snapshot was taken cannot have informed
+    // the entry decision.
+    if signal.wallets.is_empty() {
+        return Err(format!("line {line}: no wallets in signal"));
     }
     for (i, wallet) in signal.wallets.iter().enumerate() {
         if wallet.updated_at > signal.signal_timestamp {
@@ -145,8 +321,25 @@ fn validate_signal(signal: &HistoricalSignal, line: usize) -> Result<(), String>
                 i, wallet.updated_at, signal.signal_timestamp
             ));
         }
+        if wallet.updated_at > signal.market.observed_at {
+            return Err(format!(
+                "line {line}: wallet[{}].updated_at ({}) is AFTER market.observed_at ({}) — wallet data was not yet available when the market was observed",
+                i, wallet.updated_at, signal.market.observed_at
+            ));
+        }
+        if !is_valid_solana_pubkey(&wallet.wallet) {
+            return Err(format!(
+                "line {line}: wallet[{}].wallet ({:?}) is not a valid Solana pubkey",
+                i, wallet.wallet
+            ));
+        }
     }
     Ok(())
+}
+
+/// Loose Solana base58 pubkey check for wallet addresses.
+fn is_valid_solana_pubkey(s: &str) -> bool {
+    is_valid_solana_mint(s)
 }
 
 /// Rejection reason with structured data for the rejection summary.
@@ -221,7 +414,7 @@ mod tests {
                 "observed_at": signal_timestamp
             },
             "wallets": [{
-                "wallet": "wallet1",
+                "wallet": "5kqEvH3gnx5HUYA8UmK3Za5gF3kRpY3oUg3TCY4tJhPb",
                 "realized_pnl_usd": "1000",
                 "win_rate": "0.7",
                 "avg_return_pct": "15",
@@ -235,7 +428,7 @@ mod tests {
                 "tier": "Qualified",
                 "updated_at": signal_timestamp
             }, {
-                "wallet": "wallet2",
+                "wallet": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
                 "realized_pnl_usd": "2000",
                 "win_rate": "0.65",
                 "avg_return_pct": "12",
@@ -538,6 +731,123 @@ mod tests {
         assert_eq!(accepted.len(), 0);
         assert_eq!(rejected.len(), 1);
         assert!(rejected[0].reason.contains("mint mismatch"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // OHLC-related regression tests
+    // =========================================================================
+
+    #[test]
+    fn ohlc_fields_default_to_close_when_absent() {
+        let obs = PriceObservation {
+            timestamp: "2024-01-15T12:05:00Z".parse().unwrap(),
+            price_usd: dec!(0.0001),
+            liquidity_usd: dec!(100000),
+            open_usd: None,
+            high_usd: None,
+            low_usd: None,
+            close_usd: None,
+            volume: None,
+        };
+        assert_eq!(obs.effective_open(), dec!(0.0001));
+        assert_eq!(obs.effective_high(), dec!(0.0001));
+        assert_eq!(obs.effective_low(), dec!(0.0001));
+        assert_eq!(obs.effective_close(), dec!(0.0001));
+    }
+
+    #[test]
+    fn ohlc_fields_use_explicit_values_when_present() {
+        let obs = PriceObservation {
+            timestamp: "2024-01-15T12:05:00Z".parse().unwrap(),
+            price_usd: dec!(0.0001),
+            liquidity_usd: dec!(100000),
+            open_usd: Some(dec!(0.000099)),
+            high_usd: Some(dec!(0.000115)),
+            low_usd: Some(dec!(0.000094)),
+            close_usd: Some(dec!(0.000102)),
+            volume: Some(dec!(50000)),
+        };
+        assert_eq!(obs.effective_open(), dec!(0.000099));
+        assert_eq!(obs.effective_high(), dec!(0.000115));
+        assert_eq!(obs.effective_low(), dec!(0.000094));
+        assert_eq!(obs.effective_close(), dec!(0.000102));
+    }
+
+    #[test]
+    fn reject_high_less_than_low() {
+        let dir = std::env::temp_dir().join("backtest_data_test_ohlc_invalid");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut signal: HistoricalSignal = serde_json::from_str(&sample_signal_json(
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:05:00Z",
+        ))
+        .unwrap();
+        signal.price_history[0].high_usd = Some(dec!(0.00009));
+        signal.price_history[0].low_usd = Some(dec!(0.00011));
+        let path = write_jsonl(
+            &dir,
+            "signals.jsonl",
+            &serde_json::to_string(&signal).unwrap(),
+        );
+        let result = load_historical_signals(&path).unwrap();
+        assert_eq!(result.rejected_count, 1);
+        assert!(result.rejection_reasons[0].contains("high"));
+        assert!(result.rejection_reasons[0].contains("low"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reject_non_positive_ohlc_fields() {
+        let dir = std::env::temp_dir().join("backtest_data_test_ohlc_nonpos");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut signal: HistoricalSignal = serde_json::from_str(&sample_signal_json(
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:05:00Z",
+        ))
+        .unwrap();
+        signal.price_history[0].open_usd = Some(dec!(-1));
+        let path = write_jsonl(
+            &dir,
+            "signals.jsonl",
+            &serde_json::to_string(&signal).unwrap(),
+        );
+        let result = load_historical_signals(&path).unwrap();
+        assert_eq!(result.rejected_count, 1);
+        assert!(result.rejection_reasons[0].contains("open_usd"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ohlc_fields_round_trip_through_jsonl() {
+        let dir = std::env::temp_dir().join("backtest_data_test_ohlc_roundtrip");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut signal: HistoricalSignal = serde_json::from_str(&sample_signal_json(
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:00:00Z",
+            "2024-01-15T12:05:00Z",
+        ))
+        .unwrap();
+        signal.price_history[0].open_usd = Some(dec!(0.000099));
+        signal.price_history[0].high_usd = Some(dec!(0.000115));
+        signal.price_history[0].low_usd = Some(dec!(0.000094));
+        signal.price_history[0].close_usd = Some(dec!(0.000102));
+        signal.price_history[0].volume = Some(dec!(50000));
+        let path = write_jsonl(
+            &dir,
+            "signals.jsonl",
+            &serde_json::to_string(&signal).unwrap(),
+        );
+        let result = load_historical_signals(&path).unwrap();
+        assert_eq!(result.signals.len(), 1);
+        let obs = &result.signals[0].price_history[0];
+        assert_eq!(obs.open_usd, Some(dec!(0.000099)));
+        assert_eq!(obs.high_usd, Some(dec!(0.000115)));
+        assert_eq!(obs.low_usd, Some(dec!(0.000094)));
+        assert_eq!(obs.close_usd, Some(dec!(0.000102)));
+        assert_eq!(obs.volume, Some(dec!(50000)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

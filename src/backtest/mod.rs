@@ -85,7 +85,7 @@ pub fn run_backtest(
     let mut stats = compute_statistics(
         &trades,
         total_signals_before,
-        structural_rejections.len(),
+        structural_rejections.len() + strategy_rejections.len() + range_excluded.len(),
         bt_config.capital_usd,
         bt_config.is_synthetic_data,
     );
