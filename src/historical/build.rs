@@ -176,7 +176,7 @@ impl HistoricalBuilder {
                     }
                 }
                 processed += 1;
-                if processed % 5 == 0 {
+                if processed.is_multiple_of(5) {
                     tracing::info!(processed, total, "progress");
                 }
             }
@@ -549,12 +549,12 @@ mod tests {
         assert!(grid.last().copied().unwrap() <= end);
     }
 
-    /// Empty mint list yields zero signals but does not panic.
+    /// Empty mint list yields no signals but does not panic.
     #[test]
     fn empty_mints_produces_no_signals() {
         let start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         let end = Utc.timestamp_opt(1_700_000_900, 0).unwrap();
-        let total = 0 * compute_signal_grid(start, end, 3).len();
-        assert_eq!(total, 0);
+        let grid = compute_signal_grid(start, end, 3);
+        assert!(grid.len() >= 1, "grid must have at least one entry");
     }
 }

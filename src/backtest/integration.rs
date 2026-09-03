@@ -162,7 +162,7 @@ fn end_to_end_pipeline_with_bundled_sample_dataset() {
     // --- Rejection categories are reported ---
     assert!(
         result.malformed_records.len() + result.strategy_rejections.len() > 0
-            || result.structural_rejections.len() > 0,
+            || !result.structural_rejections.is_empty(),
         "rejection categories must be reported (malformed, strategy, structural, range_excluded)"
     );
 
@@ -307,7 +307,7 @@ fn end_to_end_pipeline_can_be_replayed_via_engine_directly() {
 
     // Simulate the very first accepted signal and confirm it lands in
     // a known split with a known exit reason.
-    for signal in &load_result.signals {
+    if let Some(signal) = load_result.signals.first() {
         let result = simulate_signal(signal, &config, &cost_assumptions, Split::OutOfSample, 0);
         assert!(result.is_ok(), "first OOS signal must simulate cleanly");
         let trade = result.unwrap();
@@ -319,9 +319,9 @@ fn end_to_end_pipeline_can_be_replayed_via_engine_directly() {
         );
         // Deterministic ID.
         assert!(trade.trade_id.starts_with("bt:"));
-        return;
+    } else {
+        panic!("no signals loaded from bundled fixture");
     }
-    panic!("no signals loaded from bundled fixture");
 }
 
 #[test]

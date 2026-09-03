@@ -63,6 +63,34 @@ pub struct TokenBalance {
 
 pub const SOL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
+/// A single transaction signature entry from `getSignaturesForAddress`.
+#[derive(Debug, Clone)]
+pub struct SignatureEntry {
+    pub signature: String,
+    pub slot: u64,
+    pub block_time: Option<i64>,
+    pub err: Option<Value>,
+    pub confirmation_status: Option<String>,
+}
+
+/// One of the largest token holders, from `getTokenLargestAccounts`.
+#[derive(Debug, Clone)]
+pub struct TokenLargestAccount {
+    pub address: String,
+    pub amount: u64,
+    pub decimals: u8,
+}
+
+/// Parsed SPL Token Mint account info from `getAccountInfo` (jsonParsed).
+#[derive(Debug, Clone)]
+pub struct MintAccountInfo {
+    pub mint_authority: Option<String>,
+    pub freeze_authority: Option<String>,
+    pub supply: u64,
+    pub decimals: u8,
+    pub is_initialized: bool,
+}
+
 impl RpcPool {
     pub fn new(endpoints: Vec<String>, timeout: Duration) -> Result<Self, RpcError> {
         Self::with_attempts(endpoints, timeout, 1)
@@ -166,6 +194,122 @@ impl RpcPool {
     }
     /// All SPL token accounts owned by `owner`. Used for restart
     /// reconciliation; a failure here must block trading, not be guessed away.
+    /// Fetch recent transaction signatures for an address.
+    pub async fn signatures_for_address(
+        &self,
+        address: &str,
+        limit: u32,
+    ) -> Result<Vec<SignatureEntry>, RpcError> {
+        let v = self
+            .call(
+                "getSignaturesForAddress",
+                json!([address, {"limit": limit, "commitment": "confirmed"}]),
+            )
+            .await?;
+        let entries = v
+            .value
+            .as_array()
+            .ok_or_else(|| RpcError::Invalid("missing signatures array".into()))?;
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
+            let signature = e["signature"]
+                .as_str()
+                .ok_or_else(|| RpcError::Invalid("signature entry missing signature".into()))?
+                .to_string();
+            let slot = e["slot"].as_u64().unwrap_or(0);
+            let block_time = e["blockTime"].as_i64();
+            let err = if e["err"].is_null() {
+                None
+            } else {
+                Some(e["err"].clone())
+            };
+            let confirmation_status = e["confirmationStatus"].as_str().map(str::to_owned);
+            out.push(SignatureEntry {
+                signature,
+                slot,
+                block_time,
+                err,
+                confirmation_status,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fetch the largest token accounts for a mint (holder concentration analysis).
+    pub async fn token_largest_accounts(
+        &self,
+        mint: &str,
+    ) -> Result<Vec<TokenLargestAccount>, RpcError> {
+        let v = self
+            .call(
+                "getTokenLargestAccounts",
+                json!([mint, {"commitment": "confirmed"}]),
+            )
+            .await?;
+        let value = &v.value["value"];
+        let accounts = value
+            .as_array()
+            .ok_or_else(|| RpcError::Invalid("missing token largest accounts array".into()))?;
+        let mut out = Vec::with_capacity(accounts.len());
+        for a in accounts {
+            let address = a["address"]
+                .as_str()
+                .ok_or_else(|| RpcError::Invalid("largest account missing address".into()))?
+                .to_string();
+            let amount_str = a["amount"]
+                .as_str()
+                .ok_or_else(|| RpcError::Invalid("largest account missing amount".into()))?;
+            let amount = amount_str
+                .parse::<u64>()
+                .map_err(|_| RpcError::Invalid("invalid largest account amount".into()))?;
+            let decimals = a["decimals"].as_u64().unwrap_or(0) as u8;
+            out.push(TokenLargestAccount {
+                address,
+                amount,
+                decimals,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fetch parsed SPL Token Mint account info (mint_authority, freeze_authority, supply).
+    /// Returns `None` if the account does not exist.
+    pub async fn mint_account_info(&self, mint: &str) -> Result<Option<MintAccountInfo>, RpcError> {
+        let v = self
+            .call(
+                "getAccountInfo",
+                json!([mint, {"encoding": "jsonParsed", "commitment": "confirmed"}]),
+            )
+            .await?;
+        let account = &v.value["value"];
+        if account.is_null() {
+            return Ok(None);
+        }
+        let data = &account["data"];
+        let parsed = &data["parsed"];
+        let info = &parsed["info"];
+        let mint_authority = info["mintAuthority"].as_str().map(str::to_owned);
+        let freeze_authority = info["freezeAuthority"].as_str().map(str::to_owned);
+        let supply_str = info["supply"]
+            .as_str()
+            .ok_or_else(|| RpcError::Invalid("mint missing supply".into()))?;
+        let supply = supply_str
+            .parse::<u64>()
+            .map_err(|_| RpcError::Invalid("invalid mint supply".into()))?;
+        let decimals = info["decimals"]
+            .as_u64()
+            .ok_or_else(|| RpcError::Invalid("mint missing decimals".into()))?
+            as u8;
+        let is_initialized = info["isInitialized"].as_bool().unwrap_or(false);
+        Ok(Some(MintAccountInfo {
+            mint_authority,
+            freeze_authority,
+            supply,
+            decimals,
+            is_initialized,
+        }))
+    }
+
     pub async fn token_balances(&self, owner: &str) -> Result<Vec<TokenBalance>, RpcError> {
         let v=self.call("getTokenAccountsByOwner",json!([owner,{"programId":SOL_TOKEN_PROGRAM},{"encoding":"jsonParsed","commitment":"confirmed"}])).await?;
         let accounts = v.value["value"]

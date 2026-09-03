@@ -737,6 +737,7 @@ struct SessionState {
     day_key: String,
     emergency_active: bool,
     collector: CandidateCollector,
+    wallet_monitor: Option<crate::collector::wallet_monitor::WalletMonitor>,
     #[allow(dead_code)]
     report: PerformanceReport,
 }
@@ -763,8 +764,27 @@ pub async fn run_session(
         day_key: String::new(),
         emergency_active: false,
         collector: CandidateCollector::new(),
+        wallet_monitor: None,
         report: PerformanceReport::new(config.risk.starting_capital_usd),
     };
+
+    if config.wallet_monitor.enabled {
+        match crate::collector::wallet_monitor::WalletMonitor::new(
+            config.clone(),
+            deps.rpc.clone(),
+            deps.executor.clone(),
+        )
+        .await
+        {
+            Ok(wm) => {
+                tracing::info!("wallet monitor initialized successfully");
+                state.wallet_monitor = Some(wm);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to initialize wallet monitor; continuing without it");
+            }
+        }
+    }
 
     // Restore or initialise the daily-loss window.
     let today = Utc::now().date_naive().to_string();
@@ -973,6 +993,56 @@ async fn tick(
         }
         for c in new_candidates {
             state.candidates.insert(c.mint.clone(), c);
+        }
+    }
+
+    // 1b. Wallet monitor: poll tracked wallets for new BUY events.
+    if let Some(ref mut wm) = state.wallet_monitor {
+        match wm.tick().await {
+            Ok(wm_candidates) => {
+                for c in &wm_candidates {
+                    let _ = store.set_last_liquidity(&c.mint, c.market.liquidity_usd);
+                    let sol_price = config.economics.sol_price_usd.unwrap_or(dec!(150));
+                    let input_value_usd = c.position_usd;
+                    let tokens = if sol_price > Decimal::ZERO && c.market.price_usd > Decimal::ZERO
+                    {
+                        (input_value_usd / c.market.price_usd
+                            * dec!(1_000_000)
+                            * dec!(1_000_000_000)
+                            / dec!(1_000_000))
+                        .to_string()
+                        .parse::<u64>()
+                        .unwrap_or(c.input_amount)
+                    } else {
+                        c.input_amount
+                    };
+                    deps.executor.register_quote(crate::execution::Quote {
+                        input_mint: config.strategy.base_mint.clone(),
+                        output_mint: c.mint.clone(),
+                        input_amount: c.input_amount,
+                        output_amount: tokens,
+                        price_impact_bps: c
+                            .costs
+                            .input
+                            .avg_price_impact_bps
+                            .to_string()
+                            .parse()
+                            .unwrap_or(50),
+                        route: serde_json::json!({"source": "wallet_monitor"}),
+                        observed_at: now,
+                    });
+                }
+                let count = wm_candidates.len();
+                for c in wm_candidates {
+                    state.candidates.insert(c.mint.clone(), c);
+                }
+                if count > 0 {
+                    tracing::info!(count = count, "wallet monitor produced new candidates");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "wallet monitor tick failed");
+            }
         }
     }
 
@@ -1497,6 +1567,7 @@ pub async fn exit_all_positions(deps: &SessionDeps) -> Result<usize> {
         day_key: Utc::now().date_naive().to_string(),
         emergency_active: true,
         collector: CandidateCollector::new(),
+        wallet_monitor: None,
         report: PerformanceReport::new(deps.config.risk.starting_capital_usd),
     };
     for mint in open {
@@ -1610,6 +1681,7 @@ mod tests {
             },
             runtime: RuntimeConfig::default(),
             observability: ObservabilityConfig::default(),
+            wallet_monitor: crate::config::types::WalletMonitorConfig::default(),
         })
     }
 
@@ -1750,6 +1822,7 @@ mod tests {
             day_key: Utc::now().date_naive().to_string(),
             emergency_active: false,
             collector: CandidateCollector::new(),
+            wallet_monitor: None,
             report: PerformanceReport::new(config.risk.starting_capital_usd),
         };
         let rpc = Arc::new(

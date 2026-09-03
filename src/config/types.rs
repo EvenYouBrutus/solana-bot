@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::Deserialize;
 
 use super::ConfigError;
@@ -16,6 +17,8 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    #[serde(default)]
+    pub wallet_monitor: WalletMonitorConfig,
 }
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -234,6 +237,43 @@ impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
             log_format: default_log(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WalletMonitorConfig {
+    pub enabled: bool,
+    pub wallets_file: String,
+    #[serde(default = "default_poll")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_max_history_sigs")]
+    pub max_history_signatures: u32,
+    #[serde(default = "default_consensus_window")]
+    pub consensus_window_secs: u64,
+    #[serde(default = "default_position_usd")]
+    pub position_usd: Decimal,
+}
+
+fn default_max_history_sigs() -> u32 {
+    100
+}
+fn default_consensus_window() -> u64 {
+    900
+}
+fn default_position_usd() -> Decimal {
+    dec!(4)
+}
+
+impl Default for WalletMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            wallets_file: "smart_wallets.txt".into(),
+            poll_interval_secs: default_poll(),
+            max_history_signatures: default_max_history_sigs(),
+            consensus_window_secs: default_consensus_window(),
+            position_usd: default_position_usd(),
         }
     }
 }

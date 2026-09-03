@@ -132,7 +132,7 @@ mod tests {
             high_usd: Some(Decimal::from_f64_retain(high).unwrap()),
             low_usd: Some(Decimal::from_f64_retain(low).unwrap()),
             close_usd: Some(Decimal::from_f64_retain(close).unwrap()),
-            volume: volume.and_then(|v| Decimal::from_f64_retain(v)),
+            volume: volume.and_then(Decimal::from_f64_retain),
         }
     }
 

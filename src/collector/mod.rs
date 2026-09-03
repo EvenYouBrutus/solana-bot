@@ -1,3 +1,7 @@
+pub mod swap_parser;
+pub mod token_data;
+pub mod wallet_monitor;
+
 use crate::config::types::Config;
 use crate::domain::market::MarketSnapshot;
 use crate::domain::token::TokenSafety;

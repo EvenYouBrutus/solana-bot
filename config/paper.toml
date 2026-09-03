@@ -71,3 +71,11 @@ replay_mode = false
 
 [observability]
 log_format = "pretty"
+
+[wallet_monitor]
+enabled = true
+wallets_file = "smart_wallets.txt"
+poll_interval_secs = 10
+max_history_signatures = 100
+consensus_window_secs = 900
+position_usd = 4.0

@@ -1257,6 +1257,7 @@ mod tests {
                     ..Default::default()
                 },
                 observability: crate::config::types::ObservabilityConfig::default(),
+                wallet_monitor: crate::config::types::WalletMonitorConfig::default(),
             }),
             store: Arc::new(store),
             executor: Arc::new(MockQuoteExecutor),
@@ -1345,6 +1346,7 @@ mod tests {
                     ..Default::default()
                 },
                 observability: crate::config::types::ObservabilityConfig::default(),
+                wallet_monitor: crate::config::types::WalletMonitorConfig::default(),
             }),
             store: Arc::new(store),
             executor: Arc::new(MockQuoteExecutor),

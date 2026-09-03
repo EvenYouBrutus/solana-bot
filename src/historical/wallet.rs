@@ -376,11 +376,11 @@ pub fn reconstruct_at(trades: &[WalletTrade], as_of: DateTime<Utc>) -> Historica
     stats
 }
 
-fn median(values: &mut Vec<Decimal>) -> Decimal {
+fn median(values: &mut [Decimal]) -> Decimal {
     if values.is_empty() {
         return Decimal::ZERO;
     }
-    values.sort_by(|a, b| a.cmp(b));
+    values.sort();
     let mid = values.len() / 2;
     if values.len() % 2 == 1 {
         values[mid]
