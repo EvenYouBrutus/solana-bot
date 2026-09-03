@@ -65,6 +65,7 @@ impl CandidateCollector {
                 Ok(c) => {
                     if let Some(reason) = self.validate(&c, now, max_data_age_secs) {
                         tracing::warn!(mint = %c.mint, %reason, "candidate rejected");
+                        self.seen.insert(c.mint.clone());
                         continue;
                     }
                     if self.seen.contains(&c.mint) {

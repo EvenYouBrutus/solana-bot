@@ -948,14 +948,32 @@ async fn tick(
         let _ = reason;
     }
 
+    // Clear candidates from previous tick so only fresh candidates are processed.
+    state.candidates.clear();
+
     // 1. Ingest candidates from the verified feed using the collector.
+    // In normal Paper mode with wallet_monitor enabled, the JSONL feed is NOT
+    // the candidate source — the wallet monitor is. Only read JSONL for replay
+    // mode or when wallet_monitor is disabled.
+    let has_wallet_monitor = config.wallet_monitor.enabled;
     let feed_path = config
         .runtime
         .replay_dataset_path
         .as_deref()
-        .or(config.runtime.signal_feed_path.as_deref())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            if !has_wallet_monitor {
+                config
+                    .runtime
+                    .signal_feed_path
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            }
+        });
     if let Some(path) = feed_path {
+        tracing::info!(path = %path, "ingesting candidates from JSONL feed");
         let new_candidates =
             state
                 .collector
@@ -1000,6 +1018,7 @@ async fn tick(
     if let Some(ref mut wm) = state.wallet_monitor {
         match wm.tick().await {
             Ok(wm_candidates) => {
+                let count = wm_candidates.len();
                 for c in &wm_candidates {
                     let _ = store.set_last_liquidity(&c.mint, c.market.liquidity_usd);
                     let sol_price = config.economics.sol_price_usd.unwrap_or(dec!(150));
@@ -1032,12 +1051,13 @@ async fn tick(
                         observed_at: now,
                     });
                 }
-                let count = wm_candidates.len();
                 for c in wm_candidates {
                     state.candidates.insert(c.mint.clone(), c);
                 }
                 if count > 0 {
                     tracing::info!(count = count, "wallet monitor produced new candidates");
+                } else {
+                    tracing::info!("waiting for monitored wallet activity");
                 }
             }
             Err(e) => {
@@ -1067,15 +1087,18 @@ async fn tick(
         tracing::debug!("kill switch latched; skipping entries");
     } else if entries_blocked_by(store)? {
         tracing::warn!("unreconciled orders exist; refusing new entries");
-    } else if config
-        .runtime
-        .signal_feed_path
-        .as_deref()
-        .unwrap_or_default()
-        .is_empty()
+    } else if !config.wallet_monitor.enabled
+        && config
+            .runtime
+            .signal_feed_path
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
         && !config.runtime.collector.enabled
     {
-        tracing::debug!("no signal feed and no collector configured; no entries");
+        tracing::debug!(
+            "no signal feed, no collector, and no wallet monitor configured; no entries"
+        );
     } else {
         process_entries(deps, state).await?;
     }
@@ -1189,6 +1212,7 @@ async fn process_exits(deps: &SessionDeps, state: &mut SessionState) -> Result<(
         ) else {
             continue;
         };
+        tracing::info!(mint=%mint, reason=%reason, mark=%mark, "paper exit triggered");
         attempt_exit(deps, state, &mint, remaining, reason.as_str(), false).await?;
     }
     Ok(())
@@ -1287,6 +1311,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
     let store = &deps.store;
     let now = Utc::now();
     let mints: Vec<String> = state.candidates.keys().cloned().collect();
+    tracing::info!(count = mints.len(), "evaluating candidates for entry");
     for mint in mints {
         let Some(c) = state.candidates.get(&mint).cloned() else {
             continue;
@@ -1333,6 +1358,11 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             .iter()
             .filter(|w| w.updated_at <= c.market.observed_at)
             .collect();
+        tracing::info!(
+            mint = %mint,
+            wallets = wallets.len(),
+            "consensus state evaluated"
+        );
         let signal = match evaluate_signal(config, &mint, &wallets, &c.market, &c.safety, &expected)
         {
             StrategyDecision::Accepted(s) => s,
@@ -1415,7 +1445,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         let mut placed = order.clone();
         placed.transition(OrderState::Submitted).ok();
         store.update_order(&placed)?;
-        tracing::info!(order_id=%order.id, mint=%mint, position_usd=%c.position_usd, qty_in=c.input_amount, expected_out=quote.output_amount, impact_bps=quote.price_impact_bps, "entry order submitted");
+        tracing::info!(order_id=%order.id, mint=%mint, position_usd=%c.position_usd, qty_in=c.input_amount, expected_out=quote.output_amount, impact_bps=quote.price_impact_bps, "paper entry submitted");
         let request = ExecutionRequest {
             order_id: order.id.clone(),
             quote,

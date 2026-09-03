@@ -3,8 +3,8 @@
 # One Solana base-58 address per line. Lines starting with `#` and blank
 # lines are ignored.
 #
-# These are placeholders. Replace them with real, profitable wallets you
-# have independently identified. The monitor:
+# IMPORTANT: Replace the placeholder below with REAL active Solana wallets.
+# The monitor:
 #   1. Reconstructs each wallet's historical trades (last 100 txs).
 #   2. Computes win-rate, PnL, drawdown, score, tier.
 #   3. Subscribes via logsSubscribe to every confirmed transaction.
@@ -12,6 +12,13 @@
 #
 # All addresses must be valid Solana base-58 (32..=44 chars, no 0/O/I/l).
 # Addresses that fail validation are logged and skipped.
+#
+# To find active wallets:
+#   - Use Solscan/Arkham to find profitable trading wallets
+#   - Look for wallets with frequent Jupiter/Raydium/Orca swaps
+#   - Check win rate and PnL on tracking platforms
 
-# Example: well-known high-volume Solana trading wallet.
-5kqEvH3gnx5HUYA8UmK3Za5gF3kRpY3oUg3TCY4tJhPb
+# PLACEHOLDER: Replace with real active wallet addresses.
+# Example format (replace these with actual base58 addresses):
+# 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU
+# 9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM

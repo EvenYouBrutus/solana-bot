@@ -57,7 +57,7 @@ allowed_program_ids = []
 sqlite_path = "state/paper.sqlite3"
 
 [runtime]
-signal_feed_path = "config/candidates.jsonl"
+signal_feed_path = ""
 poll_interval_secs = 10
 paper_fill_haircut_bps = 25
 reconcile_interval_secs = 0
@@ -65,7 +65,7 @@ max_liquidity_age_secs = 300
 quote_cache_ttl_secs = 30
 
 [runtime.collector]
-enabled = true
+enabled = false
 websocket_endpoints = []
 replay_mode = false
 

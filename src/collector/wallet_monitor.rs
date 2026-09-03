@@ -193,6 +193,7 @@ pub struct WalletMonitor {
     accumulators: HashMap<String, WalletAccumulator>,
     wallet_tracker: WalletTracker,
     seen_mints: HashSet<String>,
+    offered_mints: HashSet<String>,
     position_usd: Decimal,
     consensus_window_secs: u64,
 }
@@ -224,6 +225,7 @@ impl WalletMonitor {
             accumulators: HashMap::new(),
             wallet_tracker: WalletTracker::new(SmartMoneyThresholds::default()),
             seen_mints: HashSet::new(),
+            offered_mints: HashSet::new(),
             position_usd,
             consensus_window_secs,
         };
@@ -245,11 +247,19 @@ impl WalletMonitor {
     }
 
     async fn rebuild_wallet_history(&mut self, wallet: &str) -> Result<(), anyhow::Error> {
+        tracing::info!(wallet = %wallet, "rebuilding wallet history from RPC");
+
         let sigs: Vec<crate::data::rpc::SignatureEntry> = self
             .rpc
             .signatures_for_address(wallet, MAX_SIGNATURES_PER_WALLET)
             .await
             .map_err(|e| anyhow::anyhow!("signatures RPC failed: {e}"))?;
+
+        tracing::info!(
+            wallet = %wallet,
+            signatures = sigs.len(),
+            "wallet history signatures fetched"
+        );
 
         let mut processed = HashSet::new();
         let mut accumulator = WalletAccumulator::new();
@@ -337,6 +347,8 @@ impl WalletMonitor {
         let mut new_candidates = Vec::new();
         let now = Utc::now();
 
+        tracing::info!(wallets = self.wallets.len(), "wallet polling started");
+
         for wallet in self.wallets.clone() {
             if let Err(e) = self.poll_wallet(&wallet, &mut new_candidates, now).await {
                 tracing::debug!(
@@ -347,6 +359,11 @@ impl WalletMonitor {
             }
         }
 
+        tracing::info!(
+            candidates = new_candidates.len(),
+            "wallet monitor tick complete"
+        );
+
         Ok(new_candidates)
     }
 
@@ -356,16 +373,32 @@ impl WalletMonitor {
         new_candidates: &mut Vec<CandidateInput>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), anyhow::Error> {
+        tracing::info!(wallet = %wallet, "polling wallet for new signatures");
+
         let sigs: Vec<crate::data::rpc::SignatureEntry> = self
             .rpc
             .signatures_for_address(wallet, 50)
             .await
             .map_err(|e| anyhow::anyhow!("signatures RPC: {e}"))?;
 
+        tracing::info!(
+            wallet = %wallet,
+            signatures = sigs.len(),
+            "signatures fetched"
+        );
+
+        if sigs.is_empty() {
+            tracing::info!(
+                wallet = %wallet,
+                "no signatures found for wallet; wallet may have no recent activity"
+            );
+        }
+
         let sol_price = self.config.economics.sol_price_usd.unwrap_or(dec!(150));
 
         let mut tx_count = 0usize;
         let mut swaps_this_tick: Vec<SwapRecord> = Vec::new();
+        let mut new_mints_this_tick: HashSet<String> = HashSet::new();
 
         for sig in &sigs {
             if sig.err.is_some() {
@@ -409,12 +442,21 @@ impl WalletMonitor {
                 ));
                 match swap.direction {
                     SwapDirection::Buy => {
+                        new_mints_this_tick.insert(swap.output_mint.clone());
                         self.seen_mints.insert(swap.output_mint.clone());
                     }
                     SwapDirection::Sell => {}
                 }
             }
         }
+
+        tracing::info!(
+            wallet = %wallet,
+            new_swaps = swaps_this_tick.len(),
+            new_mints = new_mints_this_tick.len(),
+            transactions_fetched = tx_count,
+            "swaps parsed from wallet"
+        );
 
         for (
             ref _wallet_addr,
@@ -480,12 +522,15 @@ impl WalletMonitor {
             self.wallet_tracker.upsert(stats);
         }
 
-        let mints_to_check: Vec<String> = self.seen_mints.iter().cloned().collect();
-        for mint in mints_to_check {
-            if new_candidates.iter().any(|c| c.mint == mint) {
+        for mint in &new_mints_this_tick {
+            if self.offered_mints.contains(mint) {
+                tracing::debug!(
+                    mint = %mint,
+                    "mint already offered as candidate; skipping"
+                );
                 continue;
             }
-            self.check_and_build_candidate(&mint, new_candidates, now)
+            self.check_and_build_candidate(mint, new_candidates, now)
                 .await;
         }
 
@@ -509,6 +554,12 @@ impl WalletMonitor {
         );
 
         if consensus_wallets.len() < self.config.strategy.min_consensus_wallets {
+            tracing::debug!(
+                mint = %mint,
+                wallets = consensus_wallets.len(),
+                required = self.config.strategy.min_consensus_wallets,
+                "insufficient consensus wallets for candidate"
+            );
             return;
         }
 
@@ -527,11 +578,11 @@ impl WalletMonitor {
         {
             Ok(Some(s)) => s,
             Ok(None) => {
-                tracing::debug!(mint = %mint, "token safety data unavailable; skipping");
+                tracing::info!(mint = %mint, "token safety data unavailable; candidate rejected");
                 return;
             }
             Err(e) => {
-                tracing::debug!(mint = %mint, error = %e, "token safety fetch failed; skipping");
+                tracing::info!(mint = %mint, error = %e, "token safety fetch failed; candidate rejected");
                 return;
             }
         };
@@ -561,11 +612,11 @@ impl WalletMonitor {
         {
             Ok(Some(m)) => m,
             Ok(None) => {
-                tracing::debug!(mint = %mint, "market snapshot unavailable; skipping");
+                tracing::info!(mint = %mint, "market snapshot unavailable; candidate rejected");
                 return;
             }
             Err(e) => {
-                tracing::debug!(mint = %mint, error = %e, "market snapshot fetch failed; skipping");
+                tracing::info!(mint = %mint, error = %e, "market snapshot fetch failed; candidate rejected");
                 return;
             }
         };
@@ -609,7 +660,14 @@ impl WalletMonitor {
             costs: cost_model,
         };
 
+        tracing::info!(
+            mint = %mint,
+            position_usd = %self.position_usd,
+            "candidate created"
+        );
+
         self.seen_mints.insert(mint.to_string());
+        self.offered_mints.insert(mint.to_string());
         new_candidates.push(candidate);
     }
 }

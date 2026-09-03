@@ -200,6 +200,12 @@ impl RpcPool {
         address: &str,
         limit: u32,
     ) -> Result<Vec<SignatureEntry>, RpcError> {
+        tracing::info!(
+            address = %address,
+            limit = limit,
+            endpoints = ?self.endpoints.iter().map(|e| &e[..50.min(e.len())]).collect::<Vec<_>>(),
+            "calling getSignaturesForAddress"
+        );
         let v = self
             .call(
                 "getSignaturesForAddress",
@@ -210,6 +216,11 @@ impl RpcPool {
             .value
             .as_array()
             .ok_or_else(|| RpcError::Invalid("missing signatures array".into()))?;
+        tracing::info!(
+            address = %address,
+            returned = entries.len(),
+            "getSignaturesForAddress response received"
+        );
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             let signature = e["signature"]
