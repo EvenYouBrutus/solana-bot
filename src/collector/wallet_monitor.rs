@@ -17,16 +17,17 @@ const MAX_SIGNATURES_PER_WALLET: u32 = 100;
 const MAX_TRANSACTIONS_PER_TICK: usize = 10;
 
 type SwapRecord = (
-    String,
-    SwapDirection,
-    String,
-    u64,
-    u64,
-    u8,
-    u8,
-    String,
-    i64,
-    String,
+    String,        // wallet
+    SwapDirection, // direction
+    String,        // input_mint
+    String,        // output_mint
+    u64,           // input_amount
+    u64,           // output_amount
+    u8,            // input_decimals
+    u8,            // output_decimals
+    String,        // dex
+    i64,           // block_time
+    String,        // signature
 );
 
 #[allow(dead_code)]
@@ -253,6 +254,8 @@ impl WalletMonitor {
         let mut processed = HashSet::new();
         let mut accumulator = WalletAccumulator::new();
         let sol_price = self.config.economics.sol_price_usd.unwrap_or(dec!(150));
+        let mut parsed = 0u32;
+        let mut skipped = 0u32;
 
         for sig in &sigs {
             if sig.err.is_some() {
@@ -262,10 +265,14 @@ impl WalletMonitor {
 
             let tx = match self.rpc.transaction(&sig.signature).await {
                 Ok(Some(t)) => t,
-                _ => continue,
+                _ => {
+                    skipped += 1;
+                    continue;
+                }
             };
 
             if let Some(swap) = parse_swap_from_transaction(&tx, wallet) {
+                parsed += 1;
                 let ts =
                     chrono::DateTime::from_timestamp(swap.block_time, 0).unwrap_or_else(Utc::now);
 
@@ -288,17 +295,17 @@ impl WalletMonitor {
                         self.seen_mints.insert(swap.output_mint);
                     }
                     SwapDirection::Sell => {
+                        let sol_out = Decimal::from(swap.output_amount)
+                            / Decimal::from(10u64.pow(swap.output_decimals as u32));
                         self.wallet_tracker.observe(WalletTradeObservation {
                             wallet: wallet.to_string(),
                             mint: swap.input_mint.clone(),
                             side: Side::Sell,
-                            notional_usd: input_sol * sol_price,
+                            notional_usd: sol_out * sol_price,
                             observed_at: ts,
                             received_at: Utc::now(),
                             signature: swap.signature.clone(),
                         });
-                        let sol_out = Decimal::from(swap.output_amount)
-                            / Decimal::from(10u64.pow(swap.output_decimals as u32));
                         accumulator.record_sell(&swap.input_mint, output_tokens, sol_out, ts);
                     }
                 }
@@ -309,6 +316,15 @@ impl WalletMonitor {
         self.accumulators.insert(wallet.to_string(), accumulator);
         self.processed_sigs
             .insert(wallet.to_string(), processed.clone());
+
+        tracing::info!(
+            wallet = %wallet,
+            signatures = sigs.len(),
+            parsed_swaps = parsed,
+            rpc_skipped = skipped,
+            completed_trades = stats.trades,
+            "wallet history rebuilt"
+        );
 
         if stats.trades > 0 {
             self.wallet_tracker.upsert(stats);
@@ -381,6 +397,7 @@ impl WalletMonitor {
                 swaps_this_tick.push((
                     swap.wallet.clone(),
                     swap.direction.clone(),
+                    swap.input_mint.clone(),
                     swap.output_mint.clone(),
                     swap.input_amount,
                     swap.output_amount,
@@ -402,6 +419,7 @@ impl WalletMonitor {
         for (
             ref _wallet_addr,
             direction,
+            input_mint,
             output_mint,
             input_amount,
             output_amount,
@@ -438,9 +456,9 @@ impl WalletMonitor {
                         / Decimal::from(10u64.pow(output_decimals as u32));
                     self.wallet_tracker.observe(WalletTradeObservation {
                         wallet: wallet.to_string(),
-                        mint: output_mint.clone(),
+                        mint: input_mint.clone(),
                         side: Side::Sell,
-                        notional_usd: input_sol * sol_price,
+                        notional_usd: sol_out * sol_price,
                         observed_at: ts,
                         received_at: now,
                         signature: signature.clone(),
@@ -448,7 +466,7 @@ impl WalletMonitor {
                     self.accumulators
                         .entry(wallet.to_string())
                         .or_insert_with(WalletAccumulator::new)
-                        .record_sell(&output_mint, output_tokens, sol_out, ts);
+                        .record_sell(&input_mint, output_tokens, sol_out, ts);
                 }
             }
         }

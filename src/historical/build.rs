@@ -555,6 +555,6 @@ mod tests {
         let start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         let end = Utc.timestamp_opt(1_700_000_900, 0).unwrap();
         let grid = compute_signal_grid(start, end, 3);
-        assert!(grid.len() >= 1, "grid must have at least one entry");
+        assert!(!grid.is_empty(), "grid must have at least one entry");
     }
 }

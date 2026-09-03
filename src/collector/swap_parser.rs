@@ -96,7 +96,7 @@ fn detect_dex(account_keys: &[Value], instructions: &Value) -> String {
     "unknown".to_string()
 }
 
-const MIN_SOL_SWAP_LAMPORTS: i128 = 10_000;
+const DUST_LAMPORTS: u64 = 1_000;
 
 /// Parse a `getTransaction` response and detect a swap for the given wallet.
 ///
@@ -166,68 +166,98 @@ pub fn parse_swap_from_transaction(tx: &Value, wallet: &str) -> Option<ParsedSwa
     let instructions = &tx["transaction"]["message"]["instructions"];
     let dex = detect_dex(account_keys, instructions);
 
-    if total_sol_spent > MIN_SOL_SWAP_LAMPORTS && gained.len() == 1 && lost.is_empty() {
-        let (mint, amount, decimals) = gained.remove(0);
-        return Some(ParsedSwap {
-            wallet: wallet.to_string(),
-            input_mint: WSOL_MINT.to_string(),
-            output_mint: mint,
-            input_amount: total_sol_spent as u64,
-            output_amount: amount,
-            input_decimals: 9,
-            output_decimals: decimals,
-            direction: SwapDirection::Buy,
-            fee_lamports: fee,
-            dex,
-            slot,
-            block_time,
-            signature,
-        });
+    // CASE 1: BUY (SOL → token). Wallet spent SOL and gained at least one token.
+    // Real-world swaps often have dust residuals from routing (tiny amounts of
+    // intermediate tokens), so we only require at least one significant gain.
+    if total_sol_spent > MIN_SWAP_LAMPORTS && !gained.is_empty() {
+        // Prefer the largest non-dust gain; fall back to the largest overall.
+        let primary = gained
+            .iter()
+            .filter(|(_, amt, _)| *amt >= DUST_LAMPORTS)
+            .max_by_key(|(_, amt, _)| *amt)
+            .or_else(|| gained.iter().max_by_key(|(_, amt, _)| *amt));
+        if let Some((mint, amount, decimals)) = primary.cloned() {
+            return Some(ParsedSwap {
+                wallet: wallet.to_string(),
+                input_mint: WSOL_MINT.to_string(),
+                output_mint: mint,
+                input_amount: total_sol_spent as u64,
+                output_amount: amount,
+                input_decimals: 9,
+                output_decimals: decimals,
+                direction: SwapDirection::Buy,
+                fee_lamports: fee,
+                dex,
+                slot,
+                block_time,
+                signature,
+            });
+        }
     }
 
-    if total_sol_spent < -MIN_SWAP_LAMPORTS && lost.len() == 1 && gained.is_empty() {
-        let (mint, amount, decimals) = lost.remove(0);
-        return Some(ParsedSwap {
-            wallet: wallet.to_string(),
-            input_mint: mint,
-            output_mint: WSOL_MINT.to_string(),
-            input_amount: amount,
-            output_amount: (-total_sol_spent) as u64,
-            input_decimals: decimals,
-            output_decimals: 9,
-            direction: SwapDirection::Sell,
-            fee_lamports: fee,
-            dex,
-            slot,
-            block_time,
-            signature,
-        });
+    // CASE 2: SELL (token → SOL). Wallet lost at least one token and received SOL.
+    if total_sol_spent < -MIN_SWAP_LAMPORTS && !lost.is_empty() {
+        let primary = lost
+            .iter()
+            .filter(|(_, amt, _)| *amt >= DUST_LAMPORTS)
+            .max_by_key(|(_, amt, _)| *amt)
+            .or_else(|| lost.iter().max_by_key(|(_, amt, _)| *amt));
+        if let Some((mint, amount, decimals)) = primary.cloned() {
+            return Some(ParsedSwap {
+                wallet: wallet.to_string(),
+                input_mint: mint,
+                output_mint: WSOL_MINT.to_string(),
+                input_amount: amount,
+                output_amount: (-total_sol_spent) as u64,
+                input_decimals: decimals,
+                output_decimals: 9,
+                direction: SwapDirection::Sell,
+                fee_lamports: fee,
+                dex,
+                slot,
+                block_time,
+                signature,
+            });
+        }
     }
 
+    // CASE 3: Token-to-token swap (negligible SOL change).
     if !lost.is_empty() && !gained.is_empty() && total_sol_spent.abs() < MIN_SWAP_LAMPORTS {
-        let input = &lost[0];
-        let output = &gained[0];
-        return Some(ParsedSwap {
-            wallet: wallet.to_string(),
-            input_mint: input.0.clone(),
-            output_mint: output.0.clone(),
-            input_amount: input.1,
-            output_amount: output.1,
-            input_decimals: input.2,
-            output_decimals: output.2,
-            direction: if input.0 == WSOL_MINT {
-                SwapDirection::Buy
-            } else if output.0 == WSOL_MINT {
-                SwapDirection::Sell
-            } else {
-                SwapDirection::Buy
-            },
-            fee_lamports: fee,
-            dex,
-            slot,
-            block_time,
-            signature,
-        });
+        let primary_lost = lost
+            .iter()
+            .filter(|(_, amt, _)| *amt >= DUST_LAMPORTS)
+            .max_by_key(|(_, amt, _)| *amt)
+            .or_else(|| lost.iter().max_by_key(|(_, amt, _)| *amt));
+        let primary_gained = gained
+            .iter()
+            .filter(|(_, amt, _)| *amt >= DUST_LAMPORTS)
+            .max_by_key(|(_, amt, _)| *amt)
+            .or_else(|| gained.iter().max_by_key(|(_, amt, _)| *amt));
+        if let (Some(input), Some(output)) = (primary_lost, primary_gained) {
+            let input = input.clone();
+            let output = output.clone();
+            return Some(ParsedSwap {
+                wallet: wallet.to_string(),
+                input_mint: input.0.clone(),
+                output_mint: output.0.clone(),
+                input_amount: input.1,
+                output_amount: output.1,
+                input_decimals: input.2,
+                output_decimals: output.2,
+                direction: if input.0 == WSOL_MINT {
+                    SwapDirection::Buy
+                } else if output.0 == WSOL_MINT {
+                    SwapDirection::Sell
+                } else {
+                    SwapDirection::Buy
+                },
+                fee_lamports: fee,
+                dex,
+                slot,
+                block_time,
+                signature,
+            });
+        }
     }
 
     None
@@ -335,5 +365,121 @@ mod tests {
             "TokenB111111111111111111111111111111111111"
         );
         assert_eq!(swap.dex, "raydium_amm");
+    }
+
+    #[test]
+    fn detects_buy_with_dust_residual() {
+        let wallet = "Wallet111111111111111111111111111111111111";
+        let tx = json!({
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        {"pubkey": wallet, "signer": true, "writable": true},
+                        {"pubkey": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "signer": false, "writable": false}
+                    ],
+                    "instructions": [
+                        {"programIdIndex": 1, "accounts": [0], "data": "AA"}
+                    ]
+                },
+                "signatures": ["sig333"]
+            },
+            "meta": {
+                "err": null,
+                "fee": 5000,
+                "preBalances": [1_000_005_000, 0],
+                "postBalances": [990_000_000, 0],
+                "preTokenBalances": [],
+                "postTokenBalances": [
+                    {"accountIndex": 2, "mint": "MainToken1111111111111111111111111111111", "owner": wallet, "uiTokenAmount": {"amount": "5000000", "decimals": 6, "uiAmount": 5.0, "uiAmountString": "5"}},
+                    {"accountIndex": 3, "mint": "DustToken111111111111111111111111111111111", "owner": wallet, "uiTokenAmount": {"amount": "100", "decimals": 6, "uiAmount": 0.0001, "uiAmountString": "0.0001"}}
+                ]
+            },
+            "blockTime": 1700000000i64,
+            "slot": 300
+        });
+        let swap = parse_swap_from_transaction(&tx, wallet).unwrap();
+        assert_eq!(swap.direction, SwapDirection::Buy);
+        assert_eq!(swap.output_mint, "MainToken1111111111111111111111111111111");
+        assert_eq!(swap.output_amount, 5_000_000);
+    }
+
+    #[test]
+    fn detects_sell_swap() {
+        let wallet = "Wallet111111111111111111111111111111111111";
+        let tx = json!({
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        {"pubkey": wallet, "signer": true, "writable": true},
+                        {"pubkey": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "signer": false, "writable": false}
+                    ],
+                    "instructions": [
+                        {"programIdIndex": 1, "accounts": [0], "data": "AA"}
+                    ]
+                },
+                "signatures": ["sig444"]
+            },
+            "meta": {
+                "err": null,
+                "fee": 5000,
+                "preBalances": [990_000_000, 0],
+                "postBalances": [999_995_000, 0],
+                "preTokenBalances": [
+                    {"accountIndex": 2, "mint": "SellToken111111111111111111111111111111111", "owner": wallet, "uiTokenAmount": {"amount": "5000000", "decimals": 6, "uiAmount": 5.0, "uiAmountString": "5"}}
+                ],
+                "postTokenBalances": []
+            },
+            "blockTime": 1700000000i64,
+            "slot": 400
+        });
+        let swap = parse_swap_from_transaction(&tx, wallet).unwrap();
+        assert_eq!(swap.direction, SwapDirection::Sell);
+        assert_eq!(
+            swap.input_mint,
+            "SellToken111111111111111111111111111111111"
+        );
+        assert_eq!(swap.input_amount, 5_000_000);
+        assert_eq!(swap.output_mint, WSOL_MINT);
+    }
+
+    #[test]
+    fn detects_sell_with_dust_residual() {
+        let wallet = "Wallet111111111111111111111111111111111111";
+        let tx = json!({
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        {"pubkey": wallet, "signer": true, "writable": true},
+                        {"pubkey": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "signer": false, "writable": false}
+                    ],
+                    "instructions": [
+                        {"programIdIndex": 1, "accounts": [0], "data": "AA"}
+                    ]
+                },
+                "signatures": ["sig555"]
+            },
+            "meta": {
+                "err": null,
+                "fee": 5000,
+                "preBalances": [990_000_000, 0],
+                "postBalances": [999_995_000, 0],
+                "preTokenBalances": [
+                    {"accountIndex": 2, "mint": "SellToken111111111111111111111111111111111", "owner": wallet, "uiTokenAmount": {"amount": "5000000", "decimals": 6, "uiAmount": 5.0, "uiAmountString": "5"}},
+                    {"accountIndex": 3, "mint": "DustToken111111111111111111111111111111111", "owner": wallet, "uiTokenAmount": {"amount": "50", "decimals": 6, "uiAmount": 0.00005, "uiAmountString": "0.00005"}}
+                ],
+                "postTokenBalances": [
+                    {"accountIndex": 3, "mint": "DustToken111111111111111111111111111111111", "owner": wallet, "uiTokenAmount": {"amount": "150", "decimals": 6, "uiAmount": 0.00015, "uiAmountString": "0.00015"}}
+                ]
+            },
+            "blockTime": 1700000000i64,
+            "slot": 500
+        });
+        let swap = parse_swap_from_transaction(&tx, wallet).unwrap();
+        assert_eq!(swap.direction, SwapDirection::Sell);
+        assert_eq!(
+            swap.input_mint,
+            "SellToken111111111111111111111111111111111"
+        );
+        assert_eq!(swap.input_amount, 5_000_000);
     }
 }
