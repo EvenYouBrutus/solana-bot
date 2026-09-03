@@ -991,6 +991,7 @@ sqlite_path = ":memory:"
             observed_at: ts,
             received_at: ts,
             slot: None,
+            price_impact_bps: None,
         }
     }
 

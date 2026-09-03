@@ -109,6 +109,7 @@ impl HistoricalSignalBuilder {
             observed_at: market_candle.timestamp,
             received_at: market_candle.timestamp,
             slot: None,
+            price_impact_bps: None,
         };
         let safety_field = SafetyProvider::to_token_safety(safety, safety.token_age_secs);
         let wallet_stats: Vec<WalletStats> = wallets

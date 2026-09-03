@@ -196,6 +196,7 @@ pub struct WalletMonitor {
     offered_mints: HashSet<String>,
     position_usd: Decimal,
     consensus_window_secs: u64,
+    wallet_poll_idx: usize,
 }
 
 impl WalletMonitor {
@@ -216,7 +217,7 @@ impl WalletMonitor {
         let position_usd = config.wallet_monitor.position_usd;
         let consensus_window_secs = config.wallet_monitor.consensus_window_secs;
 
-        let mut monitor = Self {
+        let monitor = Self {
             rpc,
             executor,
             config,
@@ -228,22 +229,14 @@ impl WalletMonitor {
             offered_mints: HashSet::new(),
             position_usd,
             consensus_window_secs,
+            wallet_poll_idx: 0,
         };
 
-        monitor.rebuild_all_wallet_stats().await;
+        // Skip blocking initial rebuild — start immediately, rebuild lazily
+        tracing::info!(
+            "skipping initial wallet history rebuild; wallets will rebuild on first tick"
+        );
         Ok(monitor)
-    }
-
-    async fn rebuild_all_wallet_stats(&mut self) {
-        for wallet in &self.wallets.clone() {
-            if let Err(e) = self.rebuild_wallet_history(wallet).await {
-                tracing::warn!(
-                    wallet = %wallet,
-                    error = %e,
-                    "failed to rebuild wallet history"
-                );
-            }
-        }
     }
 
     async fn rebuild_wallet_history(&mut self, wallet: &str) -> Result<(), anyhow::Error> {
@@ -267,6 +260,8 @@ impl WalletMonitor {
         let mut parsed = 0u32;
         let mut skipped = 0u32;
 
+        let mut first_diag_logged = false;
+
         for sig in &sigs {
             if sig.err.is_some() {
                 continue;
@@ -275,11 +270,67 @@ impl WalletMonitor {
 
             let tx = match self.rpc.transaction(&sig.signature).await {
                 Ok(Some(t)) => t,
-                _ => {
+                Ok(None) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        sig = %sig.signature,
+                        error = %e,
+                        "failed to fetch transaction"
+                    );
                     skipped += 1;
                     continue;
                 }
             };
+
+            if !first_diag_logged {
+                first_diag_logged = true;
+                let meta_has = tx.get("meta").is_some();
+                let err_has = tx
+                    .get("meta")
+                    .and_then(|m| m.get("err"))
+                    .map(|e| !e.is_null())
+                    .unwrap_or(true);
+                let account_keys = tx["transaction"]["message"]["accountKeys"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let pre_bal = tx["meta"]["preBalances"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let post_bal = tx["meta"]["postBalances"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let has_lookups = tx["transaction"]["message"]["addressTableLookups"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let pre_token = tx["meta"]["preTokenBalances"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let post_token = tx["meta"]["postTokenBalances"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                tracing::info!(
+                    wallet = %wallet,
+                    sig = %sig.signature,
+                    meta_exists = meta_has,
+                    meta_err = err_has,
+                    account_keys_count = account_keys,
+                    pre_balances_count = pre_bal,
+                    post_balances_count = post_bal,
+                    lookup_tables = has_lookups,
+                    pre_token_balances = pre_token,
+                    post_token_balances = post_token,
+                    "diagnostic: first transaction structure"
+                );
+            }
 
             if let Some(swap) = parse_swap_from_transaction(&tx, wallet) {
                 parsed += 1;
@@ -343,13 +394,29 @@ impl WalletMonitor {
         Ok(())
     }
 
+    /// Number of wallets to poll per tick (round-robin for large wallet lists).
+    const WALLETS_PER_TICK: usize = 20;
+
     pub async fn tick(&mut self) -> Result<Vec<CandidateInput>, anyhow::Error> {
         let mut new_candidates = Vec::new();
         let now = Utc::now();
 
-        tracing::info!(wallets = self.wallets.len(), "wallet polling started");
+        let total = self.wallets.len();
+        let batch = Self::WALLETS_PER_TICK.min(total);
 
-        for wallet in self.wallets.clone() {
+        let start = self.wallet_poll_idx % total;
+        let indices: Vec<usize> = (start..start + batch).map(|i| i % total).collect();
+        self.wallet_poll_idx = (start + batch) % total;
+
+        tracing::info!(
+            wallets = total,
+            polling_batch = batch,
+            from_idx = start,
+            "wallet polling started"
+        );
+
+        for &idx in &indices {
+            let wallet = self.wallets[idx].clone();
             if let Err(e) = self.poll_wallet(&wallet, &mut new_candidates, now).await {
                 tracing::debug!(
                     wallet = %wallet,
@@ -373,6 +440,18 @@ impl WalletMonitor {
         new_candidates: &mut Vec<CandidateInput>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), anyhow::Error> {
+        if !self.processed_sigs.contains_key(wallet) {
+            tracing::info!(wallet = %wallet, "first poll: rebuilding wallet history");
+            if let Err(e) = self.rebuild_wallet_history(wallet).await {
+                tracing::warn!(
+                    wallet = %wallet,
+                    error = %e,
+                    "initial rebuild failed; will retry next tick"
+                );
+                return Ok(());
+            }
+        }
+
         tracing::info!(wallet = %wallet, "polling wallet for new signatures");
 
         let sigs: Vec<crate::data::rpc::SignatureEntry> = self
@@ -569,7 +648,7 @@ impl WalletMonitor {
             "consensus detected for token"
         );
 
-        let safety = match fetch_token_safety(
+        let mut safety = match fetch_token_safety(
             &self.rpc,
             mint,
             self.config.strategy.min_token_age_secs,
@@ -599,7 +678,7 @@ impl WalletMonitor {
             .parse::<u64>()
             .unwrap_or(4_000_000);
 
-        let market = match fetch_market_snapshot(
+        let (market, price_impact_bps) = match fetch_market_snapshot(
             &self.rpc,
             self.executor.as_ref(),
             mint,
@@ -621,6 +700,11 @@ impl WalletMonitor {
             }
         };
 
+        // Jupiter quote confirmed the route exists and the token is sellable
+        // through the DEX aggregation. Mark these safety fields as verified.
+        safety.sellable = Some(true);
+        safety.route_available = Some(true);
+
         let avg_return: Decimal = consensus_wallets
             .iter()
             .map(|w| w.avg_return_pct)
@@ -635,7 +719,7 @@ impl WalletMonitor {
                 avg_priority_fee_usd: dec!(0.0004),
                 avg_swap_fee_bps: dec!(30),
                 avg_slippage_bps: dec!(50),
-                avg_price_impact_bps: dec!(20),
+                avg_price_impact_bps: Decimal::from(price_impact_bps),
                 failed_tx_rate: dec!(0.05),
                 avg_failed_tx_cost_usd: dec!(0.002),
                 assumed_win_loss_ratio: dec!(2),

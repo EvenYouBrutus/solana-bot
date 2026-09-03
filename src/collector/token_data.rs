@@ -62,9 +62,10 @@ pub async fn fetch_token_safety(
         return Ok(None);
     };
 
-    let sellable = Some(true);
-    let route_available = Some(true);
-
+    // sellable and route_available are confirmed by the fact that we successfully
+    // fetched a Jupiter quote for this mint during candidate generation.
+    // All other fields are unknown from the chain alone; we do not mark them as
+    // safe when we cannot verify them.
     let now = Utc::now();
     Ok(Some(TokenSafety {
         mint_authority_present,
@@ -72,8 +73,8 @@ pub async fn fetch_token_safety(
         holder_top10_pct,
         token_age_secs,
         liquidity_locked_or_burned: None,
-        sellable,
-        route_available,
+        sellable: None,
+        route_available: None,
         creator_suspicious: None,
         abnormal_activity: None,
         liquidity_change_pct: None,
@@ -82,6 +83,8 @@ pub async fn fetch_token_safety(
 }
 
 /// Fetch real market snapshot using a Jupiter quote for pricing + RPC data.
+/// Liquidity is estimated from Jupiter's price impact: if a trade of size X
+/// causes Y% price impact, the effective pool liquidity is approximately X/Y.
 pub async fn fetch_market_snapshot(
     rpc: &RpcPool,
     executor: &dyn crate::execution::Executor,
@@ -90,7 +93,7 @@ pub async fn fetch_market_snapshot(
     sol_decimals: u8,
     input_amount: u64,
     slippage_bps: u16,
-) -> Result<Option<MarketSnapshot>, anyhow::Error> {
+) -> Result<Option<(MarketSnapshot, u32)>, anyhow::Error> {
     let quote = executor
         .quote(WSOL_MINT, mint, input_amount, slippage_bps)
         .await
@@ -110,20 +113,35 @@ pub async fn fetch_market_snapshot(
     }
 
     let price_usd = sol_spent * sol_price_usd / tokens_received;
-    let liquidity_usd = estimate_liquidity(quote.output_amount, sol_price_usd);
+
+    // Real liquidity estimation from Jupiter's price impact.
+    // price_impact_bps = (trade_size_usd / pool_liquidity_usd) * 10000
+    // => pool_liquidity_usd = (trade_size_usd * 10000) / price_impact_bps
+    let price_impact_bps = quote.price_impact_bps;
+    let trade_size_usd = sol_spent * sol_price_usd;
+    let liquidity_usd = if price_impact_bps > 0 {
+        (trade_size_usd * dec!(10000) / Decimal::from(price_impact_bps)).round_dp(2)
+    } else {
+        // Zero price impact means very deep liquidity; use a large but bounded estimate.
+        dec!(10_000_000)
+    };
 
     let now = Utc::now();
-    Ok(Some(MarketSnapshot {
-        mint: mint.to_string(),
-        price_usd,
-        liquidity_usd,
-        volume_24h_usd: Decimal::ZERO,
-        volatility_pct: dec!(25),
-        buy_sell_imbalance: dec!(0.55),
-        observed_at: now,
-        received_at: now,
-        slot: None,
-    }))
+    Ok(Some((
+        MarketSnapshot {
+            mint: mint.to_string(),
+            price_usd,
+            liquidity_usd,
+            volume_24h_usd: Decimal::ZERO,
+            volatility_pct: Decimal::ZERO,
+            buy_sell_imbalance: Decimal::ZERO,
+            observed_at: now,
+            received_at: now,
+            slot: None,
+            price_impact_bps: Some(price_impact_bps),
+        },
+        price_impact_bps,
+    )))
 }
 
 async fn quote_mint_decimals(rpc: &RpcPool, mint: &str) -> Option<u8> {
@@ -132,21 +150,4 @@ async fn quote_mint_decimals(rpc: &RpcPool, mint: &str) -> Option<u8> {
         .ok()
         .flatten()
         .map(|i| i.decimals)
-}
-
-fn estimate_liquidity(output_atomic: u64, sol_price: Decimal) -> Decimal {
-    let output_sol = Decimal::from(output_atomic) / dec!(1_000_000_000);
-    (output_sol * sol_price * dec!(10)).min(dec!(1_000_000))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn estimate_liquidity_scales_output() {
-        let liq = estimate_liquidity(1_000_000_000, dec!(150));
-        assert!(liq > Decimal::ZERO);
-        assert!(liq <= dec!(1_000_000));
-    }
 }

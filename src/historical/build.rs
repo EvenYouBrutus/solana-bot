@@ -447,6 +447,7 @@ mod tests {
                 observed_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
                 received_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
                 slot: None,
+                price_impact_bps: None,
             },
             safety: crate::domain::token::TokenSafety {
                 mint_authority_present: false,

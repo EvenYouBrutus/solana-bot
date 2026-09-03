@@ -242,6 +242,7 @@ mod tests {
                 observed_at: ts,
                 received_at: ts,
                 slot: None,
+                price_impact_bps: None,
             },
             safety: TokenSafety {
                 mint_authority_present: false,

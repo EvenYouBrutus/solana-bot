@@ -12,6 +12,8 @@ pub struct MarketSnapshot {
     pub observed_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
     pub slot: Option<u64>,
+    #[serde(default)]
+    pub price_impact_bps: Option<u32>,
 }
 impl MarketSnapshot {
     pub fn age_seconds(&self, now: DateTime<Utc>) -> i64 {

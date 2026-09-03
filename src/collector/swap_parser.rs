@@ -78,8 +78,7 @@ fn parse_token_balances_for_owner(balances: &Value, wallet: &str) -> HashMap<Str
     result
 }
 
-fn detect_dex(account_keys: &[Value], instructions: &Value) -> String {
-    let key_strs: Vec<&str> = account_keys.iter().filter_map(extract_pubkey).collect();
+fn detect_dex_from_keys(key_strs: &[&str], instructions: &Value) -> String {
     if let Some(arr) = instructions.as_array() {
         for ix in arr {
             if let Some(idx) = ix["programIdIndex"].as_u64() {
@@ -119,9 +118,24 @@ pub fn parse_swap_from_transaction(tx: &Value, wallet: &str) -> Option<ParsedSwa
     let fee = meta["fee"].as_u64().unwrap_or(0);
 
     let account_keys = tx["transaction"]["message"]["accountKeys"].as_array()?;
-    let wallet_idx = account_keys
-        .iter()
-        .position(|k| extract_pubkey(k) == Some(wallet))?;
+
+    // For V0 transactions, preBalances/postBalances include resolved lookup
+    // table accounts that are NOT in accountKeys. Build the full list to get
+    // correct indices.
+    let mut all_account_keys: Vec<&str> = account_keys.iter().filter_map(extract_pubkey).collect();
+    if let Some(lookups) = tx["transaction"]["message"]["addressTableLookups"].as_array() {
+        for lookup in lookups {
+            if let Some(accounts) = lookup["accountKeys"].as_array() {
+                for key in accounts {
+                    if let Some(k) = extract_pubkey(key) {
+                        all_account_keys.push(k);
+                    }
+                }
+            }
+        }
+    }
+
+    let wallet_idx = all_account_keys.iter().position(|k| *k == wallet)?;
 
     let pre_sol = meta["preBalances"].as_array()?.get(wallet_idx)?.as_u64()?;
     let post_sol = meta["postBalances"].as_array()?.get(wallet_idx)?.as_u64()?;
@@ -164,7 +178,7 @@ pub fn parse_swap_from_transaction(tx: &Value, wallet: &str) -> Option<ParsedSwa
     let total_sol_spent = -native_sol_change - wsol_delta - fee as i128;
 
     let instructions = &tx["transaction"]["message"]["instructions"];
-    let dex = detect_dex(account_keys, instructions);
+    let dex = detect_dex_from_keys(&all_account_keys, instructions);
 
     // CASE 1: BUY (SOL → token). Wallet spent SOL and gained at least one token.
     // Real-world swaps often have dust residuals from routing (tiny amounts of

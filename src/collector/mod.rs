@@ -167,13 +167,19 @@ impl CandidateCollector {
             let market = MarketSnapshot {
                 mint: mint.to_string(),
                 price_usd: price_per_token,
-                liquidity_usd: estimate_liquidity(quote.output_amount, sol_price),
+                liquidity_usd: if quote.price_impact_bps > 0 {
+                    (input_value_usd * dec!(10000) / Decimal::from(quote.price_impact_bps))
+                        .round_dp(2)
+                } else {
+                    dec!(10_000_000)
+                },
                 volume_24h_usd: Decimal::ZERO,
-                volatility_pct: dec!(25),
-                buy_sell_imbalance: dec!(0.55),
+                volatility_pct: Decimal::ZERO,
+                buy_sell_imbalance: Decimal::ZERO,
                 observed_at: now,
                 received_at: now,
                 slot: None,
+                price_impact_bps: Some(quote.price_impact_bps),
             };
 
             if market.liquidity_usd < config.risk.min_liquidity_usd {
@@ -323,12 +329,6 @@ impl CandidateCollector {
     }
 }
 
-/// Estimate liquidity from quote output as a proxy for pool depth.
-fn estimate_liquidity(output_atomic: u64, sol_price: Decimal) -> Decimal {
-    let output_sol = Decimal::from(output_atomic) / dec!(1_000_000_000);
-    (output_sol * sol_price * dec!(10)).min(dec!(1_000_000))
-}
-
 impl Default for CandidateCollector {
     fn default() -> Self {
         Self::new()
@@ -362,6 +362,7 @@ mod tests {
                 observed_at,
                 received_at: observed_at,
                 slot: Some(300_000_000),
+                price_impact_bps: None,
             },
             safety: TokenSafety {
                 mint_authority_present: false,

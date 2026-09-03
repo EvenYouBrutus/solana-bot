@@ -415,6 +415,7 @@ mod tests {
                 observed_at,
                 received_at: observed_at,
                 slot: Some(300_000_000),
+                price_impact_bps: None,
             },
             safety: TokenSafety {
                 mint_authority_present: false,
