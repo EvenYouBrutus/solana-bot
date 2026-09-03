@@ -432,4 +432,139 @@ mod tests {
         assert!(p.is_open());
         assert!(p.trusted_remaining().is_none());
     }
+
+    // --- FIFO / multi-buy / multi-sell / partial-close / fee accounting ---
+
+    fn enter_at(portfolio: &mut Portfolio, token_out: u64, value_usd: Decimal, price: Decimal) {
+        let f = fill(1_000_000, token_out, value_usd, price);
+        portfolio
+            .apply_entry(
+                "T".into(),
+                "B".into(),
+                6,
+                9,
+                "pos-1".into(),
+                &f,
+                price,
+                "sig-1".into(),
+                cost_model(),
+            )
+            .unwrap();
+    }
+
+    fn exit_with(portfolio: &mut Portfolio, sold: u64, proceeds: Decimal, price: Decimal) {
+        let f = fill(sold, 1_000, proceeds, price);
+        let _ = portfolio.apply_exit("T", &f, "exit", Utc::now()).unwrap();
+    }
+
+    #[test]
+    fn multi_buy_aggregates_cost_basis() {
+        // BUY 100 tokens for $1.00 (price $0.01)
+        // BUY 80 tokens for $2.00 (price $0.025)
+        // Total: 180 tokens for $3.00, weighted avg price = 0.01666...
+        let mut pf = Portfolio::default();
+        enter_at(&mut pf, 100, dec!(1.0), dec!(0.01));
+        enter_at(&mut pf, 80, dec!(2.0), dec!(0.025));
+        let p = pf.position("T").unwrap();
+        assert_eq!(p.remaining_quantity_atomic, Some(180));
+        assert_eq!(p.entry_cost_usd, Some(dec!(3.0)));
+        // weighted entry price = $3.00 / 180
+        let expected = dec!(3.0) / Decimal::from(180);
+        assert_eq!(p.entry_price_usd, expected);
+    }
+
+    #[test]
+    fn partial_sell_across_lots_realizes_fifo_pnl() {
+        // BUY 100 @ $0.01 (cost $1.00)
+        // BUY 80  @ $0.025 (cost $2.00)
+        // Total 180, cost $3.00, avg price ~$0.01667
+        // SELL 90 @ $0.05 each → proceeds $4.50
+        // FIFO: 100@0.01 + 80@0.025 sold in order:
+        //   - 100@0.01 sold for 100*0.05=$5, cost $1, pnl $4
+        //   -   0@0.025 sold (covered all of lot1 and -10 from lot2)
+        // Wait: 90 sold = 100 from lot1, but we only have 100. So 100 from lot1
+        //   and 0 from lot2? No, 90 sold = 90 from lot1, leaving 10 from lot1 + 80 from lot2.
+        // Linear equivalent: cost_of_sold = $3 * 90/180 = $1.50
+        //                   pnl = $4.50 - $1.50 = $3.00
+        // (FIFO at constant price: same as linear)
+        let mut pf = Portfolio::default();
+        enter_at(&mut pf, 100, dec!(1.0), dec!(0.01));
+        enter_at(&mut pf, 80, dec!(2.0), dec!(0.025));
+        exit_with(&mut pf, 90, dec!(4.5), dec!(0.05));
+        let p = pf.position("T").unwrap();
+        assert_eq!(p.remaining_quantity_atomic, Some(90));
+        assert!(p.is_open());
+        assert_eq!(p.realized_pnl_usd, dec!(3.0));
+    }
+
+    #[test]
+    fn multi_sell_complete_closure_with_lots() {
+        // BUY 100 @ $0.01 (cost $1)
+        // BUY 80  @ $0.025 (cost $2)
+        // SELL 90  @ $0.05 (proceeds $4.5, pnl $3)
+        // SELL 90  @ $0.04 (proceeds $3.6, cost $1.5, pnl $2.1)
+        // SELL 0   -> no-op (skip)
+        // Total realized: $5.1
+        let mut pf = Portfolio::default();
+        enter_at(&mut pf, 100, dec!(1.0), dec!(0.01));
+        enter_at(&mut pf, 80, dec!(2.0), dec!(0.025));
+        exit_with(&mut pf, 90, dec!(4.5), dec!(0.05));
+        exit_with(&mut pf, 90, dec!(3.6), dec!(0.04));
+        let p = pf.position("T").unwrap();
+        assert_eq!(p.remaining_quantity_atomic, Some(0));
+        assert_eq!(p.state, PositionState::Closed);
+        assert_eq!(p.realized_pnl_usd, dec!(5.1));
+    }
+
+    #[test]
+    fn sell_larger_than_one_lot_but_within_total() {
+        // BUY 100 @ $0.01 (cost $1)
+        // BUY 80  @ $0.025 (cost $2)
+        // SELL 110 (across both lots, not closing).
+        //   Cost of 110 = $3 * 110/180 = $1.8333...
+        //   Proceeds @ $0.04 = $4.4 → pnl $2.5666...
+        let mut pf = Portfolio::default();
+        enter_at(&mut pf, 100, dec!(1.0), dec!(0.01));
+        enter_at(&mut pf, 80, dec!(2.0), dec!(0.025));
+        exit_with(&mut pf, 110, dec!(4.4), dec!(0.04));
+        let p = pf.position("T").unwrap();
+        assert_eq!(p.remaining_quantity_atomic, Some(70));
+        assert!(p.is_open());
+        let expected_pnl = dec!(4.4) - dec!(3.0) * Decimal::from(110) / Decimal::from(180);
+        assert_eq!(p.realized_pnl_usd, expected_pnl);
+    }
+
+    #[test]
+    fn partial_sell_fees_included_in_pnl() {
+        // BUY 100 @ $0.01 cost $1
+        // SELL 40 @ $0.05 proceeds $2, fees $0.10
+        // pnl = $2 - $0.40 - $0.10 = $1.50
+        let mut pf = Portfolio::default();
+        enter_at(&mut pf, 100, dec!(1.0), dec!(0.01));
+        let mut exit = fill(40, 1_000, dec!(2.0), dec!(0.05));
+        exit.fees_usd = dec!(0.10);
+        let out = pf.apply_exit("T", &exit, "partial", Utc::now()).unwrap();
+        assert_eq!(out.realized_pnl_usd, dec!(1.5));
+        assert!(!out.closed);
+        assert_eq!(
+            pf.position("T").unwrap().remaining_quantity_atomic,
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn reentry_aggregates_into_existing_position() {
+        // BUY 100 @ $0.01 (cost $1)
+        // SELL 30 @ $0.02 (proceeds $0.60, pnl $0.30)
+        // BUY 50 @ $0.03 (cost $1.50)
+        // Position should still be open with 120 tokens
+        let mut pf = Portfolio::default();
+        enter_at(&mut pf, 100, dec!(1.0), dec!(0.01));
+        exit_with(&mut pf, 30, dec!(0.6), dec!(0.02));
+        enter_at(&mut pf, 50, dec!(1.5), dec!(0.03));
+        let p = pf.position("T").unwrap();
+        assert_eq!(p.remaining_quantity_atomic, Some(120));
+        assert!(p.is_open());
+        assert_eq!(p.realized_pnl_usd, dec!(0.3));
+    }
 }

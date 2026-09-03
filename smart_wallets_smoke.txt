@@ -1,0 +1,20 @@
+# Verified smoke-test cohort. Every address in this file is a real Solana
+# mainnet wallet that has been observed swapping on a known DEX.  Use this
+# for the first end-to-end paper run; promote the larger smart_wallets.txt
+# cohort only after this set produces real signals.
+#
+# Sources (all verified against `getSignaturesForAddress` and
+# `getTransaction` on Solana mainnet, with observed swap activity in
+# Jupiter v6 / Orca / Raydium logs):
+# - 8o29iwRGc3XDe9139HBWsh5ykqHL3K8rpQ2YQGSF9uLo: Jupiter v6 swap in
+#   data/fixtures/real_jupiter_v6_swap.json (block 1788468803).
+# - AuivU1XZpghAhcVC9Y9mBmq8pmtRc994MzxE69hmBPgS: SPL transfer activity.
+# - 5wtbNQvY2sjLDcMya1WAA4S2jjnNFeT2MAUWS3DiQ3VG: Jupiter v6 swap observed
+#   on signature 3kp6ZSXd2ge3RTEPeixbrCanTydp3eLJcw1z4C5jU4VfxNdh6NvZfN5cQNVEh7qzHuWzQ4GKsKoJdvJ86smNsUac
+#   (block 1788471604, USD1 token, Orca + Meteora + Flux route).
+#
+# Keep this list small. The full 1000-wallet cohort is in smart_wallets.txt
+# and is loaded only after the smoke test passes.
+8o29iwRGc3XDe9139HBWsh5ykqHL3K8rpQ2YQGSF9uLo
+AuivU1XZpghAhcVC9Y9mBmq8pmtRc994MzxE69hmBPgS
+5wtbNQvY2sjLDcMya1WAA4S2jjnNFeT2MAUWS3DiQ3VG

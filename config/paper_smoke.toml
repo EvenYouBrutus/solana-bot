@@ -4,16 +4,20 @@ mode = "paper"
 http_endpoints = ["https://api.mainnet-beta.solana.com"]
 websocket_endpoints = []
 max_data_age_secs = 3600
-request_timeout_secs = 8
+request_timeout_secs = 15
 max_attempts = 2
 unknown_after_secs = 180
 
 [strategy]
 base_mint = "So11111111111111111111111111111111111111112"
-min_wallet_score = 60.0
-min_wallet_samples = 25
+# Smoke-test config: lower the wallet-history requirement so the
+# pipeline can demonstrate end-to-end paper trading on a small cohort.
+# Production paper.toml (used by the 1000-wallet experiment) keeps the
+# real 25-trade threshold.
+min_wallet_score = 30.0
+min_wallet_samples = 1
 min_consensus_wallets = 2
-min_signal_score = 65.0
+min_signal_score = 30.0
 min_token_age_secs = 86400
 stop_loss_pct = 5.0
 take_profit_pct = 12.0
@@ -54,7 +58,7 @@ confirm_poll_ms = 500
 allowed_program_ids = []
 
 [storage]
-sqlite_path = "state/paper.sqlite3"
+sqlite_path = "state/paper_smoke.sqlite3"
 
 [runtime]
 signal_feed_path = ""
@@ -74,12 +78,8 @@ log_format = "pretty"
 
 [wallet_monitor]
 enabled = true
-# Smoke-test cohort: a small set of verified active wallets used to prove
-# the end-to-end pipeline before scaling to the full 1000-wallet cohort.
-# After the first successful paper run, switch wallets_file to
-# "smart_wallets.txt" to scale up.
 wallets_file = "smart_wallets_smoke.txt"
 poll_interval_secs = 10
 max_history_signatures = 200
-consensus_window_secs = 900
+consensus_window_secs = 86400
 position_usd = 4.0

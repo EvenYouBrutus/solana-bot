@@ -4,7 +4,7 @@ mode = "paper"
 http_endpoints = ["https://api.mainnet-beta.solana.com"]
 websocket_endpoints = []
 max_data_age_secs = 3600
-request_timeout_secs = 8
+request_timeout_secs = 15
 max_attempts = 2
 unknown_after_secs = 180
 
@@ -74,12 +74,8 @@ log_format = "pretty"
 
 [wallet_monitor]
 enabled = true
-# Smoke-test cohort: a small set of verified active wallets used to prove
-# the end-to-end pipeline before scaling to the full 1000-wallet cohort.
-# After the first successful paper run, switch wallets_file to
-# "smart_wallets.txt" to scale up.
-wallets_file = "smart_wallets_smoke.txt"
-poll_interval_secs = 10
-max_history_signatures = 200
+wallets_file = "smart_wallets.txt"
+poll_interval_secs = 30
+max_history_signatures = 100
 consensus_window_secs = 900
 position_usd = 4.0

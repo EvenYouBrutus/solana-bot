@@ -119,25 +119,33 @@ impl RpcPool {
         let mut errors = Vec::new();
         for attempt in 0..self.max_attempts {
             if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(
-                    250u64.saturating_mul(2u64.saturating_pow(attempt.min(4))),
-                ))
-                .await;
+                let backoff_ms = 500u64.saturating_mul(2u64.saturating_pow(attempt.min(4)));
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
             for endpoint in &self.endpoints {
                 let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
                 match self.client.post(endpoint).json(&body).send().await {
-                    Ok(r) => match r.json::<Value>().await {
-                        Ok(v) if v.get("error").is_none() => {
-                            return Ok(RpcObservation {
-                                value: v["result"].clone(),
-                                observed_at,
-                                received_at: Utc::now(),
-                            })
+                    Ok(r) => {
+                        let status = r.status();
+                        match r.json::<Value>().await {
+                            Ok(v) if v.get("error").is_none() => {
+                                return Ok(RpcObservation {
+                                    value: v["result"].clone(),
+                                    observed_at,
+                                    received_at: Utc::now(),
+                                })
+                            }
+                            Ok(v) => {
+                                let err_msg = v
+                                    .get("error")
+                                    .and_then(|e| e.get("message"))
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("unknown");
+                                errors.push(format!("{endpoint} [{status}]: {err_msg}"));
+                            }
+                            Err(e) => errors.push(format!("{endpoint} [{status}]: {e}")),
                         }
-                        Ok(v) => errors.push(format!("{endpoint}: {}", v["error"])),
-                        Err(e) => errors.push(format!("{endpoint}: {e}")),
-                    },
+                    }
                     Err(e) => errors.push(format!("{endpoint}: {e}")),
                 }
             }
@@ -221,6 +229,51 @@ impl RpcPool {
             returned = entries.len(),
             "getSignaturesForAddress response received"
         );
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
+            let signature = e["signature"]
+                .as_str()
+                .ok_or_else(|| RpcError::Invalid("signature entry missing signature".into()))?
+                .to_string();
+            let slot = e["slot"].as_u64().unwrap_or(0);
+            let block_time = e["blockTime"].as_i64();
+            let err = if e["err"].is_null() {
+                None
+            } else {
+                Some(e["err"].clone())
+            };
+            let confirmation_status = e["confirmationStatus"].as_str().map(str::to_owned);
+            out.push(SignatureEntry {
+                signature,
+                slot,
+                block_time,
+                err,
+                confirmation_status,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Paginated variant of `signatures_for_address` that walks backward in
+    /// time using the `before` cursor.  Returns a partial page (and no error)
+    /// when the chain is exhausted.
+    pub async fn signatures_for_address_paged(
+        &self,
+        address: &str,
+        limit: u32,
+        before: Option<&str>,
+    ) -> Result<Vec<SignatureEntry>, RpcError> {
+        let mut options = json!({"limit": limit, "commitment": "confirmed"});
+        if let Some(b) = before {
+            options["before"] = json!(b);
+        }
+        let v = self
+            .call("getSignaturesForAddress", json!([address, options]))
+            .await?;
+        let entries = v
+            .value
+            .as_array()
+            .ok_or_else(|| RpcError::Invalid("missing signatures array".into()))?;
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             let signature = e["signature"]

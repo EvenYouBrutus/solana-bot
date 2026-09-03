@@ -776,8 +776,38 @@ pub async fn run_session(
         )
         .await
         {
-            Ok(wm) => {
+            Ok(mut wm) => {
                 tracing::info!("wallet monitor initialized successfully");
+                // Run a one-shot validation pass at startup so the operator
+                // sees the cohort composition (VALID_ACTIVE / NO_SWAP_ACTIVITY
+                // / LOW_ACTIVITY / INVALID) before live polling begins.
+                match wm.validate_all().await {
+                    Ok(summary) => {
+                        tracing::info!(
+                            wallets_loaded = summary.wallets_loaded,
+                            wallets_valid = summary.wallets_valid,
+                            wallets_active = summary.wallets_active,
+                            wallets_no_swap_activity = summary.wallets_no_swap_activity,
+                            wallets_low_activity = summary.wallets_low_activity,
+                            wallets_invalid = summary.wallets_invalid,
+                            total_signatures = summary.total_signatures,
+                            total_successful_transactions = summary.total_successful_transactions,
+                            total_swaps_parsed = summary.total_swaps_parsed,
+                            buys = summary.total_buys,
+                            sells = summary.total_sells,
+                            "wallet cohort validation complete"
+                        );
+                        if summary.wallets_active == 0 {
+                            tracing::error!(
+                                wallets_loaded = summary.wallets_loaded,
+                                "no VALID_ACTIVE wallets in cohort; live paper experiment will not produce signals"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "wallet validation failed");
+                    }
+                }
                 state.wallet_monitor = Some(wm);
             }
             Err(e) => {

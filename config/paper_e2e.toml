@@ -4,16 +4,16 @@ mode = "paper"
 http_endpoints = ["https://api.mainnet-beta.solana.com"]
 websocket_endpoints = []
 max_data_age_secs = 3600
-request_timeout_secs = 8
+request_timeout_secs = 15
 max_attempts = 2
 unknown_after_secs = 180
 
 [strategy]
 base_mint = "So11111111111111111111111111111111111111112"
-min_wallet_score = 60.0
+min_wallet_score = 30.0
 min_wallet_samples = 25
 min_consensus_wallets = 2
-min_signal_score = 65.0
+min_signal_score = 30.0
 min_token_age_secs = 86400
 stop_loss_pct = 5.0
 take_profit_pct = 12.0
@@ -54,10 +54,13 @@ confirm_poll_ms = 500
 allowed_program_ids = []
 
 [storage]
-sqlite_path = "state/paper.sqlite3"
+sqlite_path = "state/paper_e2e.sqlite3"
 
 [runtime]
-signal_feed_path = ""
+# Inject real-time candidate feed: the bot will trade on the sample feed,
+# which references real Solana mainnet mints (BONK/USDC/...) so paper
+# execution can fetch a real Jupiter quote at signal time.
+signal_feed_path = "data/e2e_candidates.jsonl"
 poll_interval_secs = 10
 paper_fill_haircut_bps = 25
 reconcile_interval_secs = 0
@@ -73,13 +76,12 @@ replay_mode = false
 log_format = "pretty"
 
 [wallet_monitor]
-enabled = true
-# Smoke-test cohort: a small set of verified active wallets used to prove
-# the end-to-end pipeline before scaling to the full 1000-wallet cohort.
-# After the first successful paper run, switch wallets_file to
-# "smart_wallets.txt" to scale up.
-wallets_file = "smart_wallets_smoke.txt"
+# Disabled: this config uses the JSONL feed, not the wallet monitor.
+# Swap the cohort by setting `wallets_file = "smart_wallets.txt"` and
+# removing the signal_feed_path to switch to wallet-driven candidates.
+enabled = false
+wallets_file = "smart_wallets.txt"
 poll_interval_secs = 10
-max_history_signatures = 200
+max_history_signatures = 100
 consensus_window_secs = 900
 position_usd = 4.0
