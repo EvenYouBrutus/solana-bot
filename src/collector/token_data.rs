@@ -6,15 +6,34 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+/// Page size when walking a mint account's signature history backward.
+const AGE_PAGE_LIMIT: u32 = 200;
+/// Hard bound on RPC pages spent proving a token's age. When the bound is
+/// reached without proof the age is treated as unverifiable and the candidate
+/// is rejected rather than guessed.
+const MAX_AGE_PAGES: u32 = 10;
+
+/// Estimate pool liquidity from a real quote's price impact: a trade of size
+/// X causing `p` basis points of impact implies liquidity ≈ X / (p/10000).
+/// A zero (sub-bps-rounded) impact is treated as very deep liquidity with a
+/// large bounded estimate. Shared by entry pricing and exit evidence refresh
+/// so both directions use one consistent definition.
+pub fn estimate_liquidity_usd(trade_size_usd: Decimal, price_impact_bps: u32) -> Decimal {
+    if price_impact_bps > 0 {
+        (trade_size_usd * dec!(10000) / Decimal::from(price_impact_bps)).round_dp(2)
+    } else {
+        dec!(10_000_000)
+    }
+}
 
 /// Fetch real token safety data from the Solana chain via RPC.
 ///
 /// Returns `Err` if any required RPC call fails. Returns `Ok(None)` if the
-/// mint account does not exist.
+/// mint account does not exist or its age cannot be verified.
 pub async fn fetch_token_safety(
     rpc: &RpcPool,
     mint: &str,
-    _min_token_age_secs: i64,
+    min_token_age_secs: i64,
 ) -> Result<Option<TokenSafety>, anyhow::Error> {
     let mint_info = rpc
         .mint_account_info(mint)
@@ -46,21 +65,62 @@ pub async fn fetch_token_safety(
         return Ok(None);
     };
 
-    let sigs = rpc
-        .signatures_for_address(mint, 1)
-        .await
-        .map_err(|e| anyhow::anyhow!("signatures_for_address RPC failed: {e}"))?;
-
+    // Token age: walk the mint account's signature history backward until the
+    // age is proven (a signature older than the minimum age is found) or the
+    // history is exhausted (the oldest signature is the true creation
+    // activity). If the page bound is reached without proof, the age cannot
+    // be verified and the candidate is rejected — never guessed.
     let now_ts = Utc::now().timestamp();
-    let token_age_secs = if let Some(oldest) = sigs.last() {
-        if let Some(bt) = oldest.block_time {
-            now_ts.saturating_sub(bt)
-        } else {
-            return Ok(None);
+    let cutoff = now_ts.saturating_sub(min_token_age_secs.max(0));
+    let mut oldest: Option<i64> = None;
+    let mut before: Option<String> = None;
+    let mut exhausted = false;
+    for _ in 0..MAX_AGE_PAGES {
+        let page = rpc
+            .signatures_for_address_paged(mint, AGE_PAGE_LIMIT, before.as_deref())
+            .await
+            .map_err(|e| anyhow::anyhow!("signatures_for_address RPC failed: {e}"))?;
+        if page.is_empty() {
+            exhausted = true;
+            break;
         }
-    } else {
+        for entry in &page {
+            if let Some(bt) = entry.block_time {
+                oldest = Some(match oldest {
+                    Some(prev) => prev.min(bt),
+                    None => bt,
+                });
+            }
+        }
+        if oldest.is_some_and(|o| o <= cutoff) {
+            break;
+        }
+        let last_sig = page.last().map(|s| s.signature.clone());
+        if (page.len() as u32) < AGE_PAGE_LIMIT {
+            exhausted = true;
+            break;
+        }
+        match last_sig {
+            Some(s) => before = Some(s),
+            None => {
+                exhausted = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+
+    let Some(oldest_ts) = oldest else {
         return Ok(None);
     };
+    if !exhausted && oldest_ts > cutoff {
+        tracing::info!(
+            mint = %mint,
+            "token age could not be verified within the page bound; candidate rejected"
+        );
+        return Ok(None);
+    }
+    let token_age_secs = now_ts.saturating_sub(oldest_ts);
 
     // sellable and route_available are confirmed by the fact that we successfully
     // fetched a Jupiter quote for this mint during candidate generation.
@@ -85,12 +145,13 @@ pub async fn fetch_token_safety(
 /// Fetch real market snapshot using a Jupiter quote for pricing + RPC data.
 /// Liquidity is estimated from Jupiter's price impact: if a trade of size X
 /// causes Y% price impact, the effective pool liquidity is approximately X/Y.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_market_snapshot(
-    rpc: &RpcPool,
     executor: &dyn crate::execution::Executor,
     mint: &str,
     sol_price_usd: Decimal,
     sol_decimals: u8,
+    token_decimals: u8,
     input_amount: u64,
     slippage_bps: u16,
 ) -> Result<Option<(MarketSnapshot, u32)>, anyhow::Error> {
@@ -105,8 +166,8 @@ pub async fn fetch_market_snapshot(
 
     let sol_spent =
         Decimal::from(quote.input_amount) / Decimal::from(10u64.pow(sol_decimals as u32));
-    let tokens_received = Decimal::from(quote.output_amount)
-        / Decimal::from(10u64.pow(quote_mint_decimals(rpc, mint).await.unwrap_or(6) as u32));
+    let tokens_received =
+        Decimal::from(quote.output_amount) / Decimal::from(10u64.pow(token_decimals as u32));
 
     if tokens_received.is_zero() {
         return Ok(None);
@@ -115,16 +176,9 @@ pub async fn fetch_market_snapshot(
     let price_usd = sol_spent * sol_price_usd / tokens_received;
 
     // Real liquidity estimation from Jupiter's price impact.
-    // price_impact_bps = (trade_size_usd / pool_liquidity_usd) * 10000
-    // => pool_liquidity_usd = (trade_size_usd * 10000) / price_impact_bps
     let price_impact_bps = quote.price_impact_bps;
     let trade_size_usd = sol_spent * sol_price_usd;
-    let liquidity_usd = if price_impact_bps > 0 {
-        (trade_size_usd * dec!(10000) / Decimal::from(price_impact_bps)).round_dp(2)
-    } else {
-        // Zero price impact means very deep liquidity; use a large but bounded estimate.
-        dec!(10_000_000)
-    };
+    let liquidity_usd = estimate_liquidity_usd(trade_size_usd, price_impact_bps);
 
     let now = Utc::now();
     Ok(Some((
@@ -142,12 +196,4 @@ pub async fn fetch_market_snapshot(
         },
         price_impact_bps,
     )))
-}
-
-async fn quote_mint_decimals(rpc: &RpcPool, mint: &str) -> Option<u8> {
-    rpc.mint_account_info(mint)
-        .await
-        .ok()
-        .flatten()
-        .map(|i| i.decimals)
 }

@@ -768,6 +768,26 @@ pub async fn run_session(
         report: PerformanceReport::new(config.risk.starting_capital_usd),
     };
 
+    // Spawn the independent exit monitor BEFORE the wallet-monitor startup
+    // sweep. It runs on its own cadence and loads positions from SQLite, so
+    // any position inherited from a previous run stays managed while the
+    // (potentially minutes-long) history reconstruction is in progress.
+    let (exit_shutdown_tx, exit_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let exit_deps = ExitDeps {
+        config: config.clone(),
+        store: store.clone(),
+        executor: deps.executor.clone(),
+        rpc: deps.rpc.clone(),
+    };
+    let exit_interval = config.runtime.poll_interval_secs;
+    let exit_monitor = ExitMonitor::new(exit_deps, exit_interval);
+    let exit_handle = tokio::spawn(async move {
+        let mut monitor = exit_monitor;
+        if let Err(e) = monitor.run(exit_shutdown_rx).await {
+            tracing::error!(error = %e, "exit monitor terminated with error");
+        }
+    });
+
     if config.wallet_monitor.enabled {
         match crate::collector::wallet_monitor::WalletMonitor::new(
             config.clone(),
@@ -848,25 +868,6 @@ pub async fn run_session(
             "startup reconciliation incomplete; new entries stay blocked until resolved"
         );
     }
-
-    // Spawn the independent exit monitor.  It runs on its own cadence and
-    // loads positions from SQLite, so it is completely decoupled from signal
-    // ingestion and the main session tick.
-    let (exit_shutdown_tx, exit_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let exit_deps = ExitDeps {
-        config: config.clone(),
-        store: store.clone(),
-        executor: deps.executor.clone(),
-        rpc: deps.rpc.clone(),
-    };
-    let exit_interval = config.runtime.poll_interval_secs;
-    let exit_monitor = ExitMonitor::new(exit_deps, exit_interval);
-    let exit_handle = tokio::spawn(async move {
-        let mut monitor = exit_monitor;
-        if let Err(e) = monitor.run(exit_shutdown_rx).await {
-            tracing::error!(error = %e, "exit monitor terminated with error");
-        }
-    });
 
     let mut shutdown = shutdown;
     let mut last_position_reconcile = std::time::Instant::now();
@@ -1249,6 +1250,11 @@ async fn process_exits(deps: &SessionDeps, state: &mut SessionState) -> Result<(
 }
 
 /// Fresh sell quote establishes the current mark price; no synthetic prices.
+/// The same quote is a live sell-route probe, so it also refreshes the
+/// persisted liquidity evidence (same estimator as entry pricing). Without
+/// this refresh, evidence ages out within `max_liquidity_age_secs` and every
+/// position exits via LiquidityDeterioration before price-based exits can
+/// trigger.
 async fn derive_mark(
     deps: &SessionDeps,
     state: &SessionState,
@@ -1269,13 +1275,21 @@ async fn derive_mark(
         )
         .await
     {
-        Ok(q) => mark_price_from_quote(
-            q.output_amount,
-            base_decimals,
-            base_price,
-            remaining,
-            token_decimals,
-        ),
+        Ok(q) => {
+            let mark = mark_price_from_quote(
+                q.output_amount,
+                base_decimals,
+                base_price,
+                remaining,
+                token_decimals,
+            )?;
+            let probe_usd =
+                mark * Decimal::from(remaining) / Decimal::from(10u64.pow(token_decimals as u32));
+            let refreshed =
+                crate::collector::token_data::estimate_liquidity_usd(probe_usd, q.price_impact_bps);
+            let _ = deps.store.set_last_liquidity(mint, refreshed);
+            Some(mark)
+        }
         Err(e) => {
             tracing::warn!(mint=%mint, error=%e, "mark quote unavailable; exit evaluation skipped this tick");
             None

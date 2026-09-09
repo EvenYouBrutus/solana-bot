@@ -19,7 +19,13 @@ impl Default for SmartMoneyThresholds {
     }
 }
 pub fn score_wallet(stats: &mut WalletStats, t: &SmartMoneyThresholds) {
-    let sample = Decimal::from(stats.trades.min(100)) / dec!(100);
+    // Sample-size confidence ramps linearly from zero at the minimum observed
+    // count to full weight at the configured qualified count, then stays
+    // bounded. A raw trades/100 fraction can never exceed ~0.25 for a monitor
+    // window of a few hundred transactions, which silently made every wallet
+    // score ineligible regardless of performance.
+    let sample =
+        (Decimal::from(stats.trades) / Decimal::from(t.qualified_trades.max(1))).min(Decimal::ONE);
     let performance = (stats.win_rate * dec!(25)
         + stats.avg_return_pct.min(dec!(30))
         + stats.median_return_pct.min(dec!(20))
@@ -51,7 +57,7 @@ mod tests {
             wallet: "x".into(),
             entity_id: None,
             realized_pnl_usd: dec!(50),
-            win_rate: dec!(3),
+            win_rate: dec!(0.8),
             avg_return_pct: dec!(15),
             median_return_pct: dec!(10),
             max_drawdown_pct: dec!(5),
@@ -70,5 +76,22 @@ mod tests {
         score_wallet(&mut w, &Default::default());
         assert!(w.score > dec!(60));
         assert_eq!(w.tier, WalletTier::Qualified);
+    }
+
+    #[test]
+    fn qualified_trades_reach_full_sample_weight() {
+        // A wallet with exactly the configured qualified_trades (25) must be
+        // able to reach the score floor — sample confidence saturates at the
+        // qualified threshold instead of an arbitrary /100 divisor.
+        let mut w = wallet();
+        w.trades = 25;
+        score_wallet(&mut w, &Default::default());
+        assert_eq!(w.tier, WalletTier::Qualified);
+        // Below the qualified count the sample discount applies.
+        let mut w2 = wallet();
+        w2.trades = 10;
+        score_wallet(&mut w2, &Default::default());
+        assert!(w2.score < w.score);
+        assert_ne!(w2.tier, WalletTier::Qualified);
     }
 }

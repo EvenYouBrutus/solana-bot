@@ -157,7 +157,7 @@ impl ExitMonitor {
                 None => continue,
             };
             let mut fresh_quote: Option<(String, Quote)> = None;
-            let mark = if let Some(cached) = self.cached_quote(&mint) {
+            let (mark, quote_impact_bps) = if let Some(cached) = self.cached_quote(&mint) {
                 // Use cached quote for mark-to-market.
                 let base_units = match units(cached.output_amount, base_decimals) {
                     Ok(u) => u,
@@ -170,7 +170,10 @@ impl ExitMonitor {
                 if token_units.is_zero() {
                     continue;
                 }
-                Some(base_units * base_price / token_units)
+                (
+                    Some(base_units * base_price / token_units),
+                    Some(cached.price_impact_bps),
+                )
             } else {
                 match executor
                     .quote(&mint, &base_mint, remaining, config.execution.slippage_bps)
@@ -190,12 +193,12 @@ impl ExitMonitor {
                         }
                         let mark_price = base_units * base_price / token_units;
                         // Save fresh quote to cache after store usage.
-                        fresh_quote = Some((mint.clone(), q));
-                        Some(mark_price)
+                        fresh_quote = Some((mint.clone(), q.clone()));
+                        (Some(mark_price), Some(q.price_impact_bps))
                     }
                     Err(e) => {
                         tracing::warn!(mint=%mint, error=%e, "exit monitor: quote unavailable; skipping");
-                        None
+                        (None, None)
                     }
                 }
             };
@@ -215,10 +218,14 @@ impl ExitMonitor {
                 self.cache_quote(mint_str, quote);
             }
 
-            // Load persisted liquidity evidence (None = missing → exit,
-            // never invent a value). Stale evidence (older than
-            // max_liquidity_age_secs) is treated identically to missing.
-            let liquidity: Option<Decimal> = match store.last_liquidity(&mint) {
+            // Liquidity evidence: prefer a persisted observation while it is
+            // fresh. The mark quote is itself a live sell-route probe, so it
+            // refreshes the evidence (the same estimator as entry pricing).
+            // Without this refresh, persisted evidence ages out within
+            // max_liquidity_age_secs and every position exits immediately via
+            // LiquidityDeterioration, making stop-loss/take-profit exits
+            // unreachable in paper mode.
+            let persisted_liquidity: Option<Decimal> = match store.last_liquidity(&mint) {
                 Ok(Some((liq, ts))) => {
                     let max_age = config.runtime.max_liquidity_age_secs;
                     if max_age > 0 {
@@ -243,6 +250,19 @@ impl ExitMonitor {
                     tracing::error!(mint=%mint, error=%e, "exit monitor: failed to read liquidity evidence; treating as missing");
                     None
                 }
+            };
+            let liquidity: Option<Decimal> = match (persisted_liquidity, quote_impact_bps) {
+                (Some(liq), _) => Some(liq),
+                (None, Some(impact_bps)) => {
+                    // Mark value of the remaining position is the probe size.
+                    let probe_usd = mark * Decimal::from(remaining)
+                        / Decimal::from(10u64.pow(token_decimals as u32));
+                    let refreshed =
+                        crate::collector::token_data::estimate_liquidity_usd(probe_usd, impact_bps);
+                    let _ = store.set_last_liquidity(&mint, refreshed);
+                    Some(refreshed)
+                }
+                (None, None) => None,
             };
 
             // Load persisted signal invalidation from store.

@@ -30,7 +30,10 @@ const VALID_ACTIVE_SWAP_THRESHOLD: u32 = 1;
 /// Cap to avoid building an unbounded observations list per wallet.
 const MAX_OBSERVATIONS_PER_WALLET: usize = 5_000;
 /// Minimum delay between RPC calls to avoid rate limiting on public endpoints.
-const RPC_RATE_LIMIT_MS: u64 = 120;
+/// Public mainnet nodes throttle `getTransaction` aggressively; the previous
+/// 120 ms pace caused heavy 429 losses during history reconstruction, which
+/// silently shrank wallet sample sizes.
+const RPC_RATE_LIMIT_MS: u64 = 350;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalletStatus {
@@ -121,8 +124,8 @@ impl WalletAccumulator {
         &mut self,
         mint: &str,
         direction: &SwapDirection,
-        sol_amount: Decimal,
-        tokens: Decimal,
+        input_amount: Decimal,
+        output_amount: Decimal,
         ts: DateTime<Utc>,
     ) {
         let block_time = ts.timestamp();
@@ -137,18 +140,20 @@ impl WalletAccumulator {
         match direction {
             SwapDirection::Buy => {
                 self.buys += 1;
+                // Buy: input leg is SOL spent, output leg is tokens received.
                 self.open_positions
                     .entry(mint.to_string())
                     .or_default()
                     .push_back(OpenPosition {
-                        sol_spent: sol_amount,
-                        tokens_received: tokens,
+                        sol_spent: input_amount,
+                        tokens_received: output_amount,
                         timestamp: ts,
                     });
             }
             SwapDirection::Sell => {
                 self.sells += 1;
-                self.record_sell(mint, tokens, sol_amount, ts);
+                // Sell: input leg is tokens sold, output leg is SOL received.
+                self.record_sell(mint, input_amount, output_amount, ts);
             }
         }
     }
@@ -356,6 +361,17 @@ pub struct WalletMonitor {
     consensus_window_secs: u64,
     wallet_poll_idx: usize,
     validation_summary: ValidationSummary,
+    /// Wallets whose history was already rebuilt (either by startup validation
+    /// or lazily on the first poll). Prevents a second full RPC pass.
+    rebuilt: HashSet<String>,
+    /// Upper bound on RPC cost of the initial per-wallet reconstruction.
+    history_scan_budget: usize,
+    /// Set once the initial cohort sweep is complete; afterwards only
+    /// genuinely new on-chain signatures produce candidates.
+    initial_rebuild_done: bool,
+    /// Candidates produced during the startup reconstruction (drained by the
+    /// next tick). Keeps `validate_all`'s signature unchanged.
+    pending_candidates: Vec<CandidateInput>,
 }
 
 impl WalletMonitor {
@@ -375,6 +391,10 @@ impl WalletMonitor {
         }
         let position_usd = config.wallet_monitor.position_usd;
         let consensus_window_secs = config.wallet_monitor.consensus_window_secs;
+        let scan_budget = config
+            .wallet_monitor
+            .max_history_signatures
+            .clamp(1, DEFAULT_REBUILD_PAGE * MAX_REBUILD_PAGES) as usize;
 
         let monitor = Self {
             rpc,
@@ -390,10 +410,14 @@ impl WalletMonitor {
             consensus_window_secs,
             wallet_poll_idx: 0,
             validation_summary: ValidationSummary::default(),
+            rebuilt: HashSet::new(),
+            history_scan_budget: scan_budget,
+            initial_rebuild_done: false,
+            pending_candidates: Vec::new(),
         };
 
         tracing::info!(
-            "wallet monitor initialised; history rebuild is lazy (first tick per wallet)"
+            "wallet monitor initialised; history reconstruction is bounded and runs at startup"
         );
         Ok(monitor)
     }
@@ -402,8 +426,9 @@ impl WalletMonitor {
         &self.validation_summary
     }
 
-    /// Walk all configured wallets and produce a one-shot validation report.
-    /// Uses bounded pagination; safe to call at startup before live polling.
+    /// One-shot cohort validation. Each wallet is rebuilt exactly once via
+    /// `rebuild_wallet_history`; the report is derived from that pass so no
+    /// transaction is fetched twice (halves RPC cost on public endpoints).
     pub async fn validate_all(&mut self) -> Result<ValidationSummary, anyhow::Error> {
         let total = self.wallets.len();
         let mut summary = ValidationSummary {
@@ -412,7 +437,24 @@ impl WalletMonitor {
         };
         tracing::info!(wallets = total, "starting wallet cohort validation");
         for wallet in self.wallets.clone() {
-            let report = self.validate_single(&wallet).await;
+            if !is_valid_solana_address(&wallet) {
+                summary.wallets_invalid += 1;
+                tracing::info!(wallet = %wallet, status = ?WalletStatus::Invalid, "wallet validation");
+                summary.reports.push(WalletValidationReport {
+                    wallet: wallet.to_string(),
+                    status: WalletStatus::Invalid,
+                    signatures_fetched: 0,
+                    successful_transactions: 0,
+                    swaps_parsed: 0,
+                    buys: 0,
+                    sells: 0,
+                    dex_activity: HashMap::new(),
+                    last_activity_ts: None,
+                    first_activity_ts: None,
+                });
+                continue;
+            }
+            let report = self.rebuild_wallet_history(&wallet).await;
             summary.total_signatures += report.signatures_fetched as u64;
             summary.total_successful_transactions += report.successful_transactions as u64;
             summary.total_swaps_parsed += report.swaps_parsed as u64;
@@ -431,15 +473,16 @@ impl WalletMonitor {
                     summary.wallets_valid += 1;
                     summary.wallets_low_activity += 1;
                 }
-                WalletStatus::Invalid => summary.wallets_invalid += 1,
-                WalletStatus::Suspect => summary.wallets_invalid += 1,
+                WalletStatus::Invalid | WalletStatus::Suspect => summary.wallets_invalid += 1,
             }
             tracing::info!(
-                wallet = %wallet,
+                wallet = %report.wallet,
                 status = ?report.status,
                 signatures = report.signatures_fetched,
                 successful = report.successful_transactions,
                 swaps = report.swaps_parsed,
+                buys = report.buys,
+                sells = report.sells,
                 "wallet validation"
             );
             summary.reports.push(report);
@@ -455,11 +498,16 @@ impl WalletMonitor {
             swaps = summary.total_swaps_parsed,
             "wallet validation summary"
         );
+        self.initial_rebuild_done = true;
         self.validation_summary = summary.clone();
         Ok(summary)
     }
 
-    async fn validate_single(&self, wallet: &str) -> WalletValidationReport {
+    /// Rebuild a single wallet's recent history from RPC, seed the tracker and
+    /// derive a validation report. This is the ONLY full-history pass per
+    /// wallet: `poll_wallet` continues incrementally from the recorded
+    /// signature set.
+    async fn rebuild_wallet_history(&mut self, wallet: &str) -> WalletValidationReport {
         if !is_valid_solana_address(wallet) {
             return WalletValidationReport {
                 wallet: wallet.to_string(),
@@ -480,7 +528,7 @@ impl WalletMonitor {
             .max_history_signatures
             .max(DEFAULT_REBUILD_PAGE)
             / DEFAULT_REBUILD_PAGE;
-        let pages = max_pages.min(MAX_REBUILD_PAGES).max(1);
+        let pages = max_pages.clamp(1, MAX_REBUILD_PAGES);
         let mut all_sigs: Vec<SignatureEntry> = Vec::new();
         let mut before: Option<String> = None;
         for _ in 0..pages {
@@ -506,6 +554,10 @@ impl WalletMonitor {
             tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS)).await;
         }
 
+        // Trim to the per-wallet scan budget so reconstruction cost stays
+        // bounded even when the RPC returns large pages.
+        all_sigs.truncate(self.history_scan_budget);
+
         let mut successful: u32 = 0;
         let mut buys: u32 = 0;
         let mut sells: u32 = 0;
@@ -513,35 +565,35 @@ impl WalletMonitor {
         let mut swaps_parsed: u32 = 0;
         let mut last_ts: Option<i64> = None;
         let mut first_ts: Option<i64> = None;
-        let mut tx_fetch_errors: u32 = 0;
-        let inspection_cap = (pages as usize) * (DEFAULT_REBUILD_PAGE as usize);
+        let mut processed = HashSet::new();
+        let mut accumulator = WalletAccumulator::new();
+        let sol_price = self.config.economics.sol_price_usd.unwrap_or(dec!(150));
+        let mut observations: Vec<WalletTradeObservation> = Vec::new();
+        let consensus_window = self.consensus_window_secs as i64;
+        let now_for_window = Utc::now();
+        // Mints bought by this wallet within the consensus window. Only these
+        // are eligible for candidate construction after reconstruction; older
+        // historical trades are context for wallet scoring, never signals.
+        let mut recent_buy_mints: HashSet<String> = HashSet::new();
 
-        let total_to_inspect = all_sigs.len().min(inspection_cap);
-        for (idx, sig) in all_sigs.iter().enumerate() {
-            if idx >= inspection_cap {
-                break;
-            }
+        for sig in &all_sigs {
             if sig.err.is_some() {
                 continue;
             }
             successful += 1;
-            match sig.block_time {
-                Some(bt) => {
-                    last_ts = Some(match last_ts {
-                        Some(prev) => prev.max(bt),
-                        None => bt,
-                    });
-                    first_ts = Some(match first_ts {
-                        Some(prev) => prev.min(bt),
-                        None => bt,
-                    });
-                }
-                None => {}
+            if let Some(bt) = sig.block_time {
+                last_ts = Some(match last_ts {
+                    Some(prev) => prev.max(bt),
+                    None => bt,
+                });
+                first_ts = Some(match first_ts {
+                    Some(prev) => prev.min(bt),
+                    None => bt,
+                });
             }
             let tx = match self.rpc.transaction(&sig.signature).await {
                 Ok(Some(t)) => t,
                 Ok(None) => {
-                    tx_fetch_errors += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS)).await;
                     continue;
                 }
@@ -550,24 +602,61 @@ impl WalletMonitor {
                         wallet = %wallet,
                         sig = %sig.signature,
                         error = %e,
-                        progress = format!("{}/{}", idx + 1, total_to_inspect),
-                        "tx fetch failed during validation"
+                        "tx fetch failed during history reconstruction"
                     );
-                    tx_fetch_errors += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS * 2))
                         .await;
                     continue;
                 }
             };
-            if let Some(parsed) = parse_swap_from_transaction(&tx, wallet) {
+            // Mark processed only after a successful fetch so rate-limited
+            // signatures are retried on later polls instead of being lost.
+            processed.insert(sig.signature.clone());
+            if let Some(swap) = parse_swap_from_transaction(&tx, wallet) {
                 swaps_parsed += 1;
-                *dex_activity.entry(parsed.dex.clone()).or_insert(0) += 1;
-                match parsed.direction {
-                    SwapDirection::Buy => buys += 1,
+                accumulator.observe_dex(&swap.dex);
+                dex_activity
+                    .entry(swap.dex.clone())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                match swap.direction {
+                    SwapDirection::Buy => {
+                        buys += 1;
+                        // Genuinely recent only: within the consensus window
+                        // of now, and never in the future.
+                        if swap.block_time <= now_for_window.timestamp()
+                            && now_for_window.timestamp() - swap.block_time <= consensus_window
+                        {
+                            recent_buy_mints.insert(swap.output_mint.clone());
+                        }
+                    }
                     SwapDirection::Sell => sells += 1,
                 }
+                absorb_swap(
+                    &mut accumulator,
+                    &swap,
+                    &mut observations,
+                    sol_price,
+                    wallet,
+                );
             }
             tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS)).await;
+        }
+
+        let now = Utc::now();
+        let stats = accumulator.build_stats(wallet, Some(now));
+        self.accumulators.insert(wallet.to_string(), accumulator);
+        self.processed_sigs.insert(wallet.to_string(), processed);
+        self.rebuilt.insert(wallet.to_string());
+
+        for obs in observations {
+            if obs.received_at > now {
+                continue;
+            }
+            self.wallet_tracker.observe(obs);
+        }
+        if stats.trades > 0 {
+            self.wallet_tracker.upsert(stats.clone());
         }
 
         let status = if all_sigs.is_empty() || successful < LOW_ACTIVITY_TX_THRESHOLD {
@@ -591,9 +680,24 @@ impl WalletMonitor {
             swaps_parsed = swaps_parsed,
             buys = buys,
             sells = sells,
-            tx_fetch_errors = tx_fetch_errors,
-            "wallet validation complete"
+            completed_trades = stats.trades,
+            recent_buy_mints = recent_buy_mints.len(),
+            "wallet history reconstructed"
         );
+
+        // Candidate construction for genuinely recent BUYs found in history.
+        // Consensus is still required downstream: a single historical trade
+        // can never produce a trade on its own.
+        for mint in &recent_buy_mints {
+            if self.seen_mints.contains(mint) || self.offered_mints.contains(mint) {
+                continue;
+            }
+            self.seen_mints.insert(mint.clone());
+            let mut candidates = Vec::new();
+            self.check_and_build_candidate(mint, &mut candidates, now)
+                .await;
+            self.pending_candidates.extend(candidates);
+        }
 
         WalletValidationReport {
             wallet: wallet.to_string(),
@@ -609,141 +713,6 @@ impl WalletMonitor {
         }
     }
 
-    async fn rebuild_wallet_history(&mut self, wallet: &str) -> Result<u32, anyhow::Error> {
-        tracing::info!(wallet = %wallet, "rebuilding wallet history from RPC");
-        let mut before: Option<String> = None;
-        let max_signatures = self.config.wallet_monitor.max_history_signatures.max(1);
-        let mut all_sigs: Vec<SignatureEntry> = Vec::new();
-        let page_size = DEFAULT_REBUILD_PAGE.min(max_signatures);
-        let pages = ((max_signatures + page_size - 1) / page_size).min(MAX_REBUILD_PAGES);
-        for _ in 0..pages {
-            match self
-                .rpc
-                .signatures_for_address_paged(wallet, page_size, before.as_deref())
-                .await
-            {
-                Ok(mut page) => {
-                    let last_sig = page.last().map(|s| s.signature.clone());
-                    let n = page.len();
-                    all_sigs.append(&mut page);
-                    if (n as u32) < page_size {
-                        break;
-                    }
-                    match last_sig {
-                        Some(s) => before = Some(s),
-                        None => break,
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(wallet = %wallet, error = %e, "signature pagination failed");
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS)).await;
-        }
-        let sigs = all_sigs;
-
-        tracing::info!(
-            wallet = %wallet,
-            signatures = sigs.len(),
-            "wallet history signatures fetched"
-        );
-
-        let mut processed = HashSet::new();
-        let mut accumulator = WalletAccumulator::new();
-        let sol_price = self.config.economics.sol_price_usd.unwrap_or(dec!(150));
-        let mut parsed = 0u32;
-        let mut skipped = 0u32;
-        let mut successful: u32 = 0;
-        let mut observations: Vec<WalletTradeObservation> = Vec::new();
-
-        for sig in &sigs {
-            if sig.err.is_some() {
-                continue;
-            }
-            successful += 1;
-            processed.insert(sig.signature.clone());
-
-            let tx = match self.rpc.transaction(&sig.signature).await {
-                Ok(Some(t)) => t,
-                Ok(None) => {
-                    skipped += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS)).await;
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        sig = %sig.signature,
-                        error = %e,
-                        "failed to fetch transaction (RPC error)"
-                    );
-                    skipped += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS * 2))
-                        .await;
-                    continue;
-                }
-            };
-
-            if let Some(swap) = parse_swap_from_transaction(&tx, wallet) {
-                parsed += 1;
-                accumulator.observe_dex(&swap.dex);
-                absorb_swap(
-                    &mut accumulator,
-                    &swap,
-                    &mut observations,
-                    sol_price,
-                    wallet,
-                );
-                tracing::debug!(
-                    wallet = %wallet,
-                    sig = %sig.signature,
-                    dex = %swap.dex,
-                    direction = ?swap.direction,
-                    input_mint = %swap.input_mint,
-                    output_mint = %swap.output_mint,
-                    "swap detected"
-                );
-                if observations.len() >= MAX_OBSERVATIONS_PER_WALLET {
-                    tracing::warn!(
-                        wallet = %wallet,
-                        cap = MAX_OBSERVATIONS_PER_WALLET,
-                        "observation cap reached; further observations dropped"
-                    );
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS)).await;
-        }
-
-        let now = Utc::now();
-        let stats = accumulator.build_stats(wallet, Some(now));
-        self.accumulators.insert(wallet.to_string(), accumulator);
-        self.processed_sigs
-            .insert(wallet.to_string(), processed.clone());
-
-        for obs in observations {
-            if obs.received_at > now {
-                continue;
-            }
-            self.wallet_tracker.observe(obs);
-        }
-
-        if stats.trades > 0 {
-            self.wallet_tracker.upsert(stats.clone());
-        }
-
-        tracing::info!(
-            wallet = %wallet,
-            signatures = sigs.len(),
-            parsed_swaps = parsed,
-            rpc_skipped = skipped,
-            successful_txs = successful,
-            completed_trades = stats.trades,
-            "wallet history rebuilt"
-        );
-
-        Ok(parsed)
-    }
-
     const WALLETS_PER_TICK: usize = 8;
 
     pub async fn tick(&mut self) -> Result<Vec<CandidateInput>, anyhow::Error> {
@@ -752,6 +721,28 @@ impl WalletMonitor {
 
         let total = self.wallets.len();
         if total == 0 {
+            return Ok(new_candidates);
+        }
+        // Candidates produced during the startup reconstruction are released
+        // on the first tick; the pipeline then continues with live polling.
+        if !self.pending_candidates.is_empty() {
+            new_candidates = std::mem::take(&mut self.pending_candidates);
+            tracing::info!(
+                count = new_candidates.len(),
+                "releasing candidates reconstructed from recent wallet history"
+            );
+            return Ok(new_candidates);
+        }
+        // The startup validation/rebuild pass already reconstructed every
+        // wallet; during live polling only new signatures matter.
+        if !self.initial_rebuild_done {
+            self.initial_rebuild_done = true;
+            for wallet in self.wallets.clone() {
+                if self.rebuilt.contains(&wallet) {
+                    continue;
+                }
+                self.rebuild_wallet_history(&wallet).await;
+            }
             return Ok(new_candidates);
         }
         let batch = Self::WALLETS_PER_TICK.min(total);
@@ -778,15 +769,19 @@ impl WalletMonitor {
         new_candidates: &mut Vec<CandidateInput>,
         now: DateTime<Utc>,
     ) -> Result<(), anyhow::Error> {
-        if !self.processed_sigs.contains_key(wallet) {
-            if let Err(e) = self.rebuild_wallet_history(wallet).await {
+        if !self.rebuilt.contains(wallet) {
+            // Wallet was not rebuilt yet (e.g. validation was skipped or
+            // failed). Do the bounded reconstruction now.
+            self.rebuild_wallet_history(wallet).await;
+            if !self.rebuilt.contains(wallet) {
                 tracing::warn!(
                     wallet = %wallet,
-                    error = %e,
                     "initial rebuild failed; will retry next tick"
                 );
                 return Ok(());
             }
+            // Candidates from the reconstruction are queued for the next
+            // tick; this poll continues with new-signature detection.
         }
 
         let sigs: Vec<SignatureEntry> = self
@@ -843,7 +838,7 @@ impl WalletMonitor {
                     direction = ?swap.direction,
                     input = %swap.input_mint,
                     output = %swap.output_mint,
-                    "NEW SWAP DETECTED"
+                    "new swap detected"
                 );
                 swaps_this_tick.push(swap);
             }
@@ -937,9 +932,15 @@ impl WalletMonitor {
             }
         };
 
+        // Canonical mint decimals are required for atomic/USD conversion.
+        // Fail closed when the chain cannot confirm them: a wrong guess
+        // silently corrupts every downstream price and quantity.
         let token_decimals = match self.rpc.mint_account_info(mint).await {
-            Ok(Some(info)) => info.decimals,
-            _ => 6,
+            Ok(Some(info)) if info.is_initialized => info.decimals,
+            _ => {
+                tracing::info!(mint = %mint, "mint decimals unverifiable; candidate rejected");
+                return;
+            }
         };
 
         let sol_price = self.config.economics.sol_price_usd.unwrap_or(dec!(150));
@@ -950,11 +951,11 @@ impl WalletMonitor {
             .unwrap_or(4_000_000);
 
         let (market, price_impact_bps) = match fetch_market_snapshot(
-            &self.rpc,
             self.executor.as_ref(),
             mint,
             sol_price,
             base_mint_decimals,
+            token_decimals,
             input_amount,
             self.config.execution.slippage_bps,
         )
@@ -1034,17 +1035,17 @@ fn absorb_swap(
     wallet: &str,
 ) {
     let ts = chrono::DateTime::from_timestamp(swap.block_time, 0).unwrap_or_else(Utc::now);
-    let input_sol =
+    // Both legs normalized to human units (atomic / 10^decimals). For a Buy
+    // the input leg is SOL and the output leg is the token; for a Sell the
+    // input leg is the token and the output leg is SOL.
+    let input_leg =
         Decimal::from(swap.input_amount) / Decimal::from(10u64.pow(swap.input_decimals as u32));
-    let output_tokens = Decimal::from(swap.output_amount);
+    let output_leg =
+        Decimal::from(swap.output_amount) / Decimal::from(10u64.pow(swap.output_decimals as u32));
     let now = Utc::now();
     let notional = match swap.direction {
-        SwapDirection::Buy => input_sol * sol_price,
-        SwapDirection::Sell => {
-            let sol_out = Decimal::from(swap.output_amount)
-                / Decimal::from(10u64.pow(swap.output_decimals as u32));
-            sol_out * sol_price
-        }
+        SwapDirection::Buy => input_leg * sol_price,
+        SwapDirection::Sell => output_leg * sol_price,
     };
     let (mint, side) = match swap.direction {
         SwapDirection::Buy => (swap.output_mint.clone(), Side::Buy),
@@ -1061,7 +1062,7 @@ fn absorb_swap(
             signature: swap.signature.clone(),
         });
     }
-    accumulator.record_observation(&mint, &swap.direction, input_sol, output_tokens, ts);
+    accumulator.record_observation(&mint, &swap.direction, input_leg, output_leg, ts);
 }
 
 pub fn load_wallets(path: &str) -> Result<Vec<String>, anyhow::Error> {
@@ -1177,5 +1178,58 @@ mod tests {
         assert_eq!(acc.open_positions.get("X").unwrap().len(), 2);
         // 2 completed trades: lot1 closed, lot2 partial close.
         assert_eq!(acc.completed_trades.len(), 2);
+    }
+
+    // Regression: absorb_swap must normalize atomic amounts to human units
+    // (divide by the leg's decimals) before FIFO accounting. Previously the
+    // token leg was left in raw atomic units while the SOL leg was human,
+    // producing absurd return percentages that made real wallets unable to
+    // reach the qualified score.
+    #[test]
+    fn absorb_swap_normalizes_decimals_for_fifo() {
+        let mut acc = WalletAccumulator::new();
+        let mut obs = Vec::new();
+        // BUY: 1 SOL (9dp) -> 1.0 token (6dp = 1_000_000 atomic).
+        let buy = ParsedSwap {
+            wallet: "w".into(),
+            input_mint: "So11111111111111111111111111111111111111112".into(),
+            output_mint: "T".into(),
+            input_amount: 1_000_000_000,
+            output_amount: 1_000_000,
+            input_decimals: 9,
+            output_decimals: 6,
+            direction: SwapDirection::Buy,
+            fee_lamports: 5000,
+            dex: "jupiter_v6".into(),
+            slot: 1,
+            block_time: 1_700_000_000,
+            signature: "s1".into(),
+        };
+        absorb_swap(&mut acc, &buy, &mut obs, dec!(150), "w");
+        // SELL: 1.0 token (6dp) -> 2 SOL.
+        let sell = ParsedSwap {
+            input_amount: 1_000_000,
+            input_decimals: 6,
+            input_mint: "T".into(),
+            output_mint: "So11111111111111111111111111111111111111112".into(),
+            output_amount: 2_000_000_000,
+            output_decimals: 9,
+            direction: SwapDirection::Sell,
+            signature: "s2".into(),
+            ..buy.clone()
+        };
+        absorb_swap(&mut acc, &sell, &mut obs, dec!(150), "w");
+        // Lot consumed fully, one completed trade, +100% return.
+        assert_eq!(acc.completed_trades.len(), 1);
+        let trade = &acc.completed_trades[0];
+        assert_eq!(
+            trade.return_pct,
+            dec!(100.00),
+            "sell of a 1-SOL lot for 2 SOL must be +100%, got {}",
+            trade.return_pct
+        );
+        assert_eq!(trade.pnl_sol, dec!(1));
+        // Observation notionals are in USD: buy = 1 SOL * 150.
+        assert_eq!(obs[0].notional_usd, dec!(150));
     }
 }
