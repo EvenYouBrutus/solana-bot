@@ -514,6 +514,8 @@ impl WalletMonitor {
         all_sigs.truncate(self.history_scan_budget);
 
         let mut successful: u32 = 0;
+        let mut tx_fetch_failed: u32 = 0;
+        let mut tx_fetched: u32 = 0;
         let mut buys: u32 = 0;
         let mut sells: u32 = 0;
         let mut dex_activity: HashMap<String, u32> = HashMap::new();
@@ -547,17 +549,26 @@ impl WalletMonitor {
                 });
             }
             let tx = match self.rpc.transaction(&sig.signature).await {
-                Ok(Some(t)) => t,
+                Ok(Some(t)) => {
+                    tx_fetched += 1;
+                    t
+                }
                 Ok(None) => {
                     tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS)).await;
                     continue;
                 }
                 Err(e) => {
+                    // Explicitly skipped: a failed fetch is never counted as
+                    // a successful or failed swap, so wallet statistics are
+                    // not corrupted. The signature is not marked processed
+                    // and is retried on a later poll.
+                    tx_fetch_failed += 1;
                     tracing::warn!(
                         wallet = %wallet,
                         sig = %sig.signature,
                         error = %e,
-                        "tx fetch failed during history reconstruction"
+                        fetch_failed_total = tx_fetch_failed,
+                        "tx fetch failed during history reconstruction; signature left unprocessed for retry"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS * 2))
                         .await;
@@ -644,12 +655,14 @@ impl WalletMonitor {
             status = ?status,
             signatures = all_sigs.len(),
             successful = successful,
+            tx_fetched = tx_fetched,
+            tx_fetch_failed = tx_fetch_failed,
             swaps_parsed = swaps_parsed,
             buys = buys,
             sells = sells,
             completed_trades = stats.trades,
             recent_buy_mints = recent_buy_mints.len(),
-            "wallet history reconstructed"
+            "wallet history reconstruction summary"
         );
 
         // Candidate construction for genuinely recent BUYs found in history.
@@ -799,8 +812,22 @@ impl WalletMonitor {
 
             let tx = match self.rpc.transaction(&sig.signature).await {
                 Ok(Some(t)) => t,
-                _ => {
+                Ok(None) => {
                     tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS)).await;
+                    continue;
+                }
+                Err(e) => {
+                    // Explicit skip: the fetch failed, so this transaction is
+                    // neither a successful nor a failed swap. The signature
+                    // stays unprocessed and is retried on a later poll.
+                    tracing::warn!(
+                        wallet = %wallet,
+                        sig = %sig.signature,
+                        error = %e,
+                        "tx fetch failed during live poll; left unprocessed for retry"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS * 2))
+                        .await;
                     continue;
                 }
             };

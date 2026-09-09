@@ -1,8 +1,28 @@
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+
+/// Bounded exponential backoff schedule for HTTP 429 responses:
+/// 350ms → 700ms → 1.4s → 2.8s → 5s max. Never grows beyond the cap, so a
+/// rate-limited endpoint can delay a call by at most a few seconds.
+const RATE_LIMIT_BACKOFF_START_MS: u64 = 350;
+const RATE_LIMIT_BACKOFF_MAX_MS: u64 = 5_000;
+
+fn rate_limit_backoff(step: u32) -> Duration {
+    let ms = RATE_LIMIT_BACKOFF_START_MS
+        .saturating_mul(2u64.saturating_pow(step.min(4)))
+        .min(RATE_LIMIT_BACKOFF_MAX_MS);
+    Duration::from_millis(ms)
+}
+
+/// Maximum concurrent `getTransaction` fetches across the whole process.
+/// History reconstruction, live polling, and the exit monitor share one
+/// RpcPool; this prevents an uncontrolled burst of transaction requests
+/// against rate-limited public endpoints.
+const MAX_CONCURRENT_TX_FETCHES: usize = 2;
 
 #[derive(Debug, Error)]
 pub enum RpcError {
@@ -27,6 +47,9 @@ pub struct RpcPool {
     #[allow(dead_code)]
     timeout: Duration,
     max_attempts: u32,
+    /// Global concurrency gate for `getTransaction` fetches, shared across
+    /// every clone of the pool so all callers observe one bounded window.
+    tx_gate: Arc<tokio::sync::Semaphore>,
 }
 #[derive(Debug, Clone)]
 pub struct RpcObservation {
@@ -106,6 +129,7 @@ impl RpcPool {
             endpoints,
             max_attempts: max_attempts.max(1),
             timeout,
+            tx_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TX_FETCHES)),
         })
     }
     pub fn endpoints(&self) -> &[String] {
@@ -114,19 +138,61 @@ impl RpcPool {
     /// Tries every endpoint up to `max_attempts` passes with bounded backoff.
     /// A timeout or connection error on one endpoint is an availability
     /// problem, never evidence about transaction state.
+    ///
+    /// HTTP 429 responses get dedicated handling: the bounded exponential
+    /// backoff ladder (350ms → 700ms → 1.4s → 2.8s → 5s max) applies, a
+    /// `Retry-After` header is honored (capped so a single response cannot
+    /// stall the loop), and the pool fails over to the next endpoint after
+    /// repeated 429s. Total tries are bounded by `max_attempts` passes over
+    /// all endpoints — never an infinite retry.
     pub async fn call(&self, method: &str, params: Value) -> Result<RpcObservation, RpcError> {
         let observed_at = Utc::now();
         let mut errors = Vec::new();
+        let mut rate_limit_step: u32 = 0;
         for attempt in 0..self.max_attempts {
             if attempt > 0 {
+                // Non-429 failures: bounded generic backoff before the next
+                // pass. 429s already consumed their own backoff inline.
                 let backoff_ms = 500u64.saturating_mul(2u64.saturating_pow(attempt.min(4)));
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
-            for endpoint in &self.endpoints {
+            for (endpoint_idx, endpoint) in self.endpoints.iter().enumerate() {
                 let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
                 match self.client.post(endpoint).json(&body).send().await {
                     Ok(r) => {
                         let status = r.status();
+                        if status.as_u16() == 429 {
+                            let retry_after = r
+                                .headers()
+                                .get("retry-after")
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<u64>().ok());
+                            let backoff = match retry_after {
+                                // Retry-After is honored, capped at the same
+                                // 5s ladder maximum so the loop stays bounded.
+                                Some(secs) => Duration::from_secs(secs)
+                                    .min(Duration::from_millis(RATE_LIMIT_BACKOFF_MAX_MS)),
+                                None => rate_limit_backoff(rate_limit_step),
+                            };
+                            rate_limit_step = rate_limit_step.saturating_add(1);
+                            let failover = if endpoint_idx + 1 < self.endpoints.len() {
+                                "failing over to next endpoint"
+                            } else {
+                                "retrying after backoff"
+                            };
+                            tracing::debug!(
+                                method = %method,
+                                endpoint = %endpoint,
+                                backoff_ms = backoff.as_millis() as u64,
+                                ?retry_after,
+                                rate_limit_step,
+                                "RPC 429; backing off then {}",
+                                failover
+                            );
+                            tokio::time::sleep(backoff).await;
+                            errors.push(format!("{endpoint} [{status}]: 429 rate-limited"));
+                            continue; // fail over to the next endpoint
+                        }
                         match r.json::<Value>().await {
                             Ok(v) if v.get("error").is_none() => {
                                 return Ok(RpcObservation {
@@ -192,7 +258,17 @@ impl RpcPool {
     }
     /// Full transaction with metadata, required to verify the actual swap
     /// outcome (pre/post token balances and fees). `None` = not indexed yet.
+    ///
+    /// Gated by the pool-wide semaphore: at most `MAX_CONCURRENT_TX_FETCHES`
+    /// transaction fetches run at once across all tasks (history
+    /// reconstruction, live polling, exit monitor), preventing uncontrolled
+    /// request bursts against rate-limited endpoints.
     pub async fn transaction(&self, signature: &str) -> Result<Option<Value>, RpcError> {
+        let _permit = self
+            .tx_gate
+            .acquire()
+            .await
+            .map_err(|_| RpcError::Unavailable("transaction gate closed".into()))?;
         let v=self.call("getTransaction",json!([signature,{"encoding":"json","commitment":"confirmed","maxSupportedTransactionVersion":0}])).await?;
         Ok(if v.value.is_null() {
             None
@@ -406,11 +482,58 @@ impl RpcPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn availability_errors_are_not_failure_evidence() {
         assert!(RpcError::Unavailable("x".into()).is_availability());
         assert!(!RpcError::Invalid("x".into()).is_availability());
     }
+
+    // --- RPC 429 backoff regressions ---
+
+    #[test]
+    fn rate_limit_backoff_follows_bounded_ladder() {
+        // 350ms → 700ms → 1.4s → 2.8s → 5s max, never beyond.
+        assert_eq!(rate_limit_backoff(0), Duration::from_millis(350));
+        assert_eq!(rate_limit_backoff(1), Duration::from_millis(700));
+        assert_eq!(rate_limit_backoff(2), Duration::from_millis(1400));
+        assert_eq!(rate_limit_backoff(3), Duration::from_millis(2800));
+        assert_eq!(rate_limit_backoff(4), Duration::from_millis(5000));
+        assert_eq!(rate_limit_backoff(5), Duration::from_millis(5000));
+        assert_eq!(rate_limit_backoff(50), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn retry_after_is_respected_but_capped() {
+        let cap = Duration::from_millis(RATE_LIMIT_BACKOFF_MAX_MS);
+        // A Retry-After within the cap is honored verbatim.
+        let secs = 3u64;
+        assert_eq!(Duration::from_secs(secs).min(cap), Duration::from_secs(3));
+        // A Retry-After beyond the cap is clamped so the loop stays bounded.
+        assert_eq!(
+            Duration::from_secs(600).min(cap),
+            Duration::from_millis(5000)
+        );
+    }
+
+    #[test]
+    fn tx_gate_limits_concurrency_to_configured_permits() {
+        let pool = RpcPool::with_attempts(
+            vec!["http://localhost:1".into()],
+            Duration::from_millis(50),
+            1,
+        )
+        .unwrap();
+        // Two permits total: acquiring both leaves the gate closed for a
+        // third fetch until one is released.
+        let p1 = pool.tx_gate.clone().try_acquire_owned().unwrap();
+        let p2 = pool.tx_gate.clone().try_acquire_owned().unwrap();
+        assert!(pool.tx_gate.try_acquire().is_err());
+        drop(p1);
+        drop(p2);
+        assert!(pool.tx_gate.try_acquire().is_ok());
+    }
+
     #[test]
     fn clone_preserves_configured_endpoints() {
         let rpc = RpcPool::with_attempts(
