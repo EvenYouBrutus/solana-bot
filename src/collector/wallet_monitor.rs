@@ -579,9 +579,21 @@ impl WalletMonitor {
                         buys += 1;
                         // Genuinely recent only: within the consensus window
                         // of now, and never in the future.
-                        if swap.block_time <= now_for_window.timestamp()
-                            && now_for_window.timestamp() - swap.block_time <= consensus_window
-                        {
+                        let age_secs = now_for_window.timestamp() - swap.block_time;
+                        let in_window = swap.block_time <= now_for_window.timestamp()
+                            && age_secs <= consensus_window;
+                        tracing::debug!(
+                            wallet = %wallet,
+                            sig = %swap.signature,
+                            mint = %swap.output_mint,
+                            block_time = swap.block_time,
+                            age_secs = age_secs,
+                            recent_window_secs = consensus_window,
+                            inside_recent_window = in_window,
+                            rejection_reason = if in_window { "" } else { "buy is older than the consensus recent-buy window" },
+                            "historical BUY considered"
+                        );
+                        if in_window {
                             recent_buy_mints.insert(swap.output_mint.clone());
                         }
                     }
@@ -647,8 +659,20 @@ impl WalletMonitor {
         // swap) can retry it once real consensus exists.
         for mint in &recent_buy_mints {
             if self.offered_mints.contains(mint) {
+                tracing::debug!(
+                    mint = %mint,
+                    added_to_pending = false,
+                    rejection_reason = "mint already offered as a candidate",
+                    "recent BUY candidate gate"
+                );
                 continue;
             }
+            tracing::debug!(
+                mint = %mint,
+                added_to_pending = true,
+                rejection_reason = "",
+                "recent BUY candidate gate"
+            );
             let mut candidates = Vec::new();
             self.check_and_build_candidate(mint, &mut candidates, now)
                 .await;
