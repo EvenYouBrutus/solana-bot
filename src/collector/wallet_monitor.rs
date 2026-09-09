@@ -165,95 +165,48 @@ impl WalletAccumulator {
         sol_received: Decimal,
         sell_time: DateTime<Utc>,
     ) -> Option<CompletedTrade> {
-        // FIFO across multiple lots: walk from the oldest lot forward until
-        // we have accounted for all the tokens sold in this swap.  A single
-        // sell may consume several lots; each consumed lot produces one
-        // completed-trade record.
+        // FIFO across lots. Each consumed slice produces one completed-trade
+        // record whose cost basis and proceeds cover ONLY the quantity
+        // actually sold; a partially consumed lot carries its remaining cost
+        // forward so later sells account correctly.
         let queue = self.open_positions.get_mut(mint)?;
-        if queue.is_empty() {
+        if queue.is_empty() || tokens_sold <= Decimal::ZERO {
             return None;
         }
+        let proceeds_per_token = sol_received / tokens_sold;
         let mut remaining_to_sell = tokens_sold;
-        let total_proceeds = sol_received;
-        let mut consumed = 0u32;
         let mut last_trade: Option<CompletedTrade> = None;
-        let mut cumulative_pnl = Decimal::ZERO;
-        // First pass: pop fully-consumed lots.
-        while let Some(front) = queue.front() {
-            if remaining_to_sell <= Decimal::ZERO {
+        while remaining_to_sell > Decimal::ZERO {
+            let Some(front) = queue.front_mut() else {
                 break;
-            }
-            if front.tokens_received <= remaining_to_sell {
-                // Whole lot is consumed; allocate proceeds proportionally.
-                let lot = queue.pop_front().unwrap();
-                let share = if tokens_sold > Decimal::ZERO {
-                    lot.tokens_received / tokens_sold
-                } else {
-                    Decimal::ZERO
-                };
-                let lot_proceeds = total_proceeds * share;
-                let return_pct = if lot.sol_spent > Decimal::ZERO {
-                    ((lot_proceeds - lot.sol_spent) / lot.sol_spent * dec!(100)).round_dp(2)
-                } else {
-                    Decimal::ZERO
-                };
-                let pnl = lot_proceeds - lot.sol_spent;
-                cumulative_pnl += pnl;
-                consumed += 1;
-                remaining_to_sell -= lot.tokens_received;
-                last_trade = Some(CompletedTrade {
-                    return_pct,
-                    pnl_sol: pnl,
-                    entry_time: lot.timestamp,
-                    exit_time: sell_time,
-                });
-                self.completed_trades.push(last_trade.clone().unwrap());
-            } else {
-                break;
-            }
-        }
-        // If a partial lot remains, allocate the remaining proceeds to it
-        // without popping the lot (it still has tokens on hand).
-        if remaining_to_sell > Decimal::ZERO {
-            let need_pop = if let Some(front) = queue.front() {
-                let share = if tokens_sold > Decimal::ZERO {
-                    remaining_to_sell / tokens_sold
-                } else {
-                    Decimal::ZERO
-                };
-                let lot_proceeds = total_proceeds * share;
-                let return_pct = if front.sol_spent > Decimal::ZERO {
-                    ((lot_proceeds - front.sol_spent) / front.sol_spent * dec!(100)).round_dp(2)
-                } else {
-                    Decimal::ZERO
-                };
-                let pnl = lot_proceeds - front.sol_spent;
-                cumulative_pnl += pnl;
-                consumed += 1;
-                let entry_time = front.timestamp;
-                let still_remaining = front.tokens_received - remaining_to_sell;
-                let fully_consumed = still_remaining <= Decimal::ZERO;
-                last_trade = Some(CompletedTrade {
-                    return_pct,
-                    pnl_sol: pnl,
-                    entry_time,
-                    exit_time: sell_time,
-                });
-                self.completed_trades.push(last_trade.clone().unwrap());
-                fully_consumed
-            } else {
-                false
             };
-            if need_pop {
+            if front.tokens_received <= Decimal::ZERO {
                 queue.pop_front();
-            } else if let Some(front) = queue.front_mut() {
-                front.tokens_received -= remaining_to_sell;
+                continue;
+            }
+            let sold_from_lot = front.tokens_received.min(remaining_to_sell);
+            let cost_of_sold = front.sol_spent * sold_from_lot / front.tokens_received;
+            let proceeds = proceeds_per_token * sold_from_lot;
+            let return_pct = if cost_of_sold > Decimal::ZERO {
+                ((proceeds - cost_of_sold) / cost_of_sold * dec!(100)).round_dp(2)
+            } else {
+                Decimal::ZERO
+            };
+            last_trade = Some(CompletedTrade {
+                return_pct,
+                pnl_sol: proceeds - cost_of_sold,
+                entry_time: front.timestamp,
+                exit_time: sell_time,
+            });
+            front.tokens_received -= sold_from_lot;
+            front.sol_spent -= cost_of_sold;
+            let lot_exhausted = front.tokens_received.is_zero();
+            self.completed_trades.push(last_trade.clone().unwrap());
+            remaining_to_sell -= sold_from_lot;
+            if lot_exhausted {
+                queue.pop_front();
             }
         }
-        if consumed == 0 {
-            return None;
-        }
-        // Return the LAST realized trade so the caller can inspect it.
         last_trade
     }
 
@@ -369,6 +322,8 @@ pub struct WalletMonitor {
     /// Set once the initial cohort sweep is complete; afterwards only
     /// genuinely new on-chain signatures produce candidates.
     initial_rebuild_done: bool,
+    /// Guards the one-shot cohort validation summary log line.
+    validation_summary_logged: bool,
     /// Candidates produced during the startup reconstruction (drained by the
     /// next tick). Keeps `validate_all`'s signature unchanged.
     pending_candidates: Vec<CandidateInput>,
@@ -413,6 +368,7 @@ impl WalletMonitor {
             rebuilt: HashSet::new(),
             history_scan_budget: scan_budget,
             initial_rebuild_done: false,
+            validation_summary_logged: false,
             pending_candidates: Vec::new(),
         };
 
@@ -426,67 +382,63 @@ impl WalletMonitor {
         &self.validation_summary
     }
 
-    /// One-shot cohort validation. Each wallet is rebuilt exactly once via
-    /// `rebuild_wallet_history`; the report is derived from that pass so no
-    /// transaction is fetched twice (halves RPC cost on public endpoints).
+    /// One-shot cohort validation (used by tests and tooling): rebuild every
+    /// wallet exactly once and return the aggregated summary. The live
+    /// session performs the same work incrementally, one wallet per tick, to
+    /// stay responsive; both paths share `rebuild_wallet_history` and the
+    /// report accumulator.
     pub async fn validate_all(&mut self) -> Result<ValidationSummary, anyhow::Error> {
-        let total = self.wallets.len();
-        let mut summary = ValidationSummary {
-            wallets_loaded: total as u32,
-            ..Default::default()
-        };
-        tracing::info!(wallets = total, "starting wallet cohort validation");
+        tracing::info!(
+            wallets = self.wallets.len(),
+            "starting wallet cohort validation"
+        );
         for wallet in self.wallets.clone() {
-            if !is_valid_solana_address(&wallet) {
-                summary.wallets_invalid += 1;
-                tracing::info!(wallet = %wallet, status = ?WalletStatus::Invalid, "wallet validation");
-                summary.reports.push(WalletValidationReport {
-                    wallet: wallet.to_string(),
-                    status: WalletStatus::Invalid,
-                    signatures_fetched: 0,
-                    successful_transactions: 0,
-                    swaps_parsed: 0,
-                    buys: 0,
-                    sells: 0,
-                    dex_activity: HashMap::new(),
-                    last_activity_ts: None,
-                    first_activity_ts: None,
-                });
+            if self.rebuilt.contains(&wallet) {
                 continue;
             }
             let report = self.rebuild_wallet_history(&wallet).await;
-            summary.total_signatures += report.signatures_fetched as u64;
-            summary.total_successful_transactions += report.successful_transactions as u64;
-            summary.total_swaps_parsed += report.swaps_parsed as u64;
-            summary.total_buys += report.buys as u64;
-            summary.total_sells += report.sells as u64;
-            match report.status {
-                WalletStatus::ValidActive => {
-                    summary.wallets_valid += 1;
-                    summary.wallets_active += 1;
-                }
-                WalletStatus::NoSwapActivity => {
-                    summary.wallets_valid += 1;
-                    summary.wallets_no_swap_activity += 1;
-                }
-                WalletStatus::LowActivity => {
-                    summary.wallets_valid += 1;
-                    summary.wallets_low_activity += 1;
-                }
-                WalletStatus::Invalid | WalletStatus::Suspect => summary.wallets_invalid += 1,
-            }
-            tracing::info!(
-                wallet = %report.wallet,
-                status = ?report.status,
-                signatures = report.signatures_fetched,
-                successful = report.successful_transactions,
-                swaps = report.swaps_parsed,
-                buys = report.buys,
-                sells = report.sells,
-                "wallet validation"
-            );
-            summary.reports.push(report);
+            self.record_validation_report(report);
         }
+        self.initial_rebuild_done = true;
+        self.maybe_log_validation_summary();
+        Ok(self.validation_summary.clone())
+    }
+
+    /// Fold one wallet's validation report into the running summary.
+    fn record_validation_report(&mut self, report: WalletValidationReport) {
+        let summary = &mut self.validation_summary;
+        summary.wallets_loaded = self.wallets.len() as u32;
+        summary.total_signatures += report.signatures_fetched as u64;
+        summary.total_successful_transactions += report.successful_transactions as u64;
+        summary.total_swaps_parsed += report.swaps_parsed as u64;
+        summary.total_buys += report.buys as u64;
+        summary.total_sells += report.sells as u64;
+        match report.status {
+            WalletStatus::ValidActive => {
+                summary.wallets_valid += 1;
+                summary.wallets_active += 1;
+            }
+            WalletStatus::NoSwapActivity => {
+                summary.wallets_valid += 1;
+                summary.wallets_no_swap_activity += 1;
+            }
+            WalletStatus::LowActivity => {
+                summary.wallets_valid += 1;
+                summary.wallets_low_activity += 1;
+            }
+            WalletStatus::Invalid | WalletStatus::Suspect => summary.wallets_invalid += 1,
+        }
+        summary.reports.push(report);
+    }
+
+    /// Once every configured wallet has been reconstructed, log the cohort
+    /// composition exactly once so the operator can see the cohort state.
+    fn maybe_log_validation_summary(&mut self) {
+        if self.validation_summary_logged || self.rebuilt.len() < self.wallets.len() {
+            return;
+        }
+        self.validation_summary_logged = true;
+        let summary = self.validation_summary.clone();
         tracing::info!(
             wallets_loaded = summary.wallets_loaded,
             wallets_valid = summary.wallets_valid,
@@ -496,11 +448,14 @@ impl WalletMonitor {
             wallets_invalid = summary.wallets_invalid,
             signatures = summary.total_signatures,
             swaps = summary.total_swaps_parsed,
-            "wallet validation summary"
+            "wallet cohort validation complete"
         );
-        self.initial_rebuild_done = true;
-        self.validation_summary = summary.clone();
-        Ok(summary)
+        if summary.wallets_active == 0 {
+            tracing::error!(
+                wallets_loaded = summary.wallets_loaded,
+                "no VALID_ACTIVE wallets in cohort; live paper experiment will not produce signals"
+            );
+        }
     }
 
     /// Rebuild a single wallet's recent history from RPC, seed the tracker and
@@ -687,12 +642,13 @@ impl WalletMonitor {
 
         // Candidate construction for genuinely recent BUYs found in history.
         // Consensus is still required downstream: a single historical trade
-        // can never produce a trade on its own.
+        // can never produce a trade on its own. A mint that fails consensus
+        // here is NOT marked seen, so a later wallet's rebuild (or a live
+        // swap) can retry it once real consensus exists.
         for mint in &recent_buy_mints {
-            if self.seen_mints.contains(mint) || self.offered_mints.contains(mint) {
+            if self.offered_mints.contains(mint) {
                 continue;
             }
-            self.seen_mints.insert(mint.clone());
             let mut candidates = Vec::new();
             self.check_and_build_candidate(mint, &mut candidates, now)
                 .await;
@@ -733,17 +689,26 @@ impl WalletMonitor {
             );
             return Ok(new_candidates);
         }
-        // The startup validation/rebuild pass already reconstructed every
-        // wallet; during live polling only new signatures matter.
+        // Complete the startup sweep incrementally: one wallet per tick keeps
+        // the session responsive (exit monitor, interlocks, and candidate
+        // draining all run between rebuilds) instead of blocking startup for
+        // minutes on RPC latency. Candidates produced by each rebuild drain
+        // on the following tick.
         if !self.initial_rebuild_done {
-            self.initial_rebuild_done = true;
-            for wallet in self.wallets.clone() {
-                if self.rebuilt.contains(&wallet) {
-                    continue;
+            let next = self
+                .wallets
+                .iter()
+                .find(|w| !self.rebuilt.contains(*w))
+                .cloned();
+            match next {
+                Some(wallet) => {
+                    let report = self.rebuild_wallet_history(&wallet).await;
+                    self.record_validation_report(report);
+                    self.maybe_log_validation_summary();
+                    return Ok(new_candidates);
                 }
-                self.rebuild_wallet_history(&wallet).await;
+                None => self.initial_rebuild_done = true,
             }
-            return Ok(new_candidates);
         }
         let batch = Self::WALLETS_PER_TICK.min(total);
         let start = self.wallet_poll_idx % total;
@@ -770,18 +735,9 @@ impl WalletMonitor {
         now: DateTime<Utc>,
     ) -> Result<(), anyhow::Error> {
         if !self.rebuilt.contains(wallet) {
-            // Wallet was not rebuilt yet (e.g. validation was skipped or
-            // failed). Do the bounded reconstruction now.
-            self.rebuild_wallet_history(wallet).await;
-            if !self.rebuilt.contains(wallet) {
-                tracing::warn!(
-                    wallet = %wallet,
-                    "initial rebuild failed; will retry next tick"
-                );
-                return Ok(());
-            }
-            // Candidates from the reconstruction are queued for the next
-            // tick; this poll continues with new-signature detection.
+            // The startup sweep rebuilds one wallet per tick to keep the
+            // session responsive; live polling skips it until then.
+            return Ok(());
         }
 
         let sigs: Vec<SignatureEntry> = self
@@ -1018,7 +974,8 @@ impl WalletMonitor {
         tracing::info!(
             mint = %mint,
             position_usd = %self.position_usd,
-            "candidate created"
+            wallets = %candidate.wallets.iter().map(|w| w.wallet.as_str()).collect::<Vec<_>>().join(","),
+            "recent BUY candidate created"
         );
 
         self.seen_mints.insert(mint.to_string());
@@ -1231,5 +1188,116 @@ mod tests {
         assert_eq!(trade.pnl_sol, dec!(1));
         // Observation notionals are in USD: buy = 1 SOL * 150.
         assert_eq!(obs[0].notional_usd, dec!(150));
+    }
+
+    // --- Partial-sell accounting regressions ---
+
+    fn open_lot(
+        acc: &mut WalletAccumulator,
+        mint: &str,
+        sol_spent: Decimal,
+        tokens: Decimal,
+        ts: DateTime<Utc>,
+    ) {
+        acc.record_observation(mint, &SwapDirection::Buy, sol_spent, tokens, ts);
+    }
+
+    // Regression: a partial sell must book cost basis only for the sold
+    // quantity. Previously the whole lot's cost was subtracted, producing
+    // absurd (hugely negative) PnL and corrupting win rates.
+    #[test]
+    fn partial_sell_books_proportional_cost_not_whole_lot() {
+        let mut acc = WalletAccumulator::new();
+        let t0 = Utc::now();
+        // Buy 100 tokens for 1 SOL; sell 10 for 0.2 SOL (price doubled).
+        open_lot(&mut acc, "T", dec!(1), dec!(100), t0);
+        let trade = acc
+            .record_sell("T", dec!(10), dec!(0.2), t0)
+            .expect("partial sell must realize a trade");
+        // Cost of sold slice = 0.1 SOL; proceeds 0.2 SOL -> +100%.
+        assert_eq!(trade.return_pct, dec!(100.00));
+        assert_eq!(trade.pnl_sol, dec!(0.1));
+        // Remaining inventory: 90 tokens with 0.9 SOL cost carried forward.
+        let lot = &acc.open_positions.get("T").unwrap()[0];
+        assert_eq!(lot.tokens_received, dec!(90));
+        assert_eq!(lot.sol_spent, dec!(0.9));
+    }
+
+    #[test]
+    fn full_sell_closes_lot_completely() {
+        let mut acc = WalletAccumulator::new();
+        let t0 = Utc::now();
+        open_lot(&mut acc, "T", dec!(2), dec!(50), t0);
+        let trade = acc
+            .record_sell("T", dec!(50), dec!(3), t0)
+            .expect("full sell must realize a trade");
+        assert_eq!(trade.return_pct, dec!(50.00));
+        assert_eq!(trade.pnl_sol, dec!(1));
+        // Queue fully drained.
+        assert!(acc.open_positions.get("T").unwrap().is_empty());
+        assert_eq!(acc.completed_trades.len(), 1);
+    }
+
+    #[test]
+    fn multiple_partial_sells_each_book_own_slice() {
+        let mut acc = WalletAccumulator::new();
+        let t0 = Utc::now();
+        // Buy 100 tokens for 1 SOL. Sell 25 @ 0.5 SOL (price doubled),
+        // then 25 more @ 0.1 SOL (price dropped below entry).
+        open_lot(&mut acc, "T", dec!(1), dec!(100), t0);
+        let t1 = acc
+            .record_sell("T", dec!(25), dec!(0.5), t0)
+            .expect("first partial sell");
+        assert_eq!(t1.return_pct, dec!(100.00));
+        let t2 = acc
+            .record_sell("T", dec!(25), dec!(0.1), t0)
+            .expect("second partial sell");
+        // Cost basis 0.25 SOL, proceeds 0.1 SOL -> -60%.
+        assert_eq!(t2.return_pct, dec!(-60.00));
+        assert_eq!(t2.pnl_sol, dec!(-0.15));
+        // Remaining: 50 tokens at 0.5 SOL cost.
+        let lot = &acc.open_positions.get("T").unwrap()[0];
+        assert_eq!(lot.tokens_received, dec!(50));
+        assert_eq!(lot.sol_spent, dec!(0.5));
+        assert_eq!(acc.completed_trades.len(), 2);
+        // Aggregate stats: 1 win, 1 loss; PnL = (0.5-0.25) + (0.1-0.25) = +0.10.
+        let stats = acc.build_stats("W", Some(t0 + Duration::seconds(1)));
+        assert_eq!(stats.trades, 2);
+        assert_eq!(stats.win_rate, dec!(0.5));
+        assert_eq!(stats.realized_pnl_usd, dec!(0.10));
+    }
+
+    #[test]
+    fn sell_spanning_two_lots_books_each_lot_correctly() {
+        let mut acc = WalletAccumulator::new();
+        let t0 = Utc::now();
+        // Lot1: 100 tokens @ 1 SOL; lot2: 100 tokens @ 3 SOL.
+        open_lot(&mut acc, "T", dec!(1), dec!(100), t0);
+        open_lot(&mut acc, "T", dec!(3), dec!(100), t0);
+        // Sell 150 for 2 SOL -> 100 from lot1 (cost 1.0) + 50 from lot2 (cost 1.5).
+        let trade = acc
+            .record_sell("T", dec!(150), dec!(2), t0)
+            .expect("spanning sell");
+        // Last consumed slice: 50 from lot2 at cost 1.5, proceeds 2*50/150
+        // = 0.666... -> return = (0.6667-1.5)/1.5 = -55.56%.
+        assert_eq!(trade.return_pct.round_dp(2), dec!(-55.56));
+        // Remaining: 50 from lot2 at 1.5 SOL cost.
+        let remaining = &acc.open_positions.get("T").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].tokens_received, dec!(50));
+        assert_eq!(remaining[0].sol_spent, dec!(1.5));
+        assert_eq!(acc.completed_trades.len(), 2);
+    }
+
+    #[test]
+    fn oversell_stops_at_available_inventory() {
+        let mut acc = WalletAccumulator::new();
+        let t0 = Utc::now();
+        open_lot(&mut acc, "T", dec!(1), dec!(100), t0);
+        // Sell more than held: only the available 100 are accounted.
+        let trade = acc.record_sell("T", dec!(150), dec!(2), t0);
+        assert!(trade.is_some());
+        assert!(acc.open_positions.get("T").unwrap().is_empty());
+        assert_eq!(acc.completed_trades.len(), 1);
     }
 }
