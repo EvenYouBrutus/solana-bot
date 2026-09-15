@@ -839,6 +839,11 @@ struct SessionState {
     wallet_monitor: Option<crate::collector::wallet_monitor::WalletMonitor>,
     #[allow(dead_code)]
     report: PerformanceReport,
+    /// Fresh SOL/USD price fetched from Jupiter. Updated periodically in LIVE
+    /// mode. When `None` or stale, candidates are rejected.
+    sol_price_usd: Option<rust_decimal::Decimal>,
+    /// Timestamp of the last successful SOL price fetch.
+    sol_price_fetched_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Runs the trading session until `shutdown` resolves. Entries, exits,
@@ -865,6 +870,8 @@ pub async fn run_session(
         collector: CandidateCollector::new(),
         wallet_monitor: None,
         report: PerformanceReport::new(config.risk.starting_capital_usd),
+        sol_price_usd: None,
+        sol_price_fetched_at: None,
     };
 
     // Spawn the independent exit monitor BEFORE the wallet-monitor startup
@@ -1002,6 +1009,32 @@ async fn tick(
         state.risk.state.day_start_equity_usd = state.risk.state.equity_usd;
         state.risk.state.trades_today = 0;
         tracing::info!("daily risk window reset");
+    }
+
+    // Refresh SOL/USD price in LIVE mode. The config value is only used for
+    // paper/replay; live trading requires a fresh market price.
+    if deps.executor.is_live() {
+        let price_age_ok = state
+            .sol_price_fetched_at
+            .map(|t| (now - t).num_seconds() < 120)
+            .unwrap_or(false);
+        if !price_age_ok {
+            match deps.rpc.fetch_sol_price_usd().await {
+                Ok(Some(price)) if price > Decimal::ZERO => {
+                    state.sol_price_usd = Some(price);
+                    state.sol_price_fetched_at = Some(now);
+                    tracing::debug!(sol_price_usd = %price, "refreshed SOL price from Jupiter");
+                }
+                Ok(_) => {
+                    tracing::warn!("Jupiter returned invalid SOL price; candidates will be rejected");
+                    state.sol_price_usd = None;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "SOL price fetch failed; candidates will be rejected");
+                    state.sol_price_usd = None;
+                }
+            }
+        }
     }
 
     // Recurring on-chain reconciliation (live only).
@@ -1157,9 +1190,10 @@ async fn tick(
                 let count = wm_candidates.len();
                 for c in &wm_candidates {
                     let _ = store.set_last_liquidity(&c.mint, c.market.liquidity_usd);
-                    let Some(sol_price) = config.economics.sol_price_usd else {
+                    // Use fresh SOL price from Jupiter, not the config value.
+                    let Some(sol_price) = state.sol_price_usd else {
                         tracing::error!(
-                            "sol_price_usd required for wallet monitor quote; skipping candidate"
+                            "fresh sol_price_usd required for wallet monitor quote; skipping candidate"
                         );
                         continue;
                     };

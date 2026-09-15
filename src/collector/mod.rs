@@ -113,15 +113,20 @@ impl CandidateCollector {
     ) -> CollectResult {
         let now = Utc::now();
         let base_mint = &config.strategy.base_mint;
-        let Some(sol_price) = config.economics.sol_price_usd else {
-            tracing::error!(
-                "collect_live requires economics.sol_price_usd; no candidates produced"
-            );
-            return CollectResult::Candidates(vec![]);
-        };
-        if sol_price <= Decimal::ZERO {
-            tracing::error!(sol_price = %sol_price, "sol_price_usd must be positive; no candidates produced");
-            return CollectResult::Candidates(vec![]);
+        // Fetch fresh SOL/USD price from Jupiter's price API for LIVE mode.
+        // Do NOT use the config value (e.g. 150.0) as an implicit real-market price.
+        // If unavailable or stale, reject the candidate.
+        let sol_price = self.fetch_sol_price_usd().await;
+        match &sol_price {
+            None => {
+                tracing::error!("collect_live: unavailable SOL/USD price; no candidates produced");
+                return CollectResult::Candidates(vec![]);
+            }
+            Some(price) if *price <= Decimal::ZERO => {
+                tracing::error!(sol_price = %price, "collect_live: invalid SOL/USD price; no candidates produced");
+                return CollectResult::Candidates(vec![]);
+            }
+            _ => {}
         }
         let mut candidates = Vec::new();
 
@@ -236,40 +241,65 @@ impl CandidateCollector {
                     avg_priority_fee_usd: priority_fee_usd,
                     // Swap fee is embedded in the Jupiter route; we record 0
                     // because we cannot decompose the AMM fee from the quote.
+                    // In LIVE mode, unknown swap fee causes candidate rejection.
                     avg_swap_fee_bps: Decimal::ZERO,
                     avg_slippage_bps: Decimal::from(config.execution.slippage_bps),
                     avg_price_impact_bps: Decimal::from(quote.price_impact_bps),
                     // Failure data requires real execution history.
+                    // In LIVE mode, unknown failed tx cost causes candidate rejection.
                     failed_tx_rate: Decimal::ZERO,
                     avg_failed_tx_cost_usd: Decimal::ZERO,
                     // Win/loss assumptions must not be synthesized.
+                    // In LIVE mode, unknown win/loss ratio causes candidate rejection.
                     assumed_win_loss_ratio: Decimal::ZERO,
                     assumed_avg_loss_pct: Decimal::ZERO,
                 },
             };
 
-            // Expected return: without wallet consensus data, we have no
-            // basis for an expected return estimate. Using ZERO means the
-            // economic gate will reject this candidate if it requires a
-            // positive edge — which is the correct behavior.
-            candidates.push(CandidateInput {
-                mint: mint.to_string(),
-                token_decimals: Some(6),
-                base_mint_decimals: Some(9),
-                input_amount: quote.input_amount,
-                position_usd: input_value_usd,
-                expected_gross_return_pct: Decimal::ZERO,
-                market,
-                safety,
-                wallets,
-                costs,
-                blockchain_timestamp: now,
-                detection_timestamp: now,
-                candidate_timestamp: now,
-                detection_latency_ms: 0,
-            });
-        }
-
+            // Reject LIVE candidates with unknown cost components.
+            // Known zero costs (e.g., slippage from config, price impact from quote)
+            // are valid. Unknown/unavailable costs must cause rejection.
+            // Swap fee: cannot decompose from AMM quote -> unknown -> reject
+            // Failed tx rate: no execution history -> unknown -> reject
+            // Failed tx cost: no execution history -> unknown -> reject
+            // Win/loss ratio: no wallet consensus -> unknown -> reject
+            // Avg loss pct: no wallet data -> unknown -> reject
+            if costs
+                .input
+                .avg_swap_fee_bps
+                .is_zero()
+                || costs.input.failed_tx_rate.is_zero()
+                || costs.input.avg_failed_tx_cost_usd.is_zero()
+                || costs.input.assumed_win_loss_ratio.is_zero()
+                || costs.input.assumed_avg_loss_pct.is_zero()
+            {
+                tracing::warn!(
+                    mint = %mint,
+                    "LIVE candidate rejected: unknown cost component (swap_fee_bps={}, failed_tx_rate={}, failed_tx_cost_usd={}, win_loss_ratio={}, loss_pct)",
+                    costs.input.avg_swap_fee_bps,
+                    costs.input.failed_tx_rate,
+                    costs.input.avg_failed_tx_cost_usd,
+                    costs.input.assumed_win_loss_ratio,
+                    costs.input.assumed_avg_loss_pct,
+),
+                continue;
+            }
+            mint: mint.to_string(),
+            token_decimals: Some(6),
+            base_mint_decimals: Some(9),
+            input_amount: quote.input_amount,
+            position_usd: input_value_usd,
+            expected_gross_return_pct: Decimal::ZERO,
+            market,
+            safety,
+            wallets,
+            costs,
+            blockchain_timestamp: now,
+            detection_timestamp: now,
+            candidate_timestamp: now,
+detection_latency_ms: 0,
+            }
+        
         tracing::info!(
             count = candidates.len(),
             "live collection produced candidates"
@@ -317,6 +347,34 @@ impl CandidateCollector {
 
     pub fn clear_seen(&mut self) {
         self.seen.clear();
+    }
+
+    /// Fetch the current SOL/USD price from Jupiter's price API.
+    /// Returns None if the API is unreachable or returns invalid data.
+    async fn fetch_sol_price_usd(&self) -> Option<Decimal> {
+        use reqwest::Client;
+        let client = Client::new();
+        let url = "https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112";
+        let resp = match client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        let price_opt = body["data"]["So11111111111111111111111111111111111111112"]["price"].as_f64();
+        let price = match price_opt {
+            Some(p) if p > 0.0 => Decimal::from_f64(p).unwrap_or_else(|| {
+                let s = format!("{}", p);
+                rust_decimal::Decimal::from_str_radix(&s, 10).unwrap_or(Decimal::ZERO)
+            }),
+            _ => return None,
+        };
+        Some(price)
     }
 }
 

@@ -24,6 +24,12 @@ pub struct WalletStats {
     pub score: Decimal,
     pub tier: WalletTier,
     pub updated_at: DateTime<Utc>,
+    /// Average return percentage of winning trades (positive values).
+    /// None when no winning trades exist — caller must not assume a value.
+    pub avg_win_pct: Option<Decimal>,
+    /// Average loss magnitude (positive number) of losing trades.
+    /// None when no losing trades exist — caller must not assume a value.
+    pub avg_loss_pct: Option<Decimal>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletTradeObservation {

@@ -382,6 +382,21 @@ impl Config {
             ));
         }
         if self.mode == Mode::Live {
+            match self.economics.sol_price_usd {
+                None => {
+                    return Err(ConfigError::Invalid(
+                        "live mode requires sol_price_usd to be configured for fee conversion".into(),
+                    ));
+                }
+                Some(price) if price <= Decimal::ZERO => {
+                    return Err(ConfigError::Invalid(
+                        "sol_price_usd must be positive in live mode".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if self.mode == Mode::Live {
             match self.execution.jupiter_api_key_env.as_deref() {
                 None => {
                     return Err(ConfigError::Invalid(

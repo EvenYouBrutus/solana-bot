@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use reqwest::Client;
+use rust_decimal::Decimal;
 use serde_json::{json, Value};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -563,6 +565,46 @@ impl RpcPool {
             }
         }
         Ok(result)
+    }
+
+    /// Fetch the current SOL/USD price from Jupiter's price API.
+    /// Returns `None` if the API is unreachable or returns invalid data.
+    /// The price is fetched from a single public endpoint with a short
+    /// timeout; callers should cache the result and refresh periodically.
+    pub async fn fetch_sol_price_usd(&self) -> Result<Option<Decimal>, RpcError> {
+        let url = "https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112";
+        let resp = self
+            .client
+            .get(url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(RpcError::Http)?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let body: Value = resp.json().await.map_err(RpcError::Http)?;
+        let price_str = body["data"]["So11111111111111111111111111111111111111112"]["price"]
+            .as_str()
+            .or_else(|| {
+                body["data"]["So11111111111111111111111111111111111111112"]["price"]
+                    .as_f64()
+                    .map(|_| "") // force below path
+            });
+        // Try string first, then numeric
+        let price_val = body["data"]["So11111111111111111111111111111111111111112"]["price"]
+            .as_f64();
+        match price_val {
+            Some(p) if p > 0.0 => {
+                // Convert f64 to Decimal via string to avoid float precision issues
+                let price_str = format!("{:.2}", p);
+                match Decimal::from_str(&price_str) {
+                    Ok(d) if d > Decimal::ZERO => Ok(Some(d)),
+                    _ => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
     }
 }
 #[cfg(test)]

@@ -280,6 +280,8 @@ impl WalletAccumulator {
                 score: Decimal::ZERO,
                 tier: WalletTier::Candidate,
                 updated_at: cutoff,
+                avg_win_pct: None,
+                avg_loss_pct: None,
             };
         }
 
@@ -291,6 +293,35 @@ impl WalletAccumulator {
 
         let returns: Vec<Decimal> = trades.iter().map(|t| t.return_pct).collect();
         let avg_return = returns.iter().sum::<Decimal>() / Decimal::from(count);
+
+        // Compute average win and average loss from observed trades.
+        // These feed directly into the cost model's break-even calculator.
+        let winning_returns: Vec<Decimal> = trades
+            .iter()
+            .filter(|t| t.return_pct > Decimal::ZERO)
+            .map(|t| t.return_pct)
+            .collect();
+        let losing_returns: Vec<Decimal> = trades
+            .iter()
+            .filter(|t| t.return_pct < Decimal::ZERO)
+            .map(|t| t.return_pct.abs())
+            .collect();
+        let avg_win_pct = if winning_returns.is_empty() {
+            None
+        } else {
+            Some(
+                winning_returns.iter().sum::<Decimal>()
+                    / Decimal::from(winning_returns.len()),
+            )
+        };
+        let avg_loss_pct = if losing_returns.is_empty() {
+            None
+        } else {
+            Some(
+                losing_returns.iter().sum::<Decimal>()
+                    / Decimal::from(losing_returns.len()),
+            )
+        };
 
         let mut sorted = returns.clone();
         sorted.sort();
@@ -332,6 +363,8 @@ impl WalletAccumulator {
             score: Decimal::ZERO,
             tier: WalletTier::Candidate,
             updated_at: cutoff,
+            avg_win_pct,
+            avg_loss_pct,
         }
     }
 }
@@ -372,6 +405,10 @@ pub struct WalletMonitor {
     /// Prevents the same transaction from being processed twice when both
     /// paths detect it simultaneously.
     ws_seen_sigs: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Fresh SOL/USD price injected by the runtime each tick. Required for
+    /// fee conversion and notional calculation. When `None`, the wallet
+    /// monitor rejects candidates to prevent stale pricing.
+    sol_price: Option<Decimal>,
 }
 
 impl WalletMonitor {
@@ -456,6 +493,7 @@ impl WalletMonitor {
             pending_candidates: Vec::new(),
             ws_event_rx: Some(ws_event_rx),
             ws_seen_sigs,
+            sol_price: None,
         };
 
         tracing::info!(
@@ -466,6 +504,12 @@ impl WalletMonitor {
 
     pub fn validation_summary(&self) -> &ValidationSummary {
         &self.validation_summary
+    }
+
+    /// Update the fresh SOL/USD price used for fee conversion and notional
+    /// calculation. Called by the runtime each tick with a Jupiter-fetched price.
+    pub fn set_sol_price(&mut self, price: Option<Decimal>) {
+        self.sol_price = price;
     }
 
     /// One-shot cohort validation (used by tests and tooling): rebuild every
@@ -819,7 +863,11 @@ impl WalletMonitor {
                 "recent BUY candidate gate"
             );
             let mut candidates = Vec::new();
-            self.check_and_build_candidate(mint, &mut candidates, now)
+            let sol_price = self
+                .sol_price
+                .or(self.config.economics.sol_price_usd)
+                .unwrap_or_default();
+            self.check_and_build_candidate(mint, &mut candidates, now, sol_price)
                 .await;
             self.pending_candidates.extend(candidates);
         }
@@ -1054,7 +1102,11 @@ impl WalletMonitor {
             if self.offered_mints.contains(mint) {
                 continue;
             }
-            self.check_and_build_candidate(mint, new_candidates, now)
+            let Some(sol_price) = self.sol_price else {
+                tracing::debug!(mint = %mint, "SOL price unavailable; skipping candidate build");
+                continue;
+            };
+            self.check_and_build_candidate(mint, new_candidates, now, sol_price)
                 .await;
         }
 
@@ -1087,11 +1139,13 @@ impl WalletMonitor {
             "processing WebSocket swap event"
         );
 
-        let sol_price = self
-            .config
-            .economics
-            .sol_price_usd
-            .expect("sol_price_usd validated at WalletMonitor initialization");
+        let sol_price = match self.sol_price {
+            Some(p) => p,
+            None => {
+                tracing::debug!("SOL price unavailable; dropping WebSocket swap event");
+                return;
+            }
+        };
 
         let mut observations = Vec::new();
         let accumulator = self
@@ -1124,7 +1178,7 @@ impl WalletMonitor {
                 let mint = event.swap.output_mint.clone();
                 self.seen_mints.insert(mint.clone());
                 if !self.offered_mints.contains(&mint) {
-                    self.check_and_build_candidate(&mint, new_candidates, now)
+                    self.check_and_build_candidate(&mint, new_candidates, now, sol_price)
                         .await;
                 }
             }
@@ -1137,6 +1191,7 @@ impl WalletMonitor {
         mint: &str,
         new_candidates: &mut Vec<CandidateInput>,
         now: DateTime<Utc>,
+        sol_price: Decimal,
     ) {
         if self.seen_mints.contains(mint) && new_candidates.iter().any(|c| c.mint == mint) {
             return;
@@ -1193,11 +1248,6 @@ impl WalletMonitor {
             }
         };
 
-        let sol_price = self
-            .config
-            .economics
-            .sol_price_usd
-            .expect("sol_price_usd validated at WalletMonitor initialization");
         let base_mint_decimals = 9u8;
         let input_amount = match (self.position_usd / sol_price * dec!(1_000_000_000))
             .to_string()
@@ -1255,6 +1305,44 @@ impl WalletMonitor {
         // is negative or zero, that is the real signal — do not inflate it.
         let expected_gross_return = avg_return;
 
+        // Compute win/loss assumptions from observed wallet trade data.
+        // The break-even calculator requires both to be positive; if any
+        // consensus wallet lacks either wins or losses, we conservatively
+        // cannot populate the cost model and the candidate is rejected.
+        let avg_win_pct_across_wallets: Option<Decimal> = {
+            let valid: Vec<Decimal> = consensus_wallets
+                .iter()
+                .filter_map(|w| w.avg_win_pct)
+                .collect();
+            if valid.is_empty() {
+                None
+            } else {
+                Some(valid.iter().sum::<Decimal>() / Decimal::from(valid.len()))
+            }
+        };
+        let avg_loss_pct_across_wallets: Option<Decimal> = {
+            let valid: Vec<Decimal> = consensus_wallets
+                .iter()
+                .filter_map(|w| w.avg_loss_pct)
+                .collect();
+            if valid.is_empty() {
+                None
+            } else {
+                Some(valid.iter().sum::<Decimal>() / Decimal::from(valid.len()))
+            }
+        };
+        let (assumed_win_loss_ratio, assumed_avg_loss_pct) =
+            match (avg_win_pct_across_wallets, avg_loss_pct_across_wallets) {
+                (Some(win), Some(loss)) if loss > Decimal::ZERO => (win / loss, loss),
+                _ => {
+                    tracing::info!(
+                        mint = %mint,
+                        "consensus wallets lack sufficient win/loss data for cost model; candidate rejected"
+                    );
+                    return;
+                }
+            };
+
         let cost_model = CostModel {
             observed_at: now,
             input: BreakEvenInputs {
@@ -1278,11 +1366,11 @@ impl WalletMonitor {
                 // calculator does not add phantom failure costs.
                 failed_tx_rate: Decimal::ZERO,
                 avg_failed_tx_cost_usd: Decimal::ZERO,
-                // Win/loss ratio and average loss are strategy assumptions
-                // that must NOT be synthesized. If the economic gate
-                // requires them, it will reject — which is correct.
-                assumed_win_loss_ratio: Decimal::ZERO,
-                assumed_avg_loss_pct: Decimal::ZERO,
+                // Win/loss assumptions derived from observed wallet trade
+                // data — not synthesized. The candidate was already rejected
+                // above if these could not be computed.
+                assumed_win_loss_ratio,
+                assumed_avg_loss_pct,
             },
             source: "wallet_monitor".into(),
             is_live_snapshot: true,
