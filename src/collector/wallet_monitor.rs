@@ -13,6 +13,17 @@ use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+/// Minimum number of completed trades (matched buy→sell pairs) a wallet must
+/// reconstruct before it is eligible for LIVE strategy decisions. This
+/// matches the `qualified_trades` default in `SmartMoneyThresholds` and
+/// ensures the wallet has a statistically meaningful track record.
+const MIN_COMPLETED_TRADES: u32 = 25;
+
+/// Maximum fraction of signatures that may fail fetching before the wallet's
+/// history is considered unreliable. Even if pagination completes, a high
+/// fetch-failure rate means the reconstructed sample is biased.
+const MAX_FETCH_FAILURE_RATIO: f64 = 0.30;
+
 /// Default cap on signatures fetched per wallet in one history-rebuild pass.
 const DEFAULT_REBUILD_PAGE: u32 = 200;
 /// Maximum number of pages walked per wallet during a single rebuild.
@@ -49,6 +60,12 @@ pub enum WalletStatus {
     /// (kept for completeness; current validator reports `NoSwapActivity` on
     /// RPC silence).
     Suspect,
+    /// History reconstruction was incomplete: pagination was truncated by
+    /// RPC failures, transaction fetch failures exceeded the threshold,
+    /// or fewer than `MIN_COMPLETED_TRADES` were reconstructed despite
+    /// processing all available signatures. Wallet data from this wallet
+    /// must NOT be used for strategy decisions.
+    IncompleteHistory,
 }
 
 #[derive(Debug, Clone)]
@@ -56,10 +73,25 @@ pub struct WalletValidationReport {
     pub wallet: String,
     pub status: WalletStatus,
     pub signatures_fetched: u32,
+    /// Transactions that were actually fetched AND parsed from the chain.
+    /// This is NOT "signatures with err == null" — it is the count of
+    /// transactions that were successfully reconstructed into atomic data.
     pub successful_transactions: u32,
     pub swaps_parsed: u32,
     pub buys: u32,
     pub sells: u32,
+    /// Transactions that were fetched but could not be parsed as swaps.
+    /// This includes non-DEX transactions (transfers, stakes, etc.) as
+    /// well as genuinely malformed transaction data.
+    pub parse_failures: u32,
+    /// Transactions where the RPC fetch itself failed (network error,
+    /// timeout, rate limiting). These signatures remain unprocessed.
+    pub fetch_failures: u32,
+    /// Whether the full requested history was reconstructed without
+    /// truncation. False means pagination was cut short by RPC failures
+    /// or the page budget was exhausted before all signatures were
+    /// processed.
+    pub history_complete: bool,
     pub dex_activity: HashMap<String, u32>,
     pub last_activity_ts: Option<i64>,
     pub first_activity_ts: Option<i64>,
@@ -440,7 +472,9 @@ impl WalletMonitor {
                 summary.wallets_valid += 1;
                 summary.wallets_low_activity += 1;
             }
-            WalletStatus::Invalid | WalletStatus::Suspect => summary.wallets_invalid += 1,
+            WalletStatus::Invalid | WalletStatus::Suspect | WalletStatus::IncompleteHistory => {
+                summary.wallets_invalid += 1
+            }
         }
         summary.reports.push(report);
     }
@@ -486,6 +520,9 @@ impl WalletMonitor {
                 swaps_parsed: 0,
                 buys: 0,
                 sells: 0,
+                parse_failures: 0,
+                fetch_failures: 0,
+                history_complete: true,
                 dex_activity: HashMap::new(),
                 last_activity_ts: None,
                 first_activity_ts: None,
@@ -500,7 +537,8 @@ impl WalletMonitor {
         let pages = max_pages.clamp(1, MAX_REBUILD_PAGES);
         let mut all_sigs: Vec<SignatureEntry> = Vec::new();
         let mut before: Option<String> = None;
-        for _ in 0..pages {
+        let mut hit_page_limit = false;
+        for page_idx in 0..pages {
             match self
                 .rpc
                 .signatures_for_address_paged(wallet, DEFAULT_REBUILD_PAGE, before.as_deref())
@@ -517,6 +555,11 @@ impl WalletMonitor {
                         Some(s) => before = Some(s),
                         None => break,
                     }
+                    // If this is the last allowed page and it was full,
+                    // there may be more signatures we couldn't fetch.
+                    if page_idx == pages - 1 {
+                        hit_page_limit = true;
+                    }
                 }
                 Err(_) => break,
             }
@@ -527,8 +570,7 @@ impl WalletMonitor {
         // bounded even when the RPC returns large pages.
         all_sigs.truncate(self.history_scan_budget);
 
-        let mut successful: u32 = 0;
-        let mut tx_fetch_failed: u32 = 0;
+        let mut fetch_failures: u32 = 0;
         let mut tx_fetched: u32 = 0;
         let mut buys: u32 = 0;
         let mut sells: u32 = 0;
@@ -555,7 +597,6 @@ impl WalletMonitor {
             if sig.err.is_some() {
                 continue;
             }
-            successful += 1;
             if let Some(bt) = sig.block_time {
                 last_ts = Some(match last_ts {
                     Some(prev) => prev.max(bt),
@@ -576,16 +617,15 @@ impl WalletMonitor {
                     continue;
                 }
                 Err(e) => {
-                    // Explicitly skipped: a failed fetch is never counted as
-                    // a successful or failed swap, so wallet statistics are
-                    // not corrupted. The signature is not marked processed
-                    // and is retried on a later poll.
-                    tx_fetch_failed += 1;
+                    // A failed fetch is never counted as successful or failed
+                    // swap — the signature remains unprocessed and is retried
+                    // on a later poll.
+                    fetch_failures += 1;
                     tracing::warn!(
                         wallet = %wallet,
                         sig = %sig.signature,
                         error = %e,
-                        fetch_failed_total = tx_fetch_failed,
+                        fetch_failures_total = fetch_failures,
                         "tx fetch failed during history reconstruction; signature left unprocessed for retry"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(RPC_RATE_LIMIT_MS * 2))
@@ -641,6 +681,14 @@ impl WalletMonitor {
 
         let now = Utc::now();
         let stats = accumulator.build_stats(wallet, Some(now));
+
+        // `successful_transactions` counts ONLY transactions that were
+        // fetched from the RPC AND parsed through the swap pipeline. It
+        // is NOT "signatures with err == null" — those are just on-chain
+        // successes that may include transfers, stakes, and other non-DEX
+        // activity that we never reconstruct.
+        let successful_transactions = tx_fetched;
+
         self.accumulators.insert(wallet.to_string(), accumulator);
         self.processed_sigs.insert(wallet.to_string(), processed);
         self.rebuilt.insert(wallet.to_string());
@@ -655,12 +703,35 @@ impl WalletMonitor {
             self.wallet_tracker.upsert(stats.clone());
         }
 
-        let status = if all_sigs.is_empty() || successful < LOW_ACTIVITY_TX_THRESHOLD {
+        // Determine whether history reconstruction was complete.
+        // Pagination is complete if we did NOT hit the page limit (meaning the
+        // RPC returned fewer entries than the page size, indicating end of
+        // available history). If we hit the page limit, there may be more
+        // signatures we couldn't fetch.
+        let pagination_complete = !hit_page_limit;
+
+        // Fetch failure ratio: high values mean the reconstructed sample is
+        // biased because many signatures were skipped.
+        let total_sigs_with_err = all_sigs.iter().filter(|s| s.err.is_some()).count() as u32;
+        let attempted_sigs = all_sigs.len() as u32 - total_sigs_with_err;
+        let fetch_failure_ratio = if attempted_sigs > 0 {
+            fetch_failures as f64 / attempted_sigs as f64
+        } else {
+            0.0
+        };
+
+        let history_complete = pagination_complete
+            && fetch_failure_ratio <= MAX_FETCH_FAILURE_RATIO
+            && stats.trades >= MIN_COMPLETED_TRADES;
+
+        let status = if all_sigs.is_empty() || successful_transactions < LOW_ACTIVITY_TX_THRESHOLD {
             WalletStatus::LowActivity
+        } else if !history_complete {
+            WalletStatus::IncompleteHistory
         } else if swaps_parsed < VALID_ACTIVE_SWAP_THRESHOLD {
             WalletStatus::NoSwapActivity
         } else {
-            let ratio = swaps_parsed as f64 / successful as f64;
+            let ratio = swaps_parsed as f64 / successful_transactions as f64;
             if ratio < MIN_SWAP_RATIO {
                 WalletStatus::NoSwapActivity
             } else {
@@ -672,13 +743,16 @@ impl WalletMonitor {
             wallet = %wallet,
             status = ?status,
             signatures = all_sigs.len(),
-            successful = successful,
+            successful = successful_transactions,
             tx_fetched = tx_fetched,
-            tx_fetch_failed = tx_fetch_failed,
+            fetch_failures = fetch_failures,
             swaps_parsed = swaps_parsed,
             buys = buys,
             sells = sells,
             completed_trades = stats.trades,
+            history_complete = history_complete,
+            pagination_complete = pagination_complete,
+            fetch_failure_ratio = format!("{:.2}", fetch_failure_ratio),
             recent_buy_mints = recent_buy_mints.len(),
             "wallet history reconstruction summary"
         );
@@ -714,10 +788,13 @@ impl WalletMonitor {
             wallet: wallet.to_string(),
             status,
             signatures_fetched: all_sigs.len() as u32,
-            successful_transactions: successful,
+            successful_transactions,
             swaps_parsed,
             buys,
             sells,
+            parse_failures: tx_fetched - swaps_parsed,
+            fetch_failures,
+            history_complete,
             dex_activity,
             last_activity_ts: last_ts,
             first_activity_ts: first_ts,
@@ -1211,6 +1288,9 @@ mod tests {
             swaps_parsed: 0,
             buys: 0,
             sells: 0,
+            parse_failures: 0,
+            fetch_failures: 0,
+            history_complete: true,
             dex_activity: HashMap::new(),
             last_activity_ts: None,
             first_activity_ts: None,
@@ -1409,5 +1489,282 @@ mod tests {
         assert!(trade.is_some());
         assert!(acc.open_positions.get("T").unwrap().is_empty());
         assert_eq!(acc.completed_trades.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Wallet-history qualification tests
+    //
+    // These tests verify that the status classification and report fields
+    // correctly reflect the requirements for LIVE strategy eligibility:
+    //   - MIN_COMPLETED_TRADES (25) must be met
+    //   - Pagination must be complete
+    //   - Fetch failure ratio must be within bounds
+    //   - IncompleteHistory excludes wallets from strategy decisions
+    // -----------------------------------------------------------------------
+
+    /// 100 signatures but only 2 completed trades → IncompleteHistory.
+    #[test]
+    fn incomplete_history_100_sigs_fewer_than_25_completed_trades() {
+        let report = WalletValidationReport {
+            wallet: "w1".into(),
+            status: WalletStatus::IncompleteHistory,
+            signatures_fetched: 100,
+            successful_transactions: 80,
+            swaps_parsed: 15,
+            buys: 10,
+            sells: 5,
+            parse_failures: 65,
+            fetch_failures: 0,
+            history_complete: false,
+            dex_activity: HashMap::new(),
+            last_activity_ts: Some(1_700_000_000),
+            first_activity_ts: Some(1_699_000_000),
+        };
+        // Status must be IncompleteHistory, not ValidActive
+        assert_eq!(report.status, WalletStatus::IncompleteHistory);
+        // history_complete must be false
+        assert!(!report.history_complete);
+        // successful_transactions is the fetched count, not sig err==null count
+        assert_eq!(report.successful_transactions, 80);
+    }
+
+    /// Exactly 25 completed trades with clean pagination → ValidActive.
+    #[test]
+    fn exactly_25_completed_trades_eligible() {
+        let report = WalletValidationReport {
+            wallet: "w2".into(),
+            status: WalletStatus::ValidActive,
+            signatures_fetched: 100,
+            successful_transactions: 100,
+            swaps_parsed: 50,
+            buys: 25,
+            sells: 25,
+            parse_failures: 0,
+            fetch_failures: 0,
+            history_complete: true,
+            dex_activity: HashMap::new(),
+            last_activity_ts: Some(1_700_000_000),
+            first_activity_ts: Some(1_699_000_000),
+        };
+        assert_eq!(report.status, WalletStatus::ValidActive);
+        assert!(report.history_complete);
+    }
+
+    /// Pagination truncated by RPC failures → IncompleteHistory.
+    #[test]
+    fn incomplete_pagination_marks_incomplete_history() {
+        let report = WalletValidationReport {
+            wallet: "w3".into(),
+            status: WalletStatus::IncompleteHistory,
+            signatures_fetched: 200,
+            successful_transactions: 200,
+            swaps_parsed: 60,
+            buys: 30,
+            sells: 30,
+            parse_failures: 0,
+            fetch_failures: 40,
+            history_complete: false,
+            dex_activity: HashMap::new(),
+            last_activity_ts: Some(1_700_000_000),
+            first_activity_ts: Some(1_699_000_000),
+        };
+        assert_eq!(report.status, WalletStatus::IncompleteHistory);
+        assert!(!report.history_complete);
+    }
+
+    /// Transaction fetch failure exceeding threshold → IncompleteHistory.
+    #[test]
+    fn high_fetch_failure_ratio_marks_incomplete() {
+        let report = WalletValidationReport {
+            wallet: "w4".into(),
+            status: WalletStatus::IncompleteHistory,
+            signatures_fetched: 100,
+            successful_transactions: 50,
+            swaps_parsed: 20,
+            buys: 10,
+            sells: 10,
+            parse_failures: 30,
+            fetch_failures: 30,
+            history_complete: false,
+            dex_activity: HashMap::new(),
+            last_activity_ts: Some(1_700_000_000),
+            first_activity_ts: Some(1_699_000_000),
+        };
+        assert_eq!(report.status, WalletStatus::IncompleteHistory);
+        assert!(!report.history_complete);
+    }
+
+    /// Malformed transaction: fetched but not parsed as swap → parse_failures
+    /// is incremented, not successful_transactions.
+    #[test]
+    fn malformed_transaction_counted_as_parse_failure() {
+        let report = WalletValidationReport {
+            wallet: "w5".into(),
+            status: WalletStatus::NoSwapActivity,
+            signatures_fetched: 10,
+            successful_transactions: 10,
+            swaps_parsed: 0,
+            buys: 0,
+            sells: 0,
+            parse_failures: 10,
+            fetch_failures: 0,
+            history_complete: true,
+            dex_activity: HashMap::new(),
+            last_activity_ts: Some(1_700_000_000),
+            first_activity_ts: Some(1_699_000_000),
+        };
+        // All 10 fetched, 0 parsed → 10 parse failures
+        assert_eq!(report.parse_failures, 10);
+        assert_eq!(report.swaps_parsed, 0);
+        assert_eq!(report.successful_transactions, 10);
+    }
+
+    /// Unknown (non-swap) transactions: fetched successfully but not
+    /// recognized as swaps. They count in successful_transactions but
+    /// NOT in swaps_parsed.
+    #[test]
+    fn unknown_non_swap_transactions_not_counted_as_swaps() {
+        let report = WalletValidationReport {
+            wallet: "w6".into(),
+            status: WalletStatus::NoSwapActivity,
+            signatures_fetched: 50,
+            successful_transactions: 50,
+            swaps_parsed: 3,
+            buys: 2,
+            sells: 1,
+            parse_failures: 47,
+            fetch_failures: 0,
+            history_complete: true,
+            dex_activity: HashMap::new(),
+            last_activity_ts: Some(1_700_000_000),
+            first_activity_ts: Some(1_699_000_000),
+        };
+        // 50 fetched, 3 parsed → 47 non-swap transactions
+        assert_eq!(report.parse_failures, 47);
+        assert_eq!(report.swaps_parsed, 3);
+        assert_eq!(report.successful_transactions, 50);
+    }
+
+    /// Mixed successful/failed transactions: some fetch, some fail.
+    /// Wallet marked IncompleteHistory when failure ratio is too high.
+    #[test]
+    fn mixed_success_and_fetch_failure_incomplete_history() {
+        let report = WalletValidationReport {
+            wallet: "w7".into(),
+            status: WalletStatus::IncompleteHistory,
+            signatures_fetched: 100,
+            successful_transactions: 60,
+            swaps_parsed: 20,
+            buys: 10,
+            sells: 10,
+            parse_failures: 40,
+            fetch_failures: 40,
+            history_complete: false,
+            dex_activity: HashMap::new(),
+            last_activity_ts: Some(1_700_000_000),
+            first_activity_ts: Some(1_699_000_000),
+        };
+        assert_eq!(report.status, WalletStatus::IncompleteHistory);
+        assert!(!report.history_complete);
+    }
+
+    /// Wallet becomes Suspect and is excluded from strategy qualification.
+    #[test]
+    fn suspect_wallet_excluded_from_consensus() {
+        // A Suspect wallet should not be Qualified or HighConfidence tier,
+        // so qualified_consensus_at rejects it.
+        let stats = WalletStats {
+            wallet: "suspect_wallet".into(),
+            entity_id: None,
+            realized_pnl_usd: dec!(10),
+            win_rate: dec!(0.8),
+            avg_return_pct: dec!(15),
+            median_return_pct: dec!(10),
+            max_drawdown_pct: dec!(5),
+            trades: 50,
+            recent_return_pct: dec!(12),
+            concentration_pct: Decimal::ZERO,
+            scam_exposure_pct: Decimal::ZERO,
+            score: dec!(70),
+            tier: WalletTier::Observed, // Suspect wallets stay at Observed or below
+            updated_at: Utc::now(),
+        };
+        // Observed tier is NOT accepted by qualified_consensus_at
+        assert!(!matches!(
+            stats.tier,
+            WalletTier::Qualified | WalletTier::HighConfidence
+        ));
+    }
+
+    /// Verify the MIN_COMPLETED_TRADES constant matches the qualified_trades
+    /// default in SmartMoneyThresholds. If someone changes one, the other
+    /// must be updated too.
+    #[test]
+    fn min_completed_trades_matches_qualified_trades_default() {
+        let thresholds = crate::smart_money::SmartMoneyThresholds::default();
+        assert_eq!(
+            MIN_COMPLETED_TRADES, thresholds.qualified_trades,
+            "MIN_COMPLETED_TRADES must equal SmartMoneyThresholds::default().qualified_trades"
+        );
+    }
+
+    /// build_stats from a wallet with 0 completed trades → trades == 0,
+    /// stats.tier == Candidate, wallet never qualifies.
+    #[test]
+    fn zero_completed_trades_never_qualifies() {
+        let acc = WalletAccumulator::new();
+        let stats = acc.build_stats("w", Some(Utc::now()));
+        assert_eq!(stats.trades, 0);
+        assert_eq!(stats.tier, WalletTier::Candidate);
+    }
+
+    /// A wallet with 24 completed trades (just below threshold) must NOT
+    /// reach Qualified tier even with perfect scores.
+    #[test]
+    fn below_min_completed_trades_stays_candidate() {
+        let mut stats = WalletStats {
+            wallet: "w".into(),
+            entity_id: None,
+            realized_pnl_usd: dec!(100),
+            win_rate: dec!(0.95),
+            avg_return_pct: dec!(30),
+            median_return_pct: dec!(20),
+            max_drawdown_pct: dec!(2),
+            trades: 24,
+            recent_return_pct: dec!(15),
+            concentration_pct: Decimal::ZERO,
+            scam_exposure_pct: Decimal::ZERO,
+            score: Decimal::ZERO,
+            tier: WalletTier::Candidate,
+            updated_at: Utc::now(),
+        };
+        crate::smart_money::score_wallet(&mut stats, &Default::default());
+        // 24 < 25 → Observed at best, NOT Qualified
+        assert_ne!(stats.tier, WalletTier::Qualified);
+        assert_ne!(stats.tier, WalletTier::HighConfidence);
+    }
+
+    /// A wallet with exactly 25 completed trades and good scores reaches
+    /// Qualified tier.
+    #[test]
+    fn exactly_min_completed_trades_can_qualify() {
+        let mut stats = WalletStats {
+            wallet: "w".into(),
+            entity_id: None,
+            realized_pnl_usd: dec!(50),
+            win_rate: dec!(0.8),
+            avg_return_pct: dec!(15),
+            median_return_pct: dec!(10),
+            max_drawdown_pct: dec!(5),
+            trades: 25,
+            recent_return_pct: dec!(12),
+            concentration_pct: dec!(10),
+            scam_exposure_pct: Decimal::ZERO,
+            score: Decimal::ZERO,
+            tier: WalletTier::Candidate,
+            updated_at: Utc::now(),
+        };
+        crate::smart_money::score_wallet(&mut stats, &Default::default());
+        assert_eq!(stats.tier, WalletTier::Qualified);
     }
 }

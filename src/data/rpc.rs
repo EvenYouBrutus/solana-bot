@@ -529,6 +529,41 @@ impl RpcPool {
         }
         Ok(out)
     }
+
+    /// Fetch multiple accounts in a single RPC call using base64 encoding.
+    /// Returns a vec of `Option<String>` where each element is the base64-encoded
+    /// account data, or `None` if the account does not exist.
+    pub async fn fetch_accounts_base64(
+        &self,
+        pubkeys: &[&str],
+    ) -> Result<Vec<Option<String>>, RpcError> {
+        if pubkeys.is_empty() {
+            return Ok(vec![]);
+        }
+        let v = self
+            .call(
+                "getMultipleAccounts",
+                json!([pubkeys, {"encoding": "base64", "commitment": "confirmed"}]),
+            )
+            .await?;
+        let accounts = v.value["value"].as_array().ok_or_else(|| {
+            RpcError::Invalid("missing value array in getMultipleAccounts".into())
+        })?;
+        let mut result = Vec::with_capacity(pubkeys.len());
+        for account in accounts {
+            if account.is_null() {
+                result.push(None);
+            } else {
+                let data = account["data"]
+                    .as_array()
+                    .and_then(|arr| arr.get(1))
+                    .and_then(|d| d.as_str())
+                    .map(str::to_owned);
+                result.push(data);
+            }
+        }
+        Ok(result)
+    }
 }
 #[cfg(test)]
 mod tests {

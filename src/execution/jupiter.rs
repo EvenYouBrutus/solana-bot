@@ -1,6 +1,7 @@
 use super::reconcile::parse_swap_transaction;
 use super::{
-    policy::validate_provider_transaction, ExecutionError, ExecutionRequest, Executor, Quote,
+    policy::{validate_provider_transaction, AltResolver},
+    ExecutionError, ExecutionRequest, Executor, Quote,
 };
 use crate::{data::rpc::RpcPool, domain::trade::Fill};
 use async_trait::async_trait;
@@ -412,8 +413,14 @@ impl Executor for JupiterExecutor {
                 ExecutionError::Transaction("invalid provider transaction encoding".into())
             })?)
             .map_err(|_| ExecutionError::Transaction("invalid provider transaction".into()))?;
-        validate_provider_transaction(&unsigned, &signer.pubkey(), &self.allowed_program_ids)
-            .map_err(|e| ExecutionError::Policy(e.to_string()))?;
+        validate_provider_transaction(
+            &unsigned,
+            &signer.pubkey(),
+            &self.allowed_program_ids,
+            &mut AltResolver::new(&self.rpc),
+        )
+        .await
+        .map_err(|e| ExecutionError::Policy(e.to_string()))?;
         let signed = VersionedTransaction::try_new(unsigned.message, &[&signer]).map_err(|_| {
             ExecutionError::Transaction("could not sign provider transaction".into())
         })?;
