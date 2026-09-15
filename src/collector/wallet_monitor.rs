@@ -1249,9 +1249,22 @@ impl WalletMonitor {
         };
 
         let base_mint_decimals = 9u8;
-        let input_amount = match (self.position_usd / sol_price * dec!(1_000_000_000))
-            .to_string()
-            .parse::<u64>()
+        let input_amount = match self.config.mode {
+            crate::config::types::Mode::Live => {
+                // In LIVE mode, the trade size input for the quote should not be
+                // determined by the wallet monitor's position_usd. The risk engine
+                // will determine the authoritative position size later.
+                // Use priority fee based trade size, consistent with collect_live.
+                let pf_lamports = self.config.execution.priority_fee_lamports;
+                dec!(4) * Decimal::from(pf_lamports)
+            }
+            _ => {
+                // Paper/backtest mode: use position_usd from config as before
+                (self.position_usd / sol_price * dec!(1_000_000_000))
+            }
+        }
+        .to_string()
+        .parse::<u64>()
         {
             Ok(v) if v > 0 => v,
             _ => {
