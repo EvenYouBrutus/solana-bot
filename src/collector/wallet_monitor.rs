@@ -252,10 +252,10 @@ impl WalletAccumulator {
 
     /// Build point-in-time wallet statistics. The `as_of` parameter bounds
     /// the included observations; only trades completed by `as_of` count.
-    /// If `as_of` is `None`, all collected trades are used (which is wrong
-    /// for historical PIT replay — callers should always pass a value).
-    fn build_stats(&self, wallet: &str, as_of: Option<DateTime<Utc>>) -> WalletStats {
-        let cutoff = as_of.unwrap_or_else(Utc::now);
+    /// Callers MUST provide an explicit cutoff timestamp — this is a PIT-
+    /// required function, not a live-mode convenience.
+    fn build_stats(&self, wallet: &str, as_of: DateTime<Utc>) -> WalletStats {
+        let cutoff = as_of;
         let mut trades: Vec<&CompletedTrade> = self
             .completed_trades
             .iter()
@@ -764,7 +764,7 @@ impl WalletMonitor {
         }
 
         let now = Utc::now();
-        let stats = accumulator.build_stats(wallet, Some(now));
+        let stats = accumulator.build_stats(wallet, now);
 
         // `successful_transactions` counts ONLY transactions that were
         // fetched from the RPC AND parsed through the swap pipeline. It
