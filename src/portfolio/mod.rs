@@ -79,19 +79,39 @@ impl Portfolio {
             .and_modify(|p| {
                 // Validate that existing position has required accounting fields.
                 // If any are None, the position was corrupted (partial write or
-                // bug). Replace corrupted fields with the fill data rather than
-                // silently defaulting to zero — which would lose cost basis.
+                // bug). Preserve the unresolved state rather than silently
+                // defaulting to zero — which would fabricate a cost basis.
+                // Downstream callers (apply_exit, mark_to_market) have
+                // fail-closed error handling for missing values.
                 if p.remaining_quantity_atomic.is_none() {
-                    tracing::error!(mint=%mint, "apply_entry: position missing remaining_quantity_atomic; resetting from fill");
-                    p.remaining_quantity_atomic = Some(0);
+                    tracing::error!(
+                        mint=%mint,
+                        "apply_entry: position missing remaining_quantity_atomic; \
+                         preserving unresolved state"
+                    );
+                    // Do NOT set p.remaining_quantity_atomic = Some(0);
+                    // Leave as None so the position cannot be used for exit
+                    // accounting until the state is consciously repaired.
                 }
                 if p.entry_cost_usd.is_none() {
-                    tracing::error!(mint=%mint, "apply_entry: position missing entry_cost_usd; resetting from fill");
-                    p.entry_cost_usd = Some(Decimal::ZERO);
+                    tracing::error!(
+                        mint=%mint,
+                        "apply_entry: position missing entry_cost_usd; \
+                         preserving unresolved state"
+                    );
+                    // Do NOT set p.entry_cost_usd = Some(Decimal::ZERO);
+                    // Leave as None so the position cannot be used for exit
+                    // accounting until the state is consciously repaired.
                 }
                 if p.entry_fees_usd.is_none() {
-                    tracing::error!(mint=%mint, "apply_entry: position missing entry_fees_usd; resetting from fill");
-                    p.entry_fees_usd = Some(Decimal::ZERO);
+                    tracing::error!(
+                        mint=%mint,
+                        "apply_entry: position missing entry_fees_usd; \
+                         preserving unresolved state"
+                    );
+                    // Do NOT set p.entry_fees_usd = Some(Decimal::ZERO);
+                    // Leave as None so the position cannot be used for exit
+                    // accounting until the state is consciously repaired.
                 }
                 let total = p.quantity + q;
                 p.entry_price_usd = (p.entry_price_usd * p.quantity + price * q) / total;
