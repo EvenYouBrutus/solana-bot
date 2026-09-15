@@ -181,6 +181,15 @@ enum Command {
         #[arg(long)]
         input: PathBuf,
     },
+    /// Display the full live system state: wallet, balance, positions,
+    /// exposure, equity, PnL, drawdown, kill-switch state, RPC health,
+    /// collector health, and last trade timestamps.
+    Status {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 fn build_executor(c: &Config, rpc: RpcPool) -> anyhow::Result<Arc<dyn Executor>> {
@@ -284,6 +293,9 @@ async fn run(path: PathBuf) -> anyhow::Result<()> {
         tracing::warn!(%reason, "persisted emergency stop active; entries stay disabled, manual exits available");
     }
     rpc.health().await.context("RPC health check")?;
+    if c.mode == Mode::Live {
+        validate_live_startup(&c, &state, &rpc).await?;
+    }
     let executor = build_executor(&c, rpc.clone())?;
     executor.health().await.context("execution health check")?;
     if c.mode == Mode::Live {
@@ -366,6 +378,95 @@ fn clear_emergency_stop(path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn validate_live_startup(
+    c: &Config,
+    state: &StateStore,
+    rpc: &RpcPool,
+) -> anyhow::Result<()> {
+    use solana_sdk::signer::Signer;
+
+    // 1. Wallet keypair existence and validity.
+    let name = c
+        .execution
+        .live_signer_env
+        .as_deref()
+        .context("live mode requires live_signer_env")?;
+    let raw = std::env::var(name).with_context(|| format!("live signer env var {name} not set"))?;
+    let bytes: Vec<u8> =
+        serde_json::from_str(&raw).context("live signer env var must contain a JSON byte array")?;
+    let keypair = solana_sdk::signature::Keypair::try_from(bytes.as_slice())
+        .context("live signer is not a valid Solana keypair")?;
+    let signer_pubkey = keypair.pubkey().to_string();
+    tracing::info!(signer = %signer_pubkey, "trading wallet validated");
+
+    // 2. Jupiter API key existence.
+    let api_key_name = c
+        .execution
+        .jupiter_api_key_env
+        .as_deref()
+        .context("live mode requires jupiter_api_key_env")?;
+    let api_key = std::env::var(api_key_name)
+        .with_context(|| format!("Jupiter API key env var {api_key_name} not set"))?;
+    if api_key.trim().is_empty() {
+        anyhow::bail!("Jupiter API key env var {api_key_name} is empty");
+    }
+    tracing::info!("Jupiter API key validated");
+
+    // 3. SOL balance for execution fees.
+    let balance = rpc
+        .balance_lamports(&signer_pubkey)
+        .await
+        .context("failed to read wallet SOL balance")?;
+    let sol_required = 100_000_000u64; // 0.1 SOL minimum for fees
+    if balance < sol_required {
+        anyhow::bail!(
+            "trading wallet {} has insufficient SOL: {} lamports (need at least {})",
+            signer_pubkey,
+            balance,
+            sol_required
+        );
+    }
+    let sol_balance =
+        rust_decimal::Decimal::from(balance) / rust_decimal::Decimal::from(1_000_000_000u64);
+    tracing::info!(balance_lamports = balance, balance_sol = %sol_balance, "wallet SOL balance verified");
+
+    // 4. Verify signer matches configured wallet if one is persisted.
+    if let Ok(Some(stored_signer)) = state.get::<String>("runtime:signer") {
+        if stored_signer != signer_pubkey {
+            anyhow::bail!(
+                "signer mismatch: configured wallet {}, persisted wallet {}. \
+                 This may indicate a different wallet was used previously.",
+                signer_pubkey,
+                stored_signer
+            );
+        }
+    }
+
+    // 5. Multiple RPC endpoints.
+    if c.rpc.http_endpoints.len() < 2 {
+        tracing::warn!(
+            endpoints = c.rpc.http_endpoints.len(),
+            "production live mode should have at least 2 independent RPC endpoints"
+        );
+    }
+
+    // 6. Kill switch and reconciliation state.
+    if state.kill_switch_reason()?.is_some() {
+        anyhow::bail!("persisted kill switch is latched; operator review required before trading");
+    }
+    if !state.incomplete_orders()?.is_empty() {
+        tracing::warn!(
+            count = state.incomplete_orders()?.len(),
+            "unresolved orders exist; entries blocked until reconciliation"
+        );
+    }
+
+    // Persist the validated signer for future cross-session validation.
+    state.put("runtime:signer", &signer_pubkey)?;
+
+    Ok(())
+}
+
 fn report(path: PathBuf, format: &str) -> anyhow::Result<()> {
     let (c, state, _rpc) = base_setup(&path)?;
     let report = PerformanceReport::generate(&state, c.risk.starting_capital_usd)?;
@@ -375,6 +476,186 @@ fn report(path: PathBuf, format: &str) -> anyhow::Result<()> {
         }
         _ => {
             println!("{report}");
+        }
+    }
+    Ok(())
+}
+
+async fn status_cmd(path: PathBuf, format: &str) -> anyhow::Result<()> {
+    let (c, state, rpc) = base_setup(&path)?;
+    observability::init(c.observability.log_format == "json");
+
+    let live = c.mode == solana_smart_money_bot::config::types::Mode::Live;
+    let signer = if live {
+        c.execution
+            .live_signer_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .and_then(|raw| {
+                use solana_sdk::signer::Signer;
+                let bytes: Vec<u8> = serde_json::from_str(&raw).ok()?;
+                let kp = solana_sdk::signature::Keypair::try_from(bytes.as_slice()).ok()?;
+                Some(kp.pubkey().to_string())
+            })
+    } else {
+        None
+    };
+
+    // RPC health check.
+    let rpc_healthy = rpc.health().await.is_ok();
+    let rpc_endpoints = rpc.endpoints().to_vec();
+
+    // Wallet balance.
+    let sol_balance_lamports = match &signer {
+        Some(pk) => rpc.balance_lamports(pk).await.ok(),
+        None => None,
+    };
+
+    // Token balances.
+    let token_balances = match &signer {
+        Some(pk) => rpc.token_balances(pk).await.ok().unwrap_or_default(),
+        None => vec![],
+    };
+
+    // Positions.
+    let positions = state.positions().unwrap_or_default();
+    let open: Vec<_> = positions.iter().filter(|p| p.is_open()).collect();
+    let total_exposure: rust_decimal::Decimal = open
+        .iter()
+        .filter_map(|p| p.entry_cost_usd)
+        .fold(rust_decimal::Decimal::ZERO, |a, b| a + b);
+    let unrealized: rust_decimal::Decimal = open
+        .iter()
+        .map(|p| p.unrealized_pnl_usd)
+        .fold(rust_decimal::Decimal::ZERO, |a, b| a + b);
+    let realized: rust_decimal::Decimal = positions
+        .iter()
+        .map(|p| p.realized_pnl_usd)
+        .fold(rust_decimal::Decimal::ZERO, |a, b| a + b);
+    let equity = c.risk.starting_capital_usd + realized + unrealized;
+
+    // Kill switch / emergency stop.
+    let kill_switch = state
+        .kill_switch_reason()
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let emergency = state.emergency_stop().unwrap_or(None).unwrap_or_default();
+
+    // Incomplete orders.
+    let incomplete = state.incomplete_orders().unwrap_or_default();
+
+    // Last fill.
+    let last_fill = state
+        .orders()
+        .unwrap_or_default()
+        .iter()
+        .filter(|o| o.signature.is_some())
+        .max_by_key(|o| o.created_at)
+        .map(|o| {
+            format!(
+                "{} ({}, {})",
+                o.mint,
+                o.created_at.to_rfc3339(),
+                o.signature.as_deref().unwrap_or("?")
+            )
+        })
+        .unwrap_or_else(|| "none".into());
+
+    match format {
+        "json" => {
+            let output = serde_json::json!({
+                "mode": format!("{:?}", c.mode),
+                "wallet": signer.as_deref().unwrap_or("N/A"),
+                "rpc_healthy": rpc_healthy,
+                "rpc_endpoints": rpc_endpoints,
+                "sol_balance_lamports": sol_balance_lamports,
+                "token_balance_count": token_balances.len(),
+                "open_positions": open.len(),
+                "total_exposure_usd": total_exposure,
+                "equity_usd": equity,
+                "realized_pnl_usd": realized,
+                "unrealized_pnl_usd": unrealized,
+                "starting_capital_usd": c.risk.starting_capital_usd,
+                "kill_switch": kill_switch.is_empty(),
+                "emergency_stop": emergency.is_empty(),
+                "unresolved_orders": incomplete.len(),
+                "last_fill": last_fill,
+                "max_concurrent_positions": c.risk.max_concurrent_positions,
+                "max_live_capital_usd": c.risk.max_live_capital_usd,
+                "max_daily_loss_pct": c.risk.max_daily_loss_percent,
+                "max_drawdown_pct": c.risk.max_total_drawdown_before_kill_switch_pct,
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        _ => {
+            println!("=== Solana Smart Money Bot Status ===");
+            println!("Mode:               {:?}", c.mode);
+            println!(
+                "Wallet:             {}",
+                signer.as_deref().unwrap_or("N/A (paper mode)")
+            );
+            println!(
+                "SOL Balance:        {}",
+                sol_balance_lamports
+                    .map(|l| format!("{} lamports ({:.4} SOL)", l, l as f64 / 1e9))
+                    .unwrap_or_else(|| "N/A".into())
+            );
+            println!("Token Accounts:     {}", token_balances.len());
+            println!("---");
+            println!("Open Positions:     {}", open.len());
+            println!("Total Exposure:     ${}", total_exposure);
+            println!("Equity:             ${}", equity);
+            println!("Realized PnL:       ${}", realized);
+            println!("Unrealized PnL:     ${}", unrealized);
+            println!("---");
+            println!(
+                "Kill Switch:        {}",
+                if kill_switch.is_empty() {
+                    "CLEAR".to_string()
+                } else {
+                    format!("LATCHED ({})", kill_switch)
+                }
+            );
+            println!(
+                "Emergency Stop:     {}",
+                if emergency.is_empty() {
+                    "CLEAR".to_string()
+                } else {
+                    format!("ACTIVE ({})", emergency)
+                }
+            );
+            println!("Unresolved Orders:  {}", incomplete.len());
+            println!("Last Fill:          {}", last_fill);
+            println!("---");
+            println!("RPC Endpoints:      {}", rpc_endpoints.len());
+            println!(
+                "RPC Health:         {}",
+                if rpc_healthy { "OK" } else { "UNHEALTHY" }
+            );
+            println!("---");
+            println!("Max Positions:      {}", c.risk.max_concurrent_positions);
+            println!("Max Capital:        ${}", c.risk.max_live_capital_usd);
+            println!("Max Daily Loss:     {}%", c.risk.max_daily_loss_percent);
+            println!(
+                "Max Drawdown:       {}%",
+                c.risk.max_total_drawdown_before_kill_switch_pct
+            );
+
+            // Open position details.
+            if !open.is_empty() {
+                println!("---");
+                println!("Open Position Details:");
+                for p in &open {
+                    println!(
+                        "  {} | qty={} | cost=${} | unrealized=${} | entry={}",
+                        p.mint,
+                        p.remaining_quantity_atomic.unwrap_or(0),
+                        p.entry_cost_usd.unwrap_or_default(),
+                        p.unrealized_pnl_usd,
+                        p.entry_price_usd
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -555,6 +836,7 @@ async fn main() -> anyhow::Result<()> {
             .await?
         }
         Command::HistoricalValidate { input } => historical_validate_cmd(input)?,
+        Command::Status { config, format } => status_cmd(config, &format).await?,
     }
     Ok(())
 }

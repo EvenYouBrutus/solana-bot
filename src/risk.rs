@@ -99,6 +99,26 @@ impl RiskEngine {
             consecutive_failures: 0,
         }
     }
+
+    /// Computes the maximum position size in USD given the current equity
+    /// and stop-loss distance, constrained by max_risk_per_trade_percent.
+    ///
+    /// Conceptually:
+    /// ```text
+    /// max_planned_loss <= equity * max_risk_per_trade_percent
+    /// max_planned_loss = position_size * stop_loss_pct / 100
+    /// therefore:
+    /// position_size <= equity * max_risk_per_trade_percent / stop_loss_pct
+    /// ```
+    ///
+    /// Returns `None` when inputs are invalid (e.g., zero stop-loss).
+    pub fn max_position_usd(&self, stop_loss_pct: Decimal) -> Option<Decimal> {
+        if stop_loss_pct <= Decimal::ZERO {
+            return None;
+        }
+        Some(self.state.equity_usd * self.config.max_risk_per_trade_percent / stop_loss_pct)
+    }
+
     /// Every new position must pass here; the execution layer has no path that
     /// bypasses this check. Fail closed on any unmeasurable condition.
     pub fn authorize(
@@ -165,6 +185,33 @@ impl RiskEngine {
         }
         Ok(())
     }
+
+    /// Validates that a proposed position size respects the risk-per-trade
+    /// constraint. This must be called before every entry to enforce:
+    /// ```text
+    /// max_planned_loss <= equity * max_risk_per_trade_percent
+    /// ```
+    /// where max_planned_loss = position_usd * stop_loss_pct / 100.
+    pub fn validate_position_size(
+        &self,
+        position_usd: Decimal,
+        stop_loss_pct: Decimal,
+    ) -> Result<(), RiskError> {
+        let Some(max_size) = self.max_position_usd(stop_loss_pct) else {
+            return Err(RiskError::Rejected(
+                "stop-loss percentage must be positive for position sizing".into(),
+            ));
+        };
+        if position_usd > max_size {
+            return Err(RiskError::Rejected(format!(
+                "position size {} exceeds risk-adjusted maximum {} (equity={}, risk_per_trade={}, stop_loss={})",
+                position_usd, max_size, self.state.equity_usd,
+                self.config.max_risk_per_trade_percent, stop_loss_pct
+            )));
+        }
+        Ok(())
+    }
+
     /// Exits reduce risk and are permitted even under kill switch, emergency
     /// stop, cooldown, and daily-loss limits. Only the position's existence
     /// and a positive size are required.
@@ -626,5 +673,160 @@ mod tests {
         assert_eq!(engine.state.trades_today, 0);
         engine.register_trade(dec!(5));
         assert_eq!(engine.state.trades_today, 1);
+    }
+
+    // --- Position sizing via max_risk_per_trade_percent tests ---
+
+    #[test]
+    fn max_position_usd_derived_from_risk_per_trade_and_stop_loss() {
+        // equity=100, risk_per_trade=0.5%, stop_loss=5%
+        // max_position = 100 * 0.5 / 5 = 10
+        let engine = RiskEngine::new(config(), dec!(100));
+        let max = engine.max_position_usd(dec!(5)).unwrap();
+        assert_eq!(max, dec!(10));
+    }
+
+    #[test]
+    fn max_position_usd_rejects_zero_stop_loss() {
+        let engine = RiskEngine::new(config(), dec!(100));
+        assert!(engine.max_position_usd(Decimal::ZERO).is_none());
+    }
+
+    #[test]
+    fn validate_position_size_enforces_max() {
+        let engine = RiskEngine::new(config(), dec!(100));
+        // max_position = 100 * 0.5 / 5 = 10
+        assert!(engine.validate_position_size(dec!(10), dec!(5)).is_ok());
+        assert!(engine.validate_position_size(dec!(10.01), dec!(5)).is_err());
+    }
+
+    #[test]
+    fn validate_position_size_respects_equity() {
+        // equity=200, risk_per_trade=0.5%, stop_loss=5%
+        // max_position = 200 * 0.5 / 5 = 20
+        let engine = RiskEngine::new(config(), dec!(200));
+        assert!(engine.validate_position_size(dec!(20), dec!(5)).is_ok());
+        assert!(engine.validate_position_size(dec!(20.01), dec!(5)).is_err());
+    }
+
+    // --- Failure injection tests ---
+
+    #[test]
+    fn kill_switch_blocks_all_entries_after_trip() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.kill_switch.force_trip();
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_err());
+        assert!(engine.validate_position_size(dec!(1), dec!(5)).is_ok());
+        // authorize is the entry gate; position sizing is separate.
+    }
+
+    #[test]
+    fn consecutive_failures_trigger_kill_switch() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        for _ in 0..3 {
+            engine.record_execution_failure(now());
+        }
+        assert!(engine.kill_switch.is_tripped());
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_err());
+    }
+
+    #[test]
+    fn daily_loss_blocks_entries() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.state.day_start_equity_usd = dec!(100);
+        engine.state.equity_usd = dec!(97); // 3% loss
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_err());
+    }
+
+    #[test]
+    fn cooldown_blocks_entries_after_loss() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.apply_loss_cooldown(now());
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_err());
+        assert!(engine.authorize_exit(100).is_ok());
+    }
+
+    #[test]
+    fn slippage_limit_rejects_high_slippage() {
+        let engine = RiskEngine::new(config(), dec!(100));
+        // max_slippage_bps = 100
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 101, 10, now())
+            .is_err());
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 100, 10, now())
+            .is_ok());
+    }
+
+    #[test]
+    fn price_impact_limit_rejects_high_impact() {
+        let engine = RiskEngine::new(config(), dec!(100));
+        // max_slippage_bps = 100 (used for price impact too)
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 101, now())
+            .is_err());
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 100, now())
+            .is_ok());
+    }
+
+    #[test]
+    fn concurrent_position_limit_enforced_by_risk() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.set_open_positions(1); // max = 1
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_err());
+    }
+
+    #[test]
+    fn aggregate_exposure_blocks_when_full() {
+        let mut cfg = config();
+        cfg.max_live_capital_usd = dec!(10);
+        let mut engine = RiskEngine::new(cfg, dec!(100));
+        engine.set_total_exposure(dec!(8));
+        assert!(engine
+            .authorize(dec!(2), dec!(100000), 10, 10, now())
+            .is_err());
+        assert!(engine
+            .authorize(dec!(1), dec!(100000), 10, 10, now())
+            .is_ok());
+    }
+
+    #[test]
+    fn zero_position_size_is_rejected() {
+        let engine = RiskEngine::new(config(), dec!(100));
+        assert!(engine
+            .authorize(Decimal::ZERO, dec!(100000), 10, 10, now())
+            .is_err());
+    }
+
+    #[test]
+    fn zero_liquidity_is_rejected() {
+        let engine = RiskEngine::new(config(), dec!(100));
+        assert!(engine
+            .authorize(dec!(1), Decimal::ZERO, 10, 10, now())
+            .is_err());
+    }
+
+    #[test]
+    fn exit_always_allowed_even_under_kill_switch() {
+        let mut engine = RiskEngine::new(config(), dec!(100));
+        engine.kill_switch.force_trip();
+        assert!(engine.authorize_exit(1).is_ok());
+    }
+
+    #[test]
+    fn zero_remaining_exit_is_rejected() {
+        let engine = RiskEngine::new(config(), dec!(100));
+        assert!(engine.authorize_exit(0).is_err());
     }
 }

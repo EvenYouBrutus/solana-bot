@@ -291,7 +291,6 @@ impl Executor for JupiterExecutor {
             ("outputMint", output),
             ("amount", &amount.to_string()),
             ("slippageBps", &slippage.to_string()),
-            ("asLegacyTransaction", "true"),
         ]);
         if let Some(key) = self.api_key()? {
             req = req.header("x-api-key", key);
@@ -367,7 +366,6 @@ impl Executor for JupiterExecutor {
             "userPublicKey": owner,
             "wrapAndUnwrapSol": true,
             "dynamicComputeUnitLimit": true,
-            "asLegacyTransaction": true,
             "prioritizationFeeLamports": self.priority_fee_lamports,
         });
         if let Some(key) = self.api_key()? {

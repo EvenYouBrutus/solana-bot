@@ -53,6 +53,9 @@ pub fn exit_reason(
     if invalidated {
         return Some(ExitReason::SignalInvalidated);
     }
+    if p.entry_price_usd <= Decimal::ZERO {
+        return Some(ExitReason::StopLoss);
+    }
     let r = (price - p.entry_price_usd) / p.entry_price_usd * Decimal::new(100, 0);
     if r <= -c.stop_loss_pct {
         return Some(ExitReason::StopLoss);

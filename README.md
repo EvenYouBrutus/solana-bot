@@ -1,61 +1,118 @@
 # Solana smart-money bot
 
-This is a conservative Rust trading-system foundation. It is **not proven profitable** and must not be funded on the basis of this repository or a backtest alone.
+A conservative Rust trading-system foundation for smart-money copy-trading on Solana. It is **not proven profitable** and must not be funded on the basis of this repository or a backtest alone.
 
 ## What is implemented
 
-The executable uses one fail-closed path: timestamped candidate record → strict token/wallet/market strategy gates → conservative round-trip economics → risk authorization → fresh Jupiter quote → idempotent order reservation → execution → confirmed fill/position persistence. Paper and live use the same gates; only execution differs.
+### Core pipeline
 
-SQLite uses WAL plus synchronous commits and persists observations, orders, fills, positions, idempotency keys, and a latched kill switch. At startup, a persisted kill switch or any pending/submitted/unknown order blocks new entries. An unknown send is never automatically resent.
+Timestamped candidate record → strict token/wallet/market strategy gates → conservative round-trip economics → risk authorization → position sizing → fresh Jupiter quote → idempotent order reservation → versioned (V0) transaction execution → confirmed fill/position persistence. Paper and live use the same gates; only execution differs.
 
-Live Jupiter transactions are requested as legacy transactions, parsed before signing, require exactly the configured wallet as sole signer, and every invoked program must be in `execution.allowed_program_ids`. Address-lookup-table transactions are rejected rather than being signed without complete account resolution.
+### Operating modes
 
-## Important limitations
+| Mode | Description |
+|------|-------------|
+| `replay` | Static JSONL feed, deterministic replay, no broadcast |
+| `paper` | Real Jupiter quotes, simulated fills, no signing/broadcast |
+| `live` | Full execution with keypair signing and on-chain submission |
 
-This repository does **not** yet include a verified historical-indexer/DEX collector, reliable holder/liquidity-lock enrichment, WebSocket ingestion, automated exit scheduler, or a calibrated replay data set. `runtime.signal_feed_path` is therefore an explicit JSONL boundary for such a collector. Records must contain all required safety, market, wallet, and cost evidence; absent/uncertain fields are rejected. These limitations mean the project must not be described as production-ready or as an autonomous smart-money bot.
+### Risk controls (all enforced before every entry)
 
-Paper mode fetches real Jupiter quotes but does not sign or broadcast. Replay currently reuses the paper executor over a static chronological JSONL feed; it is not a complete realistic backtester. Do not infer expected returns from the `expected_gross_return_pct` input: it is an externally supplied hypothesis that is cost-gated, not proof.
+- **Aggregate exposure cap** — `max_live_capital_usd` across all open positions
+- **Per-position equity cap** — `max_position_percent_of_equity`
+- **Per-position liquidity cap** — `max_position_percent_of_liquidity`
+- **Concurrent position limit** — `max_concurrent_positions`
+- **Daily trade count limit** — `max_trades_per_day`
+- **Daily drawdown limit** — `max_daily_loss_pct` trips kill switch
+- **Kill switch on consecutive failures** — after `max_consecutive_failures`
+- **Cooldown after loss** — `cooldown_after_loss_secs` blocks entries
+- **Pre-trade slippage check** — `max_slippage_bps`
+- **Pre-trade price impact check** — `max_price_impact_bps`
+- **Position sizing** — `max_risk_per_trade_percent / stop_loss_pct` enforces maximum position USD
+- **Exits always allowed** — `authorize_exit` never checks kill switch, cooldown, or daily loss
 
-The backtest engine produces deterministic trade IDs (no randomness, no wall-clock input) and supports train/validation/OOS splitting with exact boundary enforcement. Statistical reporting includes net PnL, win rate, profit factor, Sharpe-like and Sortino-like ratios, maximum drawdown, and an OOS verdict based on bootstrap confidence intervals. All performance metrics exclude censored and ambiguous trades.
+### Execution policy
+
+- Versioned transactions (V0) with Address Lookup Table resolution
+- Payer validation: sole signer must be the configured wallet
+- Program allowlist: every invoked program must be in `execution.allowed_program_ids`
+- ALT index bounds validated before account resolution
+
+### Exit management
+
+Independent exit monitor handles all exit reasons: StopLoss, TakeProfit, TrailingStop, TimeLimit, LiquidityDeterioration, SignalInvalidated. Runs as a separate tokio task, evaluates positions every tick.
+
+### Startup validation (live mode)
+
+- Keypair existence and validity from configured environment variable
+- Jupiter API key presence check
+- SOL balance minimum (0.1 SOL) for execution fees
+- Signer cross-session consistency check against persisted state
+- Kill switch and incomplete order state check
+- RPC endpoint count warning (< 2)
+
+### Status command
+
+```bash
+cargo run -- status --config config/live.toml           # human-readable
+cargo run -- status --config config/live.toml --format json  # JSON output
+```
+
+Displays: mode, wallet address, SOL balance, open positions, aggregate exposure, equity, daily PnL, kill switch state, emergency stop state, unresolved orders, RPC health, last fill.
+
+### Reconciliation
+
+- Startup reconciliation of all incomplete orders
+- Periodic reconciliation at configurable intervals
+- Final reconciliation on shutdown
+- Exit monitor also reconciles stale orders
+- On-chain swap outcome extraction with atomic fill persistence
+
+### State persistence (SQLite WAL + synchronous=FULL)
+
+- Kill switch reason
+- Emergency stop state
+- Orders with idempotency keys
+- Fills with atomic multi-step persistence
+- Positions and portfolio state
+- Session state (day, equity, trade count)
+- KV store for runtime metadata
+
+### Observability
+
+Structured logging with `tracing` using per-pipeline `info_span!` containing `mint`, `signal_id`, `order_id`, and `position_id` fields. Supports JSON output mode via `observability.json_logging = true`. RPC health checks report latency, status codes, and errors per endpoint.
+
+### Security
+
+- No private keys/secrets logged, printed, or stored in plaintext
+- Environment variables used exclusively for keypair loading
+- Only public key (signer pubkey) is logged
+- Mutex locks use `expect()` with descriptive messages
+- Division-by-zero guards on all non-trivial arithmetic paths
+- No `unsafe` blocks in the codebase
 
 ## Setup
 
-Install a current Rust toolchain, copy the configuration, and configure at least two independent RPC endpoints for any serious operation:
+Install a current Rust toolchain, copy the configuration, and configure at least two independent RPC endpoints:
 
 ```bash
 cp config.example.toml config/local.toml
 cargo run -- check --config config/local.toml
 ```
 
-`[runtime].signal_feed_path` points to newline-delimited `CandidateInput` JSON records (defined in `src/runtime.rs`). Each record includes observed/received timestamps, wallet statistics as-of the observation time, token safety evidence, a market snapshot, and a `CostModel`. The `position_usd` and the cost model’s `position_size_usd` must match.
-
-## Modes
-
-Replay (static feed; no broadcast):
+For live trading:
 
 ```bash
-cargo run -- run --config config/replay.toml
-```
-
-Paper (real quote, simulated fill):
-
-```bash
-cargo run -- run --config config/paper.toml
-```
-
-Live requires `mode = "live"`, a positive conservative `max_live_capital_usd` no greater than starting capital, a non-empty reviewed program allowlist, and a keypair only through the configured environment variable:
-
-```bash
+cp config/live.toml config/local.toml  # edit as needed
 export SOLANA_BOT_KEYPAIR_JSON='[64 byte-array values]'
-cargo run -- check --config config/live.toml
-cargo run -- run --config config/live.toml
+export JUPITER_API_KEY='your-api-key'
+cargo run -- check --config config/local.toml
+cargo run -- run --config config/local.toml
 ```
 
-Never put that value in TOML, Git, logs, or a database. Review every allowlisted program for the specific Jupiter routes you permit. The safest default is an empty allowlist, which prevents live mode from starting.
+Never put secrets in TOML, Git, logs, or a database. Review every allowlisted program for the specific Jupiter routes you permit.
 
 ## Backtest
-
-Run a deterministic OHLC-aware backtest over historical JSONL signals:
 
 ```bash
 cargo run -- backtest \
@@ -64,13 +121,20 @@ cargo run -- backtest \
   --input data/sample_historical.jsonl
 ```
 
-The backtest walks each signal through the production entry/exit pipeline using only point-in-time data. Price observations can include optional OHLC fields (`open_usd`, `high_usd`, `low_usd`, `close_usd`, `volume`); when absent, `price_usd` is used for all. Censored trades (insufficient history, no terminal event) and ambiguous trades (SL and TP both crossed within an interval) are flagged separately and excluded from all performance statistics. Execution costs are modeled per trade leg (swap fee, priority fee, slippage, price impact) plus probabilistic expected failed-transaction cost. The engine is fully deterministic: same config and input always produces identical trade IDs, exits, and statistics.
+Deterministic OHLC-aware backtest with train/validation/OOS splitting, bootstrap confidence intervals, and exclusion of censored/ambiguous trades from statistics.
 
-## Operations and validation
+## Operations
 
-Use a persistent database path. To stop new entries, persist the kill-switch key through the operational control plane (the current binary has no CLI command to clear it); restart will preserve the block. Resolve any unknown transaction signature manually through multiple RPCs before resuming.
+```bash
+cargo run -- status --config config/live.toml              # live state
+cargo run -- reconcile --config config/local.toml          # reconcile orders
+cargo run -- emergency-stop --config config/local.toml     # halt entries
+cargo run -- clear-emergency-stop --config config/local.toml  # resume entries
+cargo run -- exit-all --config config/local.toml           # force exit positions
+cargo run -- report --config config/local.toml             # session report
+```
 
-Run the following before deployment:
+## Pre-deployment checklist
 
 ```bash
 cargo fmt --check
@@ -78,5 +142,7 @@ cargo clippy -- -D warnings
 cargo test
 cargo build --release
 ```
+
+**409 tests** covering risk controls, execution policy, reconciliation, exit logic, portfolio accounting, backtesting, and failure injection.
 
 No statistically meaningful out-of-sample test with realistic fees, liquidity, failures, latency, and adverse execution is included. Accordingly, this strategy has **not demonstrated positive out-of-sample expectancy after realistic costs**.

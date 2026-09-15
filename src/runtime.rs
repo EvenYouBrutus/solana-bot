@@ -1336,11 +1336,12 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         let Some(c) = state.candidates.get(&mint).cloned() else {
             continue;
         };
+        let _span = tracing::info_span!("entry_pipeline", mint = %mint).entered();
         // Prevent duplicate entries: skip if an open position already exists
         // for this mint.  This reuses the persisted portfolio state and works
         // across restarts; no parallel tracking system needed.
         if state.portfolio.position(&mint).is_some_and(|p| p.is_open()) {
-            tracing::debug!(mint=%mint, "candidate skipped: open position already exists");
+            tracing::debug!("candidate skipped: open position already exists");
             continue;
         }
         let (Some(token_decimals), Some(base_mint_decimals)) =
@@ -1388,14 +1389,14 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         {
             StrategyDecision::Accepted(s) => {
                 tracing::info!(
-                    mint = %mint,
+                    signal_id = %s.id,
                     score = %s.score.final_signal_score,
                     "strategy accepted candidate"
                 );
                 s
             }
             StrategyDecision::Rejected(reason) => {
-                tracing::info!(mint=%mint, %reason, "strategy rejected candidate");
+                tracing::info!(%reason, "strategy rejected candidate");
                 continue;
             }
         };
@@ -1403,7 +1404,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             continue;
         }
         if c.position_usd <= Decimal::ZERO || c.position_usd > config.risk.max_live_capital_usd {
-            tracing::warn!(mint=%mint, "position exceeds configured live-capital cap or is invalid");
+            tracing::warn!("position exceeds configured live-capital cap or is invalid");
             continue;
         }
         state
@@ -1423,7 +1424,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         {
             Ok(q) => q,
             Err(e) => {
-                tracing::warn!(mint=%mint, error=%e, "entry quote unavailable");
+                tracing::warn!(error=%e, "entry quote unavailable");
                 continue;
             }
         };
@@ -1434,7 +1435,14 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             quote.price_impact_bps,
             now,
         ) {
-            tracing::info!(mint=%mint, reason=%e, "risk engine rejected entry");
+            tracing::info!(signal_id = %signal.id, reason=%e, "risk engine rejected entry");
+            continue;
+        }
+        if let Err(e) = state
+            .risk
+            .validate_position_size(c.position_usd, config.strategy.stop_loss_pct)
+        {
+            tracing::info!(signal_id = %signal.id, reason=%e, "risk-per-trade position sizing rejected entry");
             continue;
         }
         let mut hash = Sha256::new();
@@ -1462,7 +1470,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             error: None,
         };
         if !store.reserve_order(&order)? {
-            tracing::debug!(mint=%mint, "duplicate entry order blocked by idempotency");
+            tracing::debug!(signal_id = %signal.id, "duplicate entry order blocked by idempotency");
             state.seen_signals.insert(signal.id);
             continue;
         }
@@ -1473,7 +1481,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         let mut placed = order.clone();
         placed.transition(OrderState::Submitted).ok();
         store.update_order(&placed)?;
-        tracing::info!(order_id=%order.id, mint=%mint, position_usd=%c.position_usd, qty_in=c.input_amount, expected_out=quote.output_amount, impact_bps=quote.price_impact_bps, "paper entry submitted");
+        tracing::info!(order_id=%order.id, signal_id = %signal.id, position_id=%position_id, position_usd=%c.position_usd, qty_in=c.input_amount, expected_out=quote.output_amount, impact_bps=quote.price_impact_bps, "paper entry submitted");
         let request = ExecutionRequest {
             order_id: order.id.clone(),
             quote,
@@ -1546,7 +1554,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                             signal.id.clone(),
                             c.costs.clone(),
                         );
-                        tracing::info!(order_id=%order.id, mint=%mint, signature=%fill.signature, position_id=%position_id, qty_atomic=fill.output_amount, price_usd=%fill.price_usd, fees_usd=%fill.fees_usd, fee_lamports=fill.fee_lamports, "confirmed entry persisted");
+                        tracing::info!(order_id=%order.id, signal_id = %signal.id, mint=%mint, signature=%fill.signature, position_id=%position_id, qty_atomic=fill.output_amount, price_usd=%fill.price_usd, fees_usd=%fill.fees_usd, fee_lamports=fill.fee_lamports, "confirmed entry persisted");
                         state.risk.register_trade(c.position_usd);
                         state.risk.record_execution_success();
                         if fill.output_amount < min_output {
@@ -1564,7 +1572,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                         placed.transition(OrderState::Unknown).ok();
                         placed.error = Some(format!("atomic persistence failed: {e}"));
                         store.update_order(&placed)?;
-                        tracing::error!(order_id=%order.id, error=%e, "confirmed entry could not be persisted atomically; reconciliation required")
+                        tracing::error!(order_id=%order.id, signal_id = %signal.id, error=%e, "confirmed entry could not be persisted atomically; reconciliation required")
                     }
                 }
             }
@@ -1575,7 +1583,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                 placed.transition(OrderState::Unknown).ok();
                 placed.error = Some(detail.clone());
                 store.update_order(&placed)?;
-                tracing::error!(order_id=%order.id, ?signature, %detail, "entry outcome unknown; reconciliation required before any retry");
+                tracing::error!(order_id=%order.id, signal_id = %signal.id, ?signature, %detail, "entry outcome unknown; reconciliation required before any retry");
             }
             Err(e) => {
                 placed.transition(OrderState::Failed).ok();
@@ -1585,7 +1593,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                 if tripped {
                     store.latch_kill_switch("consecutive execution failures")?;
                 }
-                tracing::error!(order_id=%order.id, mint=%mint, error=%e, "entry failed or was refused; order marked failed");
+                tracing::error!(order_id=%order.id, signal_id = %signal.id, mint=%mint, error=%e, "entry failed or was refused; order marked failed");
             }
         }
         state.seen_signals.insert(signal.id);

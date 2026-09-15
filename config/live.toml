@@ -1,0 +1,101 @@
+# Production live-trading configuration.
+#
+# Every field is required and validated at startup.  Missing or invalid
+# values cause an immediate, loud failure — never a silent fallback to
+# paper mode.
+#
+# Environment variables required:
+#   SOLANA_BOT_KEYPAIR_JSON  – JSON byte-array keypair for the trading wallet.
+#   JUPITER_API_KEY          – Jupiter API key for authenticated requests.
+#   BIRDEYE_API_KEY          – Birdeye API key for market data (optional).
+
+mode = "live"
+
+[rpc]
+# Minimum 3 independent RPC providers for production redundancy.
+http_endpoints = [
+    "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
+    "https://api.mainnet-beta.solana.com",
+    "https://solana-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+]
+websocket_endpoints = [
+    "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
+]
+max_data_age_secs = 15
+request_timeout_secs = 10
+max_attempts = 3
+unknown_after_secs = 180
+
+[strategy]
+base_mint = "So11111111111111111111111111111111111111112"
+min_wallet_score = 60.0
+min_wallet_samples = 25
+min_consensus_wallets = 2
+min_signal_score = 65.0
+min_token_age_secs = 86400
+stop_loss_pct = 5.0
+take_profit_pct = 12.0
+trailing_stop_pct = 4.0
+max_holding_minutes = 240
+
+[economics]
+round_trip_cost_threshold_pct = 3.0
+min_expected_net_return_pct = 2.0
+max_quote_age_secs = 3
+uncertainty_haircut_pct = 1.0
+sol_price_usd = 150.0
+
+[risk]
+starting_capital_usd = 100.0
+max_live_capital_usd = 25.0
+max_concurrent_positions = 2
+max_position_percent_of_equity = 5.0
+max_position_percent_of_liquidity = 0.10
+max_risk_per_trade_percent = 0.5
+max_daily_loss_percent = 2.0
+max_total_drawdown_before_kill_switch_pct = 5.0
+cooldown_after_loss_minutes = 30
+max_slippage_bps = 100
+min_liquidity_usd = 50000.0
+max_trades_per_day = 3
+max_consecutive_failures = 3
+
+[execution]
+provider = "jupiter"
+jupiter_api_url = "https://api.jup.ag"
+slippage_bps = 75
+priority_fee_lamports = 10000
+max_fee_lamports = 500000
+max_price_impact_bps = 300
+confirm_timeout_secs = 90
+confirm_poll_ms = 500
+live_signer_env = "SOLANA_BOT_KEYPAIR_JSON"
+jupiter_api_key_env = "JUPITER_API_KEY"
+# Jupiter V6 program + Raydium V4 + Orca Whirlpool + Meteora DLMM
+allowed_program_ids = [
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+]
+
+[storage]
+sqlite_path = "state/live.sqlite3"
+
+[runtime]
+poll_interval_secs = 10
+paper_fill_haircut_bps = 0
+reconcile_interval_secs = 60
+max_liquidity_age_secs = 300
+quote_cache_ttl_secs = 30
+
+[wallet_monitor]
+enabled = true
+wallets_file = "smart_wallets.txt"
+poll_interval_secs = 5
+max_history_signatures = 100
+consensus_window_secs = 900
+position_usd = 4.0
+
+[observability]
+log_format = "json"

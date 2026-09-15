@@ -201,7 +201,9 @@ impl WalletAccumulator {
             front.tokens_received -= sold_from_lot;
             front.sol_spent -= cost_of_sold;
             let lot_exhausted = front.tokens_received.is_zero();
-            self.completed_trades.push(last_trade.clone().unwrap());
+            if let Some(ref trade) = last_trade {
+                self.completed_trades.push(trade.clone());
+            }
             remaining_to_sell -= sold_from_lot;
             if lot_exhausted {
                 queue.pop_front();
@@ -984,11 +986,15 @@ impl WalletMonitor {
         safety.sellable = Some(true);
         safety.route_available = Some(true);
 
-        let avg_return: Decimal = consensus_wallets
-            .iter()
-            .map(|w| w.avg_return_pct)
-            .sum::<Decimal>()
-            / Decimal::from(consensus_wallets.len());
+        let avg_return: Decimal = if consensus_wallets.is_empty() {
+            Decimal::ZERO
+        } else {
+            consensus_wallets
+                .iter()
+                .map(|w| w.avg_return_pct)
+                .sum::<Decimal>()
+                / Decimal::from(consensus_wallets.len())
+        };
         let expected_gross_return = avg_return.max(dec!(5));
 
         let cost_model = CostModel {

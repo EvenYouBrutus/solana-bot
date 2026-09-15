@@ -23,7 +23,10 @@ impl DeterministicExecutor {
     /// entries for the same (input, output, amount, slippage) tuple.
     pub fn with_quotes(self, quotes: Vec<Quote>) -> Self {
         {
-            let mut map = self.quotes.lock().unwrap();
+            let mut map = self
+                .quotes
+                .lock()
+                .expect("deterministic executor mutex poisoned");
             for q in quotes {
                 let key = (
                     q.input_mint.clone(),
@@ -45,7 +48,10 @@ impl DeterministicExecutor {
             quote.input_amount,
             0,
         );
-        self.quotes.lock().unwrap().insert(key, quote);
+        self.quotes
+            .lock()
+            .expect("deterministic executor mutex poisoned")
+            .insert(key, quote);
     }
 }
 
@@ -67,7 +73,7 @@ impl Executor for DeterministicExecutor {
         let key = (input_mint.to_string(), output_mint.to_string(), amount, 0);
         self.quotes
             .lock()
-            .unwrap()
+            .expect("deterministic executor mutex poisoned")
             .get(&key)
             .cloned()
             .ok_or_else(|| {
@@ -111,7 +117,10 @@ impl Executor for DeterministicExecutor {
             quote.input_amount,
             0,
         );
-        self.quotes.lock().unwrap().insert(key, quote);
+        self.quotes
+            .lock()
+            .expect("deterministic executor mutex poisoned")
+            .insert(key, quote);
     }
 }
 

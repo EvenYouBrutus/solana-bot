@@ -67,6 +67,9 @@ pub fn evaluate_signal(
         return StrategyDecision::Rejected("economic edge below threshold".into());
     }
     let count = Decimal::from(wallets.len() as u32);
+    if count <= Decimal::ZERO {
+        return StrategyDecision::Rejected("no wallets for scoring".into());
+    }
     let mut score = SignalScore {
         wallet_score: wallets.iter().map(|w| w.score).sum::<Decimal>() / count,
         wallet_sample_size: wallets.iter().map(|w| w.trades).min().unwrap_or(0),

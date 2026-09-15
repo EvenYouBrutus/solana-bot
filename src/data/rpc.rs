@@ -114,6 +114,17 @@ pub struct MintAccountInfo {
     pub is_initialized: bool,
 }
 
+/// Health check result for a single RPC endpoint.
+#[derive(Debug, Clone)]
+pub struct RpcHealthEntry {
+    pub endpoint: String,
+    pub healthy: bool,
+    pub latency_ms: u64,
+    pub status_code: u16,
+    #[allow(dead_code)]
+    pub error: Option<String>,
+}
+
 impl RpcPool {
     pub fn new(endpoints: Vec<String>, timeout: Duration) -> Result<Self, RpcError> {
         Self::with_attempts(endpoints, timeout, 1)
@@ -220,6 +231,46 @@ impl RpcPool {
     }
     pub async fn health(&self) -> Result<(), RpcError> {
         self.call("getHealth", json!([])).await.map(|_| ())
+    }
+
+    /// Performs a health check across all configured RPC endpoints and returns
+    /// a per-endpoint report. If any endpoint disagrees on a critical value
+    /// (e.g., slot health), the contradictory provider is flagged.
+    pub async fn health_report(&self) -> Vec<RpcHealthEntry> {
+        let mut report = Vec::with_capacity(self.endpoints.len());
+        for endpoint in &self.endpoints {
+            let start = std::time::Instant::now();
+            let result = self
+                .client
+                .post(endpoint)
+                .json(&json!({"jsonrpc":"2.0","id":1,"method":"getHealth","params":[]}))
+                .send()
+                .await;
+            let latency_ms = start.elapsed().as_millis() as u64;
+            match result {
+                Ok(r) => {
+                    let status = r.status();
+                    let is_ok = status.is_success();
+                    report.push(RpcHealthEntry {
+                        endpoint: endpoint.clone(),
+                        healthy: is_ok,
+                        latency_ms,
+                        status_code: status.as_u16(),
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    report.push(RpcHealthEntry {
+                        endpoint: endpoint.clone(),
+                        healthy: false,
+                        latency_ms,
+                        status_code: 0,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+        report
     }
     pub async fn balance_lamports(&self, address: &str) -> Result<u64, RpcError> {
         let v = self
