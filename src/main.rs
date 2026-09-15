@@ -341,10 +341,8 @@ async fn exit_all(path: PathBuf) -> anyhow::Result<()> {
     let store = Arc::new(state);
     let rpc = Arc::new(rpc);
     let deps = session_deps(config, store, executor, rpc);
-    let summary = runtime::run_reconciliation(&deps).await?;
-    if summary.unresolved_orders > 0 {
-        anyhow::bail!("unresolved orders remain; run Reconcile and review before exiting");
-    }
+    // Emergency exit must not be blocked by unresolved reconciliation.
+    // Positions with untrusted quantity use on-chain balance directly.
     let exited = runtime::exit_all_positions(&deps).await?;
     println!("manual exit attempted for {exited} position(s)");
     Ok(())

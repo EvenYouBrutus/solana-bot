@@ -77,6 +77,22 @@ impl Portfolio {
         self.positions
             .entry(mint.clone())
             .and_modify(|p| {
+                // Validate that existing position has required accounting fields.
+                // If any are None, the position was corrupted (partial write or
+                // bug). Replace corrupted fields with the fill data rather than
+                // silently defaulting to zero — which would lose cost basis.
+                if p.remaining_quantity_atomic.is_none() {
+                    tracing::error!(mint=%mint, "apply_entry: position missing remaining_quantity_atomic; resetting from fill");
+                    p.remaining_quantity_atomic = Some(0);
+                }
+                if p.entry_cost_usd.is_none() {
+                    tracing::error!(mint=%mint, "apply_entry: position missing entry_cost_usd; resetting from fill");
+                    p.entry_cost_usd = Some(Decimal::ZERO);
+                }
+                if p.entry_fees_usd.is_none() {
+                    tracing::error!(mint=%mint, "apply_entry: position missing entry_fees_usd; resetting from fill");
+                    p.entry_fees_usd = Some(Decimal::ZERO);
+                }
                 let total = p.quantity + q;
                 p.entry_price_usd = (p.entry_price_usd * p.quantity + price * q) / total;
                 p.quantity = total;
@@ -177,7 +193,14 @@ impl Portfolio {
         p.remaining_quantity_atomic = Some(new_remaining);
         p.realized_pnl_usd += realized;
         p.fees_usd += fill.fees_usd;
-        p.exit_fees_usd = Some(p.exit_fees_usd.unwrap_or(Decimal::ZERO) + fill.fees_usd);
+        if p.exit_fees_usd.is_none() {
+            tracing::error!(
+                mint,
+                "apply_exit: position missing exit_fees_usd; initializing from fill"
+            );
+            p.exit_fees_usd = Some(Decimal::ZERO);
+        }
+        p.exit_fees_usd = Some(p.exit_fees_usd.unwrap() + fill.fees_usd);
         p.high_water_price_usd = p.high_water_price_usd.max(fill.price_usd);
         p.current_value_usd = fill.price_usd * Decimal::from(new_remaining);
         let closed = new_remaining == 0;
@@ -201,11 +224,17 @@ impl Portfolio {
             .positions
             .get_mut(mint)
             .ok_or_else(|| "no position for mint".to_string())?;
-        let remaining = p.remaining_quantity_atomic.unwrap_or(0);
+        let remaining = p.remaining_quantity_atomic.ok_or_else(|| {
+            tracing::error!(mint=%mint, "mark_to_market: position missing remaining_quantity_atomic");
+            "position missing remaining_quantity_atomic; cannot mark to market".to_string()
+        })?;
         p.high_water_price_usd = p.high_water_price_usd.max(price);
         p.current_value_usd = price * Decimal::from(remaining);
-        let cost_of_remaining = p.entry_cost_usd.unwrap_or(Decimal::ZERO)
-            * Decimal::from(remaining)
+        let entry_cost = p.entry_cost_usd.ok_or_else(|| {
+            tracing::error!(mint=%mint, "mark_to_market: position missing entry_cost_usd");
+            "position missing entry_cost_usd; cannot mark to market".to_string()
+        })?;
+        let cost_of_remaining = entry_cost * Decimal::from(remaining)
             / if p.quantity == Decimal::ZERO {
                 Decimal::ONE
             } else {

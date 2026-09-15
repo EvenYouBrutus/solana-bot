@@ -116,10 +116,13 @@ impl ExitMonitor {
         portfolio.load(stored);
 
         // 3. Re-read interlock state so the monitor respects operator actions.
-        let emergency_active = store.emergency_stop()?.is_some();
-        let kill_switch_latched = store.kill_switch_reason()?.is_some();
-        let _ = emergency_active;
-        let _ = kill_switch_latched;
+        // Emergency stop blocks new entries but allows exits. Kill switch
+        // blocks entries but allows exits. The exit monitor evaluates exits
+        // regardless of these interlocks — positions must be liquidatable
+        // even when entries are halted. The interlocks are read here so they
+        // are available for future use without changing the query pattern.
+        let _emergency_active = store.emergency_stop()?.is_some();
+        let _kill_switch_latched = store.kill_switch_reason()?.is_some();
 
         // 4. Iterate open positions and evaluate exits.
         let open: Vec<String> = portfolio
@@ -207,11 +210,14 @@ impl ExitMonitor {
             };
 
             // Mark to market and persist.
-            if let Ok(new_value) = portfolio.mark_to_market(&mint, mark) {
-                let _ = new_value;
+            if let Err(e) = portfolio.mark_to_market(&mint, mark) {
+                tracing::warn!(mint=%mint, error=%e, "exit monitor: mark-to-market failed");
+                continue;
             }
             if let Some(p) = portfolio.position(&mint) {
-                let _ = store.save_position(p);
+                if let Err(e) = store.save_position(p) {
+                    tracing::error!(mint=%mint, error=%e, "exit monitor: failed to persist position; next tick will reload stale data");
+                }
             }
             // Store the fresh quote in the cache now that the store borrow is released.
             if let Some((mint_str, quote)) = fresh_quote {
@@ -340,15 +346,23 @@ async fn reconcile_stale_orders(deps: &ExitDeps) {
                 if age > Duration::seconds(deps.config.rpc.unknown_after_secs) {
                     let mut o = order.clone();
                     o.error = Some("expired without submission (exit monitor)".into());
-                    o.transition(OrderState::Failed).ok();
-                    deps.store.update_order(&o).ok();
+                    if let Err(te) = o.transition(OrderState::Failed) {
+                        tracing::error!(order_id=%order.id, error=%te, "exit monitor: transition to Failed failed");
+                    }
+                    if let Err(se) = deps.store.update_order(&o) {
+                        tracing::error!(order_id=%order.id, error=%se, "exit monitor: order persist failed");
+                    }
                 }
             }
             (Some(_sig), false) => {
                 let mut o = order.clone();
                 o.error = Some("paper signature cannot be reconciled".into());
-                o.transition(OrderState::Failed).ok();
-                deps.store.update_order(&o).ok();
+                if let Err(te) = o.transition(OrderState::Failed) {
+                    tracing::error!(order_id=%order.id, error=%te, "exit monitor: transition to Failed failed");
+                }
+                if let Err(se) = deps.store.update_order(&o) {
+                    tracing::error!(order_id=%order.id, error=%se, "exit monitor: order persist failed");
+                }
             }
             (Some(sig), true) => {
                 let Some(owner) = &owner else {
@@ -394,15 +408,23 @@ async fn reconcile_stale_orders(deps: &ExitDeps) {
                         if age > Duration::seconds(deps.config.rpc.unknown_after_secs) {
                             let mut o = order.clone();
                             o.error = Some("signature never appeared (exit monitor)".into());
-                            o.transition(OrderState::Expired).ok();
-                            deps.store.update_order(&o).ok();
+                            if let Err(te) = o.transition(OrderState::Expired) {
+                                tracing::error!(order_id=%order.id, error=%te, "exit monitor: transition to Expired failed");
+                            }
+                            if let Err(se) = deps.store.update_order(&o) {
+                                tracing::error!(order_id=%order.id, error=%se, "exit monitor: order persist failed");
+                            }
                         }
                     }
                     Err(ExecutionError::Transaction(detail)) => {
                         let mut o = order.clone();
                         o.error = Some(detail);
-                        o.transition(OrderState::Failed).ok();
-                        deps.store.update_order(&o).ok();
+                        if let Err(te) = o.transition(OrderState::Failed) {
+                            tracing::error!(order_id=%order.id, error=%te, "exit monitor: transition to Failed failed");
+                        }
+                        if let Err(se) = deps.store.update_order(&o) {
+                            tracing::error!(order_id=%order.id, error=%se, "exit monitor: order persist failed");
+                        }
                     }
                     Err(_) => {
                         // Availability error; leave as-is for next tick.

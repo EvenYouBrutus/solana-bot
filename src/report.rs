@@ -14,6 +14,8 @@ pub struct PerformanceReport {
     pub wins: u32,
     pub losses: u32,
     pub total_pnl_usd: Decimal,
+    pub gross_wins_usd: Decimal,
+    pub gross_losses_usd: Decimal,
     pub total_fees_usd: Decimal,
     pub win_rate: Decimal,
     pub expectancy: Decimal,
@@ -62,8 +64,10 @@ impl PerformanceReport {
                 report.total_fees_usd += fees;
                 if is_win {
                     report.wins += 1;
+                    report.gross_wins_usd += pnl;
                 } else {
                     report.losses += 1;
+                    report.gross_losses_usd += pnl.abs();
                 }
                 *report.exits_by_reason.entry(exit_reason).or_insert(0) += 1;
 
@@ -86,11 +90,9 @@ impl PerformanceReport {
             report.expectancy = report.total_pnl_usd / Decimal::from(report.total_trades);
         }
 
-        let total_wins_pnl: Decimal = report.total_pnl_usd.max(Decimal::ZERO);
-        let total_losses_pnl: Decimal = report.total_pnl_usd.abs();
-        report.profit_factor = if total_losses_pnl > Decimal::ZERO {
-            total_wins_pnl / total_losses_pnl
-        } else if total_wins_pnl > Decimal::ZERO {
+        report.profit_factor = if report.gross_losses_usd > Decimal::ZERO {
+            report.gross_wins_usd / report.gross_losses_usd
+        } else if report.gross_wins_usd > Decimal::ZERO {
             Decimal::from(u64::MAX)
         } else {
             Decimal::ZERO
@@ -272,5 +274,92 @@ mod tests {
         assert!(display.contains("Risk"));
         assert!(display.contains("Exit Breakdown"));
         assert!(display.contains("Rejection Breakdown"));
+    }
+
+    #[test]
+    fn profit_factor_uses_gross_wins_and_losses() {
+        use crate::domain::position::{Position, PositionState, ReconciliationStatus};
+        use chrono::Utc;
+
+        let store = StateStore::open(":memory:").unwrap();
+        // Winning trade: +$20
+        let win = Position {
+            mint: "WIN".into(),
+            position_id: Some("p-win".into()),
+            token_mint: Some("WIN".into()),
+            base_mint: Some("SOL".into()),
+            entry_input_amount_atomic: Some(1_000_000),
+            entry_output_amount_atomic: Some(5_000_000),
+            token_decimals: Some(6),
+            base_mint_decimals: Some(9),
+            entry_fees_usd: Some(dec!(0.01)),
+            entry_slippage_bps: Some(30),
+            entry_cost_model: None,
+            quantity: dec!(5_000_000),
+            remaining_quantity_atomic: Some(0),
+            entry_cost_usd: Some(dec!(10)),
+            base_entry_price_usd: Some(dec!(150)),
+            state: PositionState::Closed,
+            reconciliation_status: ReconciliationStatus::Reconciled,
+            last_reconciled_at: None,
+            exit_signature: Some("paper:exit-win".into()),
+            exit_fees_usd: Some(dec!(0.01)),
+            exit_time: Some(Utc::now()),
+            entry_price_usd: dec!(0.002),
+            entry_time: Utc::now() - chrono::Duration::hours(1),
+            entry_signature: "paper:entry-win".into(),
+            high_water_price_usd: dec!(0.003),
+            realized_pnl_usd: dec!(20),
+            unrealized_pnl_usd: Decimal::ZERO,
+            fees_usd: dec!(0.02),
+            current_value_usd: dec!(0),
+            signal_id: "s-win".into(),
+            exit_reason: Some("take_profit".into()),
+        };
+        store.save_position(&win).unwrap();
+
+        // Losing trade: -$5
+        let loss = Position {
+            mint: "LOSS".into(),
+            position_id: Some("p-loss".into()),
+            token_mint: Some("LOSS".into()),
+            base_mint: Some("SOL".into()),
+            entry_input_amount_atomic: Some(1_000_000),
+            entry_output_amount_atomic: Some(5_000_000),
+            token_decimals: Some(6),
+            base_mint_decimals: Some(9),
+            entry_fees_usd: Some(dec!(0.01)),
+            entry_slippage_bps: Some(30),
+            entry_cost_model: None,
+            quantity: dec!(5_000_000),
+            remaining_quantity_atomic: Some(0),
+            entry_cost_usd: Some(dec!(10)),
+            base_entry_price_usd: Some(dec!(150)),
+            state: PositionState::Closed,
+            reconciliation_status: ReconciliationStatus::Reconciled,
+            last_reconciled_at: None,
+            exit_signature: Some("paper:exit-loss".into()),
+            exit_fees_usd: Some(dec!(0.01)),
+            exit_time: Some(Utc::now()),
+            entry_price_usd: dec!(0.002),
+            entry_time: Utc::now() - chrono::Duration::hours(2),
+            entry_signature: "paper:entry-loss".into(),
+            high_water_price_usd: dec!(0.003),
+            realized_pnl_usd: dec!(-5),
+            unrealized_pnl_usd: Decimal::ZERO,
+            fees_usd: dec!(0.02),
+            current_value_usd: dec!(0),
+            signal_id: "s-loss".into(),
+            exit_reason: Some("stop_loss".into()),
+        };
+        store.save_position(&loss).unwrap();
+
+        let report = PerformanceReport::generate(&store, dec!(100)).unwrap();
+        assert_eq!(report.total_trades, 2);
+        assert_eq!(report.wins, 1);
+        assert_eq!(report.losses, 1);
+        assert_eq!(report.gross_wins_usd, dec!(20));
+        assert_eq!(report.gross_losses_usd, dec!(5));
+        assert_eq!(report.profit_factor, dec!(4));
     }
 }

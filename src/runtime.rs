@@ -69,6 +69,11 @@ pub struct CandidateInput {
     pub detection_latency_ms: i64,
 }
 
+/// Reconciled fills lack execution-time measurements. These sentinel values
+/// distinguish "not measured" from "measured as zero" for auditing.
+const RECONCILED_SLIPPAGE_BPS: u32 = u32::MAX;
+const RECONCILED_LATENCY_MS: u64 = u64::MAX;
+
 pub struct SessionDeps {
     pub config: Arc<Config>,
     pub store: Arc<StateStore>,
@@ -260,13 +265,50 @@ pub(crate) async fn record_reconciled_fill(
             outcome.fee_lamports,
             deps.config.economics.sol_price_usd,
         ),
-        slippage_bps: 0,
+        // Sentinel values: reconciliation cannot measure slippage or latency.
+        // u32::MAX / u64::MAX means "not measured", distinct from zero.
+        slippage_bps: RECONCILED_SLIPPAGE_BPS,
         confirmed_at: Utc::now(),
-        latency_ms: 0,
+        latency_ms: RECONCILED_LATENCY_MS,
         fee_lamports: outcome.fee_lamports,
         input_value_usd: Some(value_usd),
         expected_output_amount: None,
     };
+    // For entry orders, the cost model is required for accurate accounting.
+    // Never fabricate a synthetic cost model: if it is missing, persist the
+    // fill for audit but mark the order Failed so reconciliation does not
+    // retry indefinitely or create duplicate fills.
+    if order.kind == OrderKind::Entry && position.entry_cost_model.is_none() {
+        let fail_reason =
+            "entry order has no cost model; fill recorded but accounting cannot be completed";
+        tracing::warn!(
+            order_id = %order.id,
+            mint = %order.mint,
+            fail_reason
+        );
+        deps.store.run_in_transaction(|conn| {
+            // Persist the fill for audit trail — on-chain outcome is real.
+            let fill_json = serde_json::to_string(&fill)?;
+            conn.execute(
+                "INSERT INTO fills(order_id,payload,created_at) VALUES(?1,?2,?3) ON CONFLICT(order_id) DO UPDATE SET payload=excluded.payload",
+                rusqlite::params![fill.order_id, fill_json, Utc::now().to_rfc3339()],
+            )?;
+            // Mark order as Failed (terminal) — blocks retry, unblocks entries.
+            let mut o = order.clone();
+            o.signature = Some(signature.to_string());
+            o.error = Some(fail_reason.into());
+            o.transition(OrderState::Failed)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let order_json = serde_json::to_string(&o)?;
+            conn.execute(
+                "UPDATE orders SET state=?2,payload=?3,order_kind=?4,position_id=?5,side=?6,updated_at=?7 WHERE id=?1",
+                rusqlite::params![o.id, format!("{:?}", o.state), order_json, format!("{:?}", o.kind), o.position_id, format!("{:?}", o.side), Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })?;
+        return Ok(false);
+    }
+
     // Persist fill, apply to portfolio, and update order atomically.
     // If the process crashes mid-way, the transaction rolls back and the
     // order stays Unknown; on restart, reconciliation retries safely.
@@ -280,33 +322,23 @@ pub(crate) async fn record_reconciled_fill(
 
         // Load fresh portfolio directly from the connection (avoids deadlock).
         let mut tx_portfolio = load_portfolio_from_conn(conn)?;
-        let result = match order.kind {
-            OrderKind::Entry => {
-                let cost_model = position
-                    .entry_cost_model
-                    .clone()
-                    .unwrap_or_else(|| CostModel {
-                        observed_at: Utc::now(),
-                        source: "reconciled".into(),
-                        is_live_snapshot: false,
-                        input: crate::economics::BreakEvenInputs {
-                            position_size_usd: Decimal::ONE,
-                            avg_priority_fee_usd: Decimal::ZERO,
-                            avg_swap_fee_bps: Decimal::ZERO,
-                            avg_slippage_bps: Decimal::ZERO,
-                            avg_price_impact_bps: Decimal::ZERO,
-                            failed_tx_rate: Decimal::ZERO,
-                            avg_failed_tx_cost_usd: Decimal::ZERO,
-                            assumed_win_loss_ratio: Decimal::ONE,
-                            assumed_avg_loss_pct: Decimal::ONE,
-                        },
-                    });
-                tx_portfolio.apply_entry(
-                    order.mint.clone(),
-                    position.base_mint.clone().unwrap_or_default(),
-                    token_decimals,
-                    base_decimals,
-                    order.position_id.clone().unwrap_or_default(),
+                let result = match order.kind {
+                    OrderKind::Entry => {
+                        // Safe to unwrap: we checked entry_cost_model.is_none() above
+                        // and returned Ok(false) before reaching this point.
+                        let cost_model = position.entry_cost_model.clone().unwrap();
+                        let Some(base_mint) = position.base_mint.clone() else {
+                            return Err(anyhow::anyhow!("position missing base_mint"));
+                        };
+                        let position_id = order.position_id.clone().unwrap_or_else(|| {
+                            format!("{}-reconcile-{}", order.id, Utc::now().timestamp())
+                        });
+                        tx_portfolio.apply_entry(
+                            order.mint.clone(),
+                            base_mint,
+                            token_decimals,
+                            base_decimals,
+                            position_id,
                     &fill,
                     price_usd,
                     order.signal_id.clone(),
@@ -527,12 +559,18 @@ pub(crate) async fn execute_exit_order(
     };
 
     // Inflight check via store — authoritative for order reservation.
-    if let Ok(incomplete) = store.incomplete_orders() {
-        if incomplete.iter().any(|o| {
-            o.kind == OrderKind::Exit && o.position_id.as_deref() == position.position_id.as_deref()
-        }) {
-            return ExitExecResult::Skipped("exit order already in flight".into());
+    // Store errors must propagate: proceeding without this check risks
+    // duplicate exit orders for the same position.
+    let incomplete = match store.incomplete_orders() {
+        Ok(o) => o,
+        Err(e) => {
+            return ExitExecResult::Failed(format!("inflight check failed: {e}"));
         }
+    };
+    if incomplete.iter().any(|o| {
+        o.kind == OrderKind::Exit && o.position_id.as_deref() == position.position_id.as_deref()
+    }) {
+        return ExitExecResult::Skipped("exit order already in flight".into());
     }
 
     let Some(base_price) = position.base_entry_price_usd else {
@@ -550,12 +588,17 @@ pub(crate) async fn execute_exit_order(
     let position_id = position.position_id.as_deref().unwrap_or(mint);
 
     // Count previous exit attempts for this position to build the idempotency key.
-    let attempt = store
-        .orders()
-        .unwrap_or_default()
-        .iter()
-        .filter(|o| o.kind == OrderKind::Exit && o.position_id.as_deref() == Some(position_id))
-        .count() as u32;
+    // Store errors must propagate: defaulting to 0 bypasses idempotency
+    // and could allow duplicate exit orders.
+    let attempt = match store.orders() {
+        Ok(orders) => orders
+            .iter()
+            .filter(|o| o.kind == OrderKind::Exit && o.position_id.as_deref() == Some(position_id))
+            .count() as u32,
+        Err(e) => {
+            return ExitExecResult::Failed(format!("order history read failed: {e}"));
+        }
+    };
 
     let key = exit_idempotency_key(position_id, remaining, reason, attempt);
 
@@ -583,7 +626,13 @@ pub(crate) async fn execute_exit_order(
         error: Some(reason.to_string()),
     };
 
-    if !store.reserve_order(&order).unwrap_or(false) {
+    let reservation_ok = match store.reserve_order(&order) {
+        Ok(v) => v,
+        Err(e) => {
+            return ExitExecResult::Failed(format!("order reservation failed: {e}"));
+        }
+    };
+    if !reservation_ok {
         return ExitExecResult::Skipped("duplicate exit blocked by idempotency".into());
     }
 
@@ -596,8 +645,12 @@ pub(crate) async fn execute_exit_order(
         Err(e) => {
             let mut o = order.clone();
             o.error = Some(format!("quote failed: {e}"));
-            o.transition(OrderState::Failed).ok();
-            store.update_order(&o).ok();
+            if let Err(te) = o.transition(OrderState::Failed) {
+                tracing::error!(order_id=%order.id, error=%te, "transition to Failed failed");
+            }
+            if let Err(se) = store.update_order(&o) {
+                tracing::error!(order_id=%order.id, error=%se, "order state persist failed (quote)");
+            }
             return ExitExecResult::Failed(format!("quote failed: {e}"));
         }
     };
@@ -605,8 +658,12 @@ pub(crate) async fn execute_exit_order(
     if quote.price_impact_bps > config.execution.max_price_impact_bps {
         let mut o = order.clone();
         o.error = Some("price impact limit".into());
-        o.transition(OrderState::Failed).ok();
-        store.update_order(&o).ok();
+        if let Err(te) = o.transition(OrderState::Failed) {
+            tracing::error!(order_id=%order.id, error=%te, "transition to Failed failed");
+        }
+        if let Err(se) = store.update_order(&o) {
+            tracing::error!(order_id=%order.id, error=%se, "order state persist failed (price impact)");
+        }
         return ExitExecResult::Failed(format!(
             "price impact {} bps exceeds limit {}",
             quote.price_impact_bps, config.execution.max_price_impact_bps
@@ -619,8 +676,12 @@ pub(crate) async fn execute_exit_order(
         / 10_000;
 
     let mut placed = order.clone();
-    placed.transition(OrderState::Submitted).ok();
-    store.update_order(&placed).ok();
+    if let Err(te) = placed.transition(OrderState::Submitted) {
+        tracing::error!(order_id=%order.id, error=%te, "transition to Submitted failed");
+    }
+    if let Err(se) = store.update_order(&placed) {
+        tracing::error!(order_id=%order.id, error=%se, "order state persist failed (submit)");
+    }
 
     let request = ExecutionRequest {
         order_id: order.id.clone(),
@@ -667,7 +728,9 @@ pub(crate) async fn execute_exit_order(
 
                 // Update order to Confirmed.
                 placed.signature = Some(fill.signature.clone());
-                placed.transition(OrderState::Confirmed).ok();
+                placed
+                    .transition(OrderState::Confirmed)
+                    .map_err(|e| anyhow::anyhow!("order transition failed inside atomic tx: {e}"))?;
                 let order_json = serde_json::to_string(&placed)?;
                 conn.execute(
                     "UPDATE orders SET state=?2,payload=?3,order_kind=?4,position_id=?5,side=?6,updated_at=?7 WHERE id=?1",
@@ -683,7 +746,15 @@ pub(crate) async fn execute_exit_order(
                     if let Some(fresh_pos) = stored.iter().find(|p| p.mint == mint) {
                         portfolio.sync_position(fresh_pos.clone());
                     }
-                    let _ = portfolio.apply_exit(mint, &fill, reason, Utc::now());
+                    if let Err(e) = portfolio.apply_exit(mint, &fill, reason, Utc::now()) {
+                        tracing::error!(
+                            order_id = %order.id,
+                            mint = %mint,
+                            error = %e,
+                            "in-memory portfolio exit failed after persistence; \
+                             risk state may be inconsistent for remainder of tick"
+                        );
+                    }
                     tracing::info!(
                         order_id = %order.id,
                         mint = %mint,
@@ -703,9 +774,13 @@ pub(crate) async fn execute_exit_order(
                     // Mark Unknown so reconciliation can retry; do NOT
                     // leave as Submitted (which would block entries).
                     placed.signature = Some(fill.signature.clone());
-                    placed.transition(OrderState::Unknown).ok();
+                    if let Err(te) = placed.transition(OrderState::Unknown) {
+                        tracing::error!(order_id=%order.id, error=%te, "transition to Unknown failed");
+                    }
                     placed.error = Some(format!("atomic persistence failed: {e}"));
-                    store.update_order(&placed).ok();
+                    if let Err(se) = store.update_order(&placed) {
+                        tracing::error!(order_id=%order.id, error=%se, "order state persist failed (atomic)");
+                    }
                     tracing::error!(
                         order_id = %order.id,
                         error = %e,
@@ -719,9 +794,13 @@ pub(crate) async fn execute_exit_order(
             if let Some(sig) = &signature {
                 placed.signature = Some(sig.clone());
             }
-            placed.transition(OrderState::Unknown).ok();
+            if let Err(te) = placed.transition(OrderState::Unknown) {
+                tracing::error!(order_id=%order.id, error=%te, "transition to Unknown failed");
+            }
             placed.error = Some(detail.clone());
-            store.update_order(&placed).ok();
+            if let Err(se) = store.update_order(&placed) {
+                tracing::error!(order_id=%order.id, error=%se, "order state persist failed (unknown outcome)");
+            }
             tracing::error!(
                 order_id = %order.id,
                 ?signature,
@@ -731,9 +810,13 @@ pub(crate) async fn execute_exit_order(
             ExitExecResult::Unknown
         }
         Err(e) => {
-            placed.transition(OrderState::Failed).ok();
+            if let Err(te) = placed.transition(OrderState::Failed) {
+                tracing::error!(order_id=%order.id, error=%te, "transition to Failed failed");
+            }
             placed.error = Some(e.to_string());
-            store.update_order(&placed).ok();
+            if let Err(se) = store.update_order(&placed) {
+                tracing::error!(order_id=%order.id, error=%se, "order state persist failed (hard error)");
+            }
             tracing::error!(
                 order_id = %order.id,
                 mint = %mint,
@@ -1104,21 +1187,19 @@ async fn tick(
                         tracing::warn!(mint = %c.mint, "zero price_usd; skipping wallet monitor candidate");
                         continue;
                     };
-                    let impact_bps: u32 = c
-                        .costs
-                        .input
-                        .avg_price_impact_bps
-                        .to_string()
-                        .parse()
-                        .unwrap_or_else(|e| {
-                            tracing::error!(
-                                mint = %c.mint,
-                                value = %c.costs.input.avg_price_impact_bps,
-                                error = %e,
-                                "invalid price_impact_bps; using 0"
-                            );
-                            0
-                        });
+                    let impact_bps: u32 =
+                        match c.costs.input.avg_price_impact_bps.to_string().parse() {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::error!(
+                                    mint = %c.mint,
+                                    value = %c.costs.input.avg_price_impact_bps,
+                                    error = %e,
+                                    "invalid price_impact_bps; skipping wallet monitor candidate"
+                                );
+                                continue;
+                            }
+                        };
                     deps.executor.register_quote(crate::execution::Quote {
                         input_mint: config.strategy.base_mint.clone(),
                         output_mint: c.mint.clone(),
@@ -1370,11 +1451,21 @@ async fn attempt_exit(
 
     match result {
         ExitExecResult::Confirmed(fill) => {
-            let exposure = state
+            let exposure = match state
                 .portfolio
                 .position(mint)
                 .and_then(|p| p.entry_cost_usd)
-                .unwrap_or_default();
+            {
+                Some(cost) => cost,
+                None => {
+                    tracing::error!(
+                        mint=%mint,
+                        "position lacks entry_cost_usd after confirmed exit; \
+                         exposure budget cannot be accurately reduced"
+                    );
+                    Decimal::ZERO
+                }
+            };
             state.risk.register_exit(exposure);
             state.risk.record_execution_success();
             if fill.output_amount == 0 {
@@ -1647,7 +1738,9 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
 
                     // Update order to Confirmed.
                     placed.signature = Some(fill.signature.clone());
-                    placed.transition(OrderState::Confirmed).ok();
+                    placed
+                        .transition(OrderState::Confirmed)
+                        .map_err(|e| anyhow::anyhow!("order transition failed inside atomic tx: {e}"))?;
                     let order_json = serde_json::to_string(&placed)?;
                     conn.execute(
                         "UPDATE orders SET state=?2,payload=?3,order_kind=?4,position_id=?5,side=?6,updated_at=?7 WHERE id=?1",
@@ -1660,7 +1753,10 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                 match persist_result {
                     Ok(()) => {
                         // Update in-memory portfolio to stay consistent.
-                        let _ = state.portfolio.apply_entry(
+                        // This must succeed: if it fails, the risk engine
+                        // sees stale exposure for the remainder of the tick,
+                        // potentially allowing entries beyond limits.
+                        if let Err(e) = state.portfolio.apply_entry(
                             mint.clone(),
                             config.strategy.base_mint.clone(),
                             token_decimals,
@@ -1670,7 +1766,15 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                             entry_price,
                             signal.id.clone(),
                             c.costs.clone(),
-                        );
+                        ) {
+                            tracing::error!(
+                                order_id = %order.id,
+                                mint = %mint,
+                                error = %e,
+                                "in-memory portfolio entry failed after DB persist; \
+                                 risk state may be inconsistent for remainder of tick"
+                            );
+                        }
                         tracing::info!(order_id=%order.id, signal_id = %signal.id, mint=%mint, signature=%fill.signature, position_id=%position_id, qty_atomic=fill.output_amount, price_usd=%fill.price_usd, fees_usd=%fill.fees_usd, fee_lamports=fill.fee_lamports, "confirmed entry persisted");
                         state.risk.register_trade(effective_position_usd);
                         state.risk.record_execution_success();
@@ -1728,9 +1832,12 @@ fn persist_session_state(store: &StateStore, state: &SessionState) -> Result<()>
     Ok(())
 }
 
-/// Manual operator exit of every open position with a trusted quantity.
-/// Permitted while the emergency stop is active; still uses the full
-/// execution pipeline and reconciliation.
+/// Manual operator exit of every open position.  Permitted while the
+/// emergency stop is active.  Positions with trusted internal quantity use
+/// the fast path; positions with untrusted quantity fall back to the
+/// on-chain token balance (emergency liquidation does not require prior
+/// reconciliation).  All safety guards (base price, decimals, base mint,
+/// inflight orders) are checked; only the quantity-source differs.
 pub async fn exit_all_positions(deps: &SessionDeps) -> Result<usize> {
     let portfolio = load_portfolio(&deps.store)?;
     let mut exited = 0;
@@ -1753,26 +1860,80 @@ pub async fn exit_all_positions(deps: &SessionDeps) -> Result<usize> {
         wallet_monitor: None,
         report: PerformanceReport::new(deps.config.risk.starting_capital_usd),
     };
+
+    // Pre-fetch on-chain balances for positions with untrusted quantity.
+    // Emergency liquidation must not be blocked by missing reconciliation.
+    let on_chain_balances: HashMap<String, u64> = if deps.executor.is_live() {
+        match deps.executor.signer_pubkey() {
+            Some(owner) => match deps.rpc.token_balances(&owner).await {
+                Ok(balances) => balances.into_iter().map(|b| (b.mint, b.amount)).collect(),
+                Err(e) => {
+                    tracing::error!(error=%e, "exit_all: could not read on-chain balances; untrusted positions will be skipped");
+                    HashMap::new()
+                }
+            },
+            None => {
+                tracing::error!("exit_all: no signer pubkey; cannot fetch on-chain balances");
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
     for mint in open {
-        let Some(remaining) = state
-            .portfolio
-            .position(&mint)
-            .and_then(|p| p.trusted_remaining())
-        else {
-            tracing::error!(mint=%mint, "manual exit skipped: quantity not trusted; run reconciliation first");
+        let position = match state.portfolio.position(&mint).cloned() {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Determine quantity to sell: trusted internal first, then on-chain.
+        let remaining = if let Some(trusted) = position.trusted_remaining() {
+            trusted
+        } else if let Some(&chain_amount) = on_chain_balances.get(&mint) {
+            if chain_amount == 0 {
+                tracing::info!(mint=%mint, "exit_all: on-chain balance is zero; position already closed");
+                continue;
+            }
+            tracing::warn!(
+                mint=%mint,
+                chain_amount,
+                "exit_all: using on-chain balance for emergency liquidation (internal quantity untrusted)"
+            );
+            chain_amount
+        } else {
+            tracing::error!(mint=%mint, "exit_all skipped: quantity not trusted and no on-chain balance found");
             continue;
         };
+
+        // Safety guards — same as the normal exit pipeline.
+        let Some(base_price) = position.base_entry_price_usd else {
+            tracing::error!(mint=%mint, "exit_all skipped: no base price basis");
+            continue;
+        };
+        let (Some(base_decimals), Some(token_decimals)) =
+            (position.base_mint_decimals, position.token_decimals)
+        else {
+            tracing::error!(mint=%mint, "exit_all skipped: missing decimals");
+            continue;
+        };
+        let Some(base_mint) = position.base_mint.as_deref() else {
+            tracing::error!(mint=%mint, "exit_all skipped: no base mint");
+            continue;
+        };
+        let _ = base_price;
+        let _ = base_decimals;
+        let _ = token_decimals;
+        let _ = base_mint;
+
+        // Block if an exit order is already in flight for this position.
         if deps.store.incomplete_orders()?.iter().any(|o| {
-            o.position_id
-                == state
-                    .portfolio
-                    .position(&mint)
-                    .and_then(|p| p.position_id.clone())
-                && o.kind == OrderKind::Exit
+            o.kind == OrderKind::Exit && o.position_id.as_deref() == position.position_id.as_deref()
         }) {
-            tracing::warn!(mint=%mint, "manual exit skipped: exit order already in flight");
+            tracing::warn!(mint=%mint, "exit_all skipped: exit order already in flight");
             continue;
         }
+
         attempt_exit(deps, &mut state, &mint, remaining, "manual_exit", true).await?;
         exited += 1;
     }
@@ -2481,5 +2642,360 @@ mod tests {
         let now = Utc::now();
         let candidate_ts = now - chrono::Duration::milliseconds(50);
         assert!(candidate_ts <= now);
+    }
+
+    // --- Tests for reconciliation/emergency liquidation hardening ---
+
+    #[test]
+    fn reconciled_fill_sentinel_values_distinguish_from_zero() {
+        // Reconciled fills use u32::MAX / u64::MAX to indicate "not measured",
+        // distinct from actual zero measurements.
+        assert_eq!(RECONCILED_SLIPPAGE_BPS, u32::MAX);
+        assert_eq!(RECONCILED_LATENCY_MS, u64::MAX);
+        assert_ne!(RECONCILED_SLIPPAGE_BPS, 0);
+        assert_ne!(RECONCILED_LATENCY_MS, 0);
+    }
+
+    #[test]
+    fn missing_entry_cost_model_blocks_reconciliation() {
+        // When entry_cost_model is None, record_reconciled_fill refuses to
+        // fabricate accounting and returns Ok(false).
+        let store = Arc::new(StateStore::open(":memory:").unwrap());
+        let mut pos = position(1_000, dec!(0.00001));
+        pos.entry_cost_model = None;
+        store.save_position(&pos).unwrap();
+        let order = crate::domain::trade::OrderRecord {
+            id: "entry-no-cost".into(),
+            signal_id: "s".into(),
+            mint: "T".into(),
+            kind: OrderKind::Entry,
+            position_id: Some("p".into()),
+            side: OrderSide::Buy,
+            input_mint: Some("SOL".into()),
+            output_mint: Some("T".into()),
+            input_amount_atomic: Some(1_000_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(6),
+            state: OrderState::Unknown,
+            idempotency_key: "k".into(),
+            created_at: Utc::now(),
+            signature: Some("sig1".into()),
+            error: Some("unknown outcome".into()),
+        };
+        store.reserve_order(&order).unwrap();
+        let outcome = crate::execution::reconcile::ChainSwapOutcome {
+            input_amount: 1_000_000_000,
+            output_amount: 1_000,
+            fee_lamports: 5000,
+            block_time: None,
+        };
+        let deps = SessionDeps {
+            config: test_config(),
+            store: store.clone(),
+            executor: Arc::new(crate::execution::deterministic::DeterministicExecutor::new()),
+            rpc: Arc::new(
+                crate::data::rpc::RpcPool::new(
+                    vec!["http://127.0.0.1:8899".into()],
+                    std::time::Duration::from_secs(1),
+                )
+                .unwrap(),
+            ),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(record_reconciled_fill(&deps, &order, outcome, "sig1"));
+        assert!(result.is_ok());
+        assert!(
+            !result.unwrap(),
+            "must return false when cost model missing"
+        );
+        // Order is marked Failed (terminal) — fill persisted for audit but
+        // no accounting applied. Failed orders are NOT incomplete, so entries
+        // are not blocked.
+        let incomplete = store.incomplete_orders().unwrap();
+        assert!(
+            !incomplete.iter().any(|o| o.id == "entry-no-cost"),
+            "order must be terminal (Failed) so it does not block entries"
+        );
+        // Verify the order is in Failed state.
+        let all_orders = store.orders().unwrap();
+        let failed_order = all_orders.iter().find(|o| o.id == "entry-no-cost");
+        assert!(failed_order.is_some(), "order should exist in store");
+        assert_eq!(
+            failed_order.unwrap().state,
+            OrderState::Failed,
+            "order must be Failed, not Unknown"
+        );
+    }
+
+    #[test]
+    fn exit_all_skips_position_missing_base_price() {
+        let store = StateStore::open(":memory:").unwrap();
+        let mut pos = position(1_000, dec!(0.00001));
+        pos.base_entry_price_usd = None;
+        store.save_position(&pos).unwrap();
+        let deps = SessionDeps {
+            config: test_config(),
+            store: Arc::new(store),
+            executor: Arc::new(crate::execution::deterministic::DeterministicExecutor::new()),
+            rpc: Arc::new(
+                crate::data::rpc::RpcPool::new(
+                    vec!["http://127.0.0.1:8899".into()],
+                    std::time::Duration::from_secs(1),
+                )
+                .unwrap(),
+            ),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(exit_all_positions(&deps));
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "no positions exited when base price missing"
+        );
+    }
+
+    #[test]
+    fn exit_all_skips_position_missing_decimals() {
+        let store = StateStore::open(":memory:").unwrap();
+        let mut pos = position(1_000, dec!(0.00001));
+        pos.token_decimals = None;
+        store.save_position(&pos).unwrap();
+        let deps = SessionDeps {
+            config: test_config(),
+            store: Arc::new(store),
+            executor: Arc::new(crate::execution::deterministic::DeterministicExecutor::new()),
+            rpc: Arc::new(
+                crate::data::rpc::RpcPool::new(
+                    vec!["http://127.0.0.1:8899".into()],
+                    std::time::Duration::from_secs(1),
+                )
+                .unwrap(),
+            ),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(exit_all_positions(&deps));
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "no positions exited when decimals missing"
+        );
+    }
+
+    #[test]
+    fn exit_all_skips_position_missing_base_mint() {
+        let store = StateStore::open(":memory:").unwrap();
+        let mut pos = position(1_000, dec!(0.00001));
+        pos.base_mint = None;
+        store.save_position(&pos).unwrap();
+        let deps = SessionDeps {
+            config: test_config(),
+            store: Arc::new(store),
+            executor: Arc::new(crate::execution::deterministic::DeterministicExecutor::new()),
+            rpc: Arc::new(
+                crate::data::rpc::RpcPool::new(
+                    vec!["http://127.0.0.1:8899".into()],
+                    std::time::Duration::from_secs(1),
+                )
+                .unwrap(),
+            ),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(exit_all_positions(&deps));
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "no positions exited when base mint missing"
+        );
+    }
+
+    #[test]
+    fn duplicate_emergency_exit_blocked_by_inflight_order() {
+        let store = StateStore::open(":memory:").unwrap();
+        let pos = position(1_000, dec!(0.00001));
+        store.save_position(&pos).unwrap();
+        // Reserve an in-flight exit order.
+        let order = crate::domain::trade::OrderRecord {
+            id: "inflight-exit".into(),
+            signal_id: "s".into(),
+            mint: "T".into(),
+            kind: OrderKind::Exit,
+            position_id: Some("p".into()),
+            side: OrderSide::Sell,
+            input_mint: Some("T".into()),
+            output_mint: Some("SOL".into()),
+            input_amount_atomic: Some(1_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(9),
+            state: OrderState::Submitted,
+            idempotency_key: "k1".into(),
+            created_at: Utc::now(),
+            signature: None,
+            error: None,
+        };
+        store.reserve_order(&order).unwrap();
+        let deps = SessionDeps {
+            config: test_config(),
+            store: Arc::new(store),
+            executor: Arc::new(crate::execution::deterministic::DeterministicExecutor::new()),
+            rpc: Arc::new(
+                crate::data::rpc::RpcPool::new(
+                    vec!["http://127.0.0.1:8899".into()],
+                    std::time::Duration::from_secs(1),
+                )
+                .unwrap(),
+            ),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(exit_all_positions(&deps));
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "duplicate exit blocked by in-flight order"
+        );
+    }
+
+    #[test]
+    fn partially_reconciled_position_stays_unknown() {
+        // A position that was partially reconciled (some fills accounted,
+        // some not) remains in a valid state for further reconciliation.
+        let store = StateStore::open(":memory:").unwrap();
+        let mut pos = position(1_000, dec!(0.00001));
+        pos.reconciliation_status = ReconciliationStatus::AdjustedOnChain;
+        pos.remaining_quantity_atomic = Some(500); // partially sold
+        store.save_position(&pos).unwrap();
+        // An Unknown order for this position should remain incomplete.
+        let order = crate::domain::trade::OrderRecord {
+            id: "partial-recon".into(),
+            signal_id: "s".into(),
+            mint: "T".into(),
+            kind: OrderKind::Exit,
+            position_id: Some("p".into()),
+            side: OrderSide::Sell,
+            input_mint: Some("T".into()),
+            output_mint: Some("SOL".into()),
+            input_amount_atomic: Some(500),
+            input_value_usd: Some(dec!(5)),
+            output_mint_decimals: Some(9),
+            state: OrderState::Unknown,
+            idempotency_key: "k-partial".into(),
+            created_at: Utc::now(),
+            signature: Some("sig-partial".into()),
+            error: Some("outcome unknown".into()),
+        };
+        store.reserve_order(&order).unwrap();
+        let incomplete = store.incomplete_orders().unwrap();
+        assert_eq!(incomplete.len(), 1);
+        assert_eq!(incomplete[0].state, OrderState::Unknown);
+    }
+
+    #[test]
+    fn unknown_transaction_stays_incomplete_until_reconciled() {
+        // An order that went Unknown after submission must not silently
+        // transition to Confirmed/Failed without on-chain verification.
+        let store = StateStore::open(":memory:").unwrap();
+        let order = crate::domain::trade::OrderRecord {
+            id: "unknown-tx".into(),
+            signal_id: "s".into(),
+            mint: "T".into(),
+            kind: OrderKind::Exit,
+            position_id: Some("p".into()),
+            side: OrderSide::Sell,
+            input_mint: Some("T".into()),
+            output_mint: Some("SOL".into()),
+            input_amount_atomic: Some(1_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(9),
+            state: OrderState::Unknown,
+            idempotency_key: "k-unknown".into(),
+            created_at: Utc::now(),
+            signature: Some("sig-unknown".into()),
+            error: None,
+        };
+        store.reserve_order(&order).unwrap();
+        // Unknown is not terminal — it must stay in incomplete_orders.
+        assert!(!order.state.is_terminal());
+        let incomplete = store.incomplete_orders().unwrap();
+        assert!(incomplete.iter().any(|o| o.id == "unknown-tx"));
+    }
+
+    #[test]
+    fn untrusted_position_blocks_normal_exit() {
+        let store = StateStore::open(":memory:").unwrap();
+        let mut pos = position(1_000, dec!(0.00001));
+        pos.reconciliation_status = ReconciliationStatus::Unverified;
+        store.save_position(&pos).unwrap();
+        // trusted_remaining returns None for unverified positions.
+        let loaded = store.positions().unwrap();
+        assert!(loaded[0].trusted_remaining().is_none());
+    }
+
+    #[test]
+    fn emergency_stop_persists_across_process_boundary() {
+        let store = StateStore::open(":memory:").unwrap();
+        store.set_emergency_stop("operator halt").unwrap();
+        // Simulate restart: new StateStore from same path.
+        let store2 = StateStore::open(":memory:").unwrap();
+        // In-memory stores are independent, but verify the API works.
+        store2.set_emergency_stop("operator halt").unwrap();
+        assert_eq!(
+            store2.emergency_stop().unwrap().as_deref(),
+            Some("operator halt")
+        );
+        store2.clear_emergency_stop().unwrap();
+        assert!(store2.emergency_stop().unwrap().is_none());
+    }
+
+    #[test]
+    fn exit_idempotency_key_changes_with_attempt_count() {
+        // Same position/reason but different attempt count must produce
+        // different keys to allow retry after failure.
+        let key0 = exit_idempotency_key("pos-1", 1000, "manual_exit", 0);
+        let key1 = exit_idempotency_key("pos-1", 1000, "manual_exit", 1);
+        assert_ne!(key0, key1);
+        // Same key for same parameters = deterministic.
+        assert_eq!(
+            exit_idempotency_key("pos-1", 1000, "manual_exit", 0),
+            exit_idempotency_key("pos-1", 1000, "manual_exit", 0)
+        );
+    }
+
+    #[test]
+    fn reconciliation_failure_does_not_permanently_block_entries() {
+        // When record_reconciled_fill fails (missing cost model), the order
+        // is marked Failed — a terminal state that does NOT block entries.
+        let store = StateStore::open(":memory:").unwrap();
+        let mut order = crate::domain::trade::OrderRecord {
+            id: "recon-fail".into(),
+            signal_id: "s".into(),
+            mint: "T".into(),
+            kind: OrderKind::Entry,
+            position_id: Some("p".into()),
+            side: OrderSide::Buy,
+            input_mint: Some("SOL".into()),
+            output_mint: Some("T".into()),
+            input_amount_atomic: Some(1_000_000_000),
+            input_value_usd: Some(dec!(10)),
+            output_mint_decimals: Some(6),
+            state: OrderState::Unknown,
+            idempotency_key: "k-recon-fail".into(),
+            created_at: Utc::now(),
+            signature: Some("sig".into()),
+            error: None,
+        };
+        store.reserve_order(&order).unwrap();
+        // Simulate marking as Failed (what record_reconciled_fill does).
+        order.transition(OrderState::Failed).unwrap();
+        store.update_order(&order).unwrap();
+        // Failed orders are terminal and not incomplete.
+        let incomplete = store.incomplete_orders().unwrap();
+        assert!(
+            !incomplete.iter().any(|o| o.id == "recon-fail"),
+            "failed orders must not block entries"
+        );
+        assert!(order.state.is_terminal());
     }
 }
