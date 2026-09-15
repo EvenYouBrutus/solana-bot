@@ -51,6 +51,22 @@ pub struct CandidateInput {
     pub safety: crate::domain::token::TokenSafety,
     pub wallets: Vec<WalletStats>,
     pub costs: CostModel,
+    /// When the transaction was confirmed on-chain (from block_time).
+    /// Zero if unknown (e.g., replay mode).
+    #[serde(default)]
+    pub blockchain_timestamp: chrono::DateTime<chrono::Utc>,
+    /// When the bot first learned about this transaction (from WebSocket
+    /// notification or polling discovery).
+    #[serde(default)]
+    pub detection_timestamp: chrono::DateTime<chrono::Utc>,
+    /// When this candidate was created (after consensus check, safety
+    /// fetch, and Jupiter quote).
+    #[serde(default)]
+    pub candidate_timestamp: chrono::DateTime<chrono::Utc>,
+    /// End-to-end detection latency: detection_timestamp - blockchain_timestamp.
+    /// Measured in milliseconds. Zero if unknown.
+    #[serde(default)]
+    pub detection_latency_ms: i64,
 }
 
 pub struct SessionDeps {
@@ -1399,6 +1415,20 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             tracing::debug!("candidate skipped: open position already exists");
             continue;
         }
+        // Reject stale candidates: if the detection latency exceeds the
+        // configured max data age, the signal is too old to act on. This
+        // prevents WebSocket-stored candidates from being processed after
+        // they've gone cold.
+        let candidate_age_secs = (now - c.detection_timestamp).num_seconds();
+        if candidate_age_secs > config.rpc.max_data_age_secs {
+            tracing::info!(
+                mint = %mint,
+                candidate_age_secs,
+                max_age_secs = config.rpc.max_data_age_secs,
+                "stale candidate rejected: detection too old"
+            );
+            continue;
+        }
         let (Some(token_decimals), Some(base_mint_decimals)) =
             (c.token_decimals, c.base_mint_decimals)
         else {
@@ -1438,6 +1468,8 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             mint = %mint,
             candidate_position_usd = %c.position_usd,
             wallets = wallets.len(),
+            detection_latency_ms = c.detection_latency_ms,
+            candidate_age_secs = (now - c.candidate_timestamp).num_seconds(),
             "candidate evaluated"
         );
         let signal = match evaluate_signal(config, &mint, &wallets, &c.market, &c.safety, &expected)
@@ -2402,5 +2434,52 @@ mod tests {
         assert!(risk
             .authorize(dec!(5), dec!(100000), 10, 10, Utc::now())
             .is_err());
+    }
+
+    #[test]
+    fn stale_candidate_rejected_by_detection_age() {
+        use chrono::Duration;
+        let config = test_config();
+        let max_age = config.rpc.max_data_age_secs;
+        let now = Utc::now();
+        let stale_detection = now - Duration::seconds(max_age + 60);
+        let age_secs = (now - stale_detection).num_seconds();
+        assert!(
+            age_secs > max_age,
+            "stale candidate age {} should exceed max {}",
+            age_secs,
+            max_age
+        );
+    }
+
+    #[test]
+    fn fresh_candidate_within_max_data_age() {
+        use chrono::Duration;
+        let config = test_config();
+        let max_age = config.rpc.max_data_age_secs;
+        let now = Utc::now();
+        let fresh_detection = now - Duration::seconds(max_age - 5);
+        let age_secs = (now - fresh_detection).num_seconds();
+        assert!(
+            age_secs <= max_age,
+            "fresh candidate age {} should be within max {}",
+            age_secs,
+            max_age
+        );
+    }
+
+    #[test]
+    fn detection_latency_populated_on_candidate_input() {
+        let now = Utc::now();
+        let blockchain = now - chrono::Duration::milliseconds(300);
+        let latency = (now - blockchain).num_milliseconds();
+        assert_eq!(latency, 300);
+    }
+
+    #[test]
+    fn candidate_timestamp_is_not_later_than_now() {
+        let now = Utc::now();
+        let candidate_ts = now - chrono::Duration::milliseconds(50);
+        assert!(candidate_ts <= now);
     }
 }

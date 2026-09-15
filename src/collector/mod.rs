@@ -1,6 +1,7 @@
 pub mod swap_parser;
 pub mod token_data;
 pub mod wallet_monitor;
+pub mod wallet_ws;
 
 use crate::config::types::Config;
 use crate::domain::market::MarketSnapshot;
@@ -262,6 +263,10 @@ impl CandidateCollector {
                 safety,
                 wallets,
                 costs,
+                blockchain_timestamp: now,
+                detection_timestamp: now,
+                candidate_timestamp: now,
+                detection_latency_ms: 0,
             });
         }
 
@@ -413,6 +418,10 @@ mod tests {
                     assumed_avg_loss_pct: dec!(1),
                 },
             },
+            blockchain_timestamp: observed_at,
+            detection_timestamp: observed_at,
+            candidate_timestamp: observed_at,
+            detection_latency_ms: 0,
         }
     }
 

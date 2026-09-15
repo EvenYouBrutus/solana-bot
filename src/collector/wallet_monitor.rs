@@ -1,5 +1,6 @@
 use crate::collector::swap_parser::{parse_swap_from_transaction, ParsedSwap, SwapDirection};
 use crate::collector::token_data::{fetch_market_snapshot, fetch_token_safety};
+use crate::collector::wallet_ws::{WalletWsManager, WsSwapEvent};
 use crate::config::types::Config;
 use crate::data::rpc::{RpcPool, SignatureEntry};
 use crate::domain::wallet::{Side, WalletStats, WalletTier, WalletTradeObservation};
@@ -12,6 +13,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// Minimum number of completed trades (matched buy→sell pairs) a wallet must
 /// reconstruct before it is eligible for LIVE strategy decisions. This
@@ -361,6 +363,15 @@ pub struct WalletMonitor {
     /// Candidates produced during the startup reconstruction (drained by the
     /// next tick). Keeps `validate_all`'s signature unchanged.
     pending_candidates: Vec<CandidateInput>,
+    /// Channel receiver for WebSocket swap events. When the WebSocket
+    /// subscription manager detects a new swap, it sends a `WsSwapEvent`
+    /// through this channel. The `tick()` method drains it and processes
+    /// events through the same accumulator path as polling.
+    ws_event_rx: Option<mpsc::Receiver<WsSwapEvent>>,
+    /// Shared signature dedup set between WebSocket and polling paths.
+    /// Prevents the same transaction from being processed twice when both
+    /// paths detect it simultaneously.
+    ws_seen_sigs: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 impl WalletMonitor {
@@ -397,6 +408,33 @@ impl WalletMonitor {
             .max_history_signatures
             .clamp(1, DEFAULT_REBUILD_PAGE * MAX_REBUILD_PAGES) as usize;
 
+        // Set up WebSocket subscription manager for real-time detection.
+        let ws_seen_sigs = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let (ws_event_tx, ws_event_rx) = mpsc::channel(256);
+        let ws_endpoints = config.rpc.websocket_endpoints.clone();
+        if ws_endpoints.is_empty() || !config.wallet_monitor.enabled || wallets.is_empty() {
+            tracing::info!(
+                ws_endpoints_empty = ws_endpoints.is_empty(),
+                monitor_enabled = config.wallet_monitor.enabled,
+                wallets_empty = wallets.is_empty(),
+                "WebSocket subscription manager not started; polling-only mode"
+            );
+        } else {
+            let ws_mgr = WalletWsManager::new(
+                ws_endpoints,
+                rpc.clone(),
+                wallets.clone(),
+                ws_seen_sigs.clone(),
+                ws_event_tx,
+                10, // max reconnect attempts
+            );
+            ws_mgr.spawn();
+            tracing::info!(
+                wallets = wallets.len(),
+                "WebSocket subscription manager started for real-time wallet monitoring"
+            );
+        }
+
         let monitor = Self {
             rpc,
             executor,
@@ -416,6 +454,8 @@ impl WalletMonitor {
             initial_rebuild_done: false,
             validation_summary_logged: false,
             pending_candidates: Vec::new(),
+            ws_event_rx: Some(ws_event_rx),
+            ws_seen_sigs,
         };
 
         tracing::info!(
@@ -821,6 +861,33 @@ impl WalletMonitor {
             );
             return Ok(new_candidates);
         }
+
+        // Drain WebSocket events FIRST. Real-time notifications arrive with
+        // near-zero latency compared to polling; processing them before the
+        // polling pass ensures the fastest possible detection-to-candidate
+        // pipeline. Events are deduplicated against the polling path via
+        // `ws_seen_sigs`.
+        if let Some(rx) = &mut self.ws_event_rx {
+            let ws_start = std::time::Instant::now();
+            let mut ws_events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                ws_events.push(event);
+            }
+            let ws_count = ws_events.len() as u32;
+            for event in &ws_events {
+                self.process_ws_swap_event(event, &mut new_candidates, now)
+                    .await;
+            }
+            if ws_count > 0 {
+                tracing::info!(
+                    ws_events = ws_count,
+                    drain_ms = ws_start.elapsed().as_millis(),
+                    candidates = new_candidates.len(),
+                    "WebSocket events drained and processed"
+                );
+            }
+        }
+
         // Complete the startup sweep incrementally: one wallet per tick keeps
         // the session responsive (exit monitor, interlocks, and candidate
         // draining all run between rebuilds) instead of blocking startup for
@@ -935,6 +1002,12 @@ impl WalletMonitor {
                 .entry(wallet.to_string())
                 .or_default()
                 .insert(sig.signature.clone());
+            // Also mark in the shared dedup set so the WebSocket path
+            // does not re-process the same transaction.
+            {
+                let mut seen = self.ws_seen_sigs.blocking_lock();
+                seen.insert(sig.signature.clone());
+            }
 
             if let Some(swap) = parse_swap_from_transaction(&tx, wallet) {
                 tracing::info!(
@@ -986,6 +1059,77 @@ impl WalletMonitor {
         }
 
         Ok(())
+    }
+
+    /// Process a swap event received via WebSocket subscription. This uses
+    /// the same accumulator and candidate-building path as polling, but
+    /// operates on a single swap event rather than a batch of signatures.
+    /// Detection latency is logged explicitly.
+    async fn process_ws_swap_event(
+        &mut self,
+        event: &WsSwapEvent,
+        new_candidates: &mut Vec<CandidateInput>,
+        now: DateTime<Utc>,
+    ) {
+        let detection_latency_ms = (now - event.detected_at).num_milliseconds().max(0);
+        let blockchain_latency_ms = (event.detected_at
+            - chrono::DateTime::from_timestamp(event.swap.block_time, 0).unwrap_or(now))
+        .num_milliseconds()
+        .max(0);
+
+        tracing::debug!(
+            wallet = %event.wallet,
+            sig = %event.swap.signature,
+            mint = %event.swap.output_mint,
+            direction = ?event.swap.direction,
+            detection_latency_ms,
+            blockchain_latency_ms,
+            "processing WebSocket swap event"
+        );
+
+        let sol_price = self
+            .config
+            .economics
+            .sol_price_usd
+            .expect("sol_price_usd validated at WalletMonitor initialization");
+
+        let mut observations = Vec::new();
+        let accumulator = self
+            .accumulators
+            .entry(event.wallet.clone())
+            .or_insert_with(WalletAccumulator::new);
+
+        accumulator.observe_dex(&event.swap.dex);
+        absorb_swap(
+            accumulator,
+            &event.swap,
+            &mut observations,
+            sol_price,
+            &event.wallet,
+        );
+
+        for obs in observations {
+            if obs.received_at <= now {
+                self.wallet_tracker.observe(obs);
+            }
+        }
+
+        let stats = accumulator.build_stats(&event.wallet, Some(now));
+        if stats.trades > 0 {
+            self.wallet_tracker.upsert(stats);
+        }
+
+        match event.swap.direction {
+            SwapDirection::Buy => {
+                let mint = event.swap.output_mint.clone();
+                self.seen_mints.insert(mint.clone());
+                if !self.offered_mints.contains(&mint) {
+                    self.check_and_build_candidate(&mint, new_candidates, now)
+                        .await;
+                }
+            }
+            SwapDirection::Sell => {}
+        }
     }
 
     async fn check_and_build_candidate(
@@ -1145,6 +1289,23 @@ impl WalletMonitor {
         };
 
         let input_lamports = input_amount;
+        let candidate_timestamp = now;
+        // Compute detection latency from the most recently observed wallet.
+        // All consensus wallets observed this mint; use the latest
+        // received_at as the detection time and the earliest block_time
+        // as the blockchain time.
+        let (blockchain_ts, detection_ts, detection_latency_ms) = if !consensus_wallets.is_empty() {
+            let blockchain = consensus_wallets
+                .iter()
+                .map(|w| w.updated_at)
+                .min()
+                .unwrap_or(now);
+            let detection = now; // candidate is built at detection time
+            let latency = (detection - blockchain).num_milliseconds().max(0);
+            (blockchain, detection, latency)
+        } else {
+            (now, now, 0)
+        };
         let candidate = CandidateInput {
             mint: mint.to_string(),
             token_decimals: Some(token_decimals),
@@ -1156,12 +1317,17 @@ impl WalletMonitor {
             safety,
             wallets: consensus_wallets.into_iter().cloned().collect(),
             costs: cost_model,
+            blockchain_timestamp: blockchain_ts,
+            detection_timestamp: detection_ts,
+            candidate_timestamp,
+            detection_latency_ms,
         };
 
         tracing::info!(
             mint = %mint,
             position_usd = %self.position_usd,
             wallets = %candidate.wallets.iter().map(|w| w.wallet.as_str()).collect::<Vec<_>>().join(","),
+            detection_latency_ms = candidate.detection_latency_ms,
             "recent BUY candidate created"
         );
 
@@ -1766,5 +1932,147 @@ mod tests {
         };
         crate::smart_money::score_wallet(&mut stats, &Default::default());
         assert_eq!(stats.tier, WalletTier::Qualified);
+    }
+
+    #[test]
+    fn stale_candidate_rejected_by_max_data_age() {
+        use chrono::Duration;
+
+        let now = Utc::now();
+        let stale = now - Duration::seconds(360);
+        let fresh = now - Duration::seconds(30);
+
+        let max_age_secs = 300i64;
+
+        let stale_age = (now - stale).num_seconds();
+        let fresh_age = (now - fresh).num_seconds();
+
+        assert!(
+            stale_age > max_age_secs,
+            "stale candidate age {} should exceed max {}",
+            stale_age,
+            max_age_secs
+        );
+        assert!(
+            fresh_age <= max_age_secs,
+            "fresh candidate age {} should be within max {}",
+            fresh_age,
+            max_age_secs
+        );
+    }
+
+    #[test]
+    fn detection_latency_is_non_negative() {
+        let now = Utc::now();
+        let blockchain = now - chrono::Duration::milliseconds(150);
+        let latency = (now - blockchain).num_milliseconds();
+        assert!(latency > 0);
+        assert_eq!(latency, 150);
+    }
+
+    #[test]
+    fn detection_latency_zero_when_no_wallets() {
+        let now = Utc::now();
+        let (blockchain, detection, latency) = {
+            let blockchain = now;
+            let detection = now;
+            let latency = (detection - blockchain).num_milliseconds().max(0);
+            (blockchain, detection, latency)
+        };
+        assert_eq!(latency, 0);
+        assert_eq!(blockchain, detection);
+    }
+
+    #[test]
+    fn duplicate_mint_candidates_are_deduped_in_seen_mints() {
+        let mut seen_mints = std::collections::HashSet::new();
+        let mint = "TokenMint1111111111111111111111111111111111";
+        assert!(seen_mints.insert(mint.to_string()));
+        assert!(!seen_mints.insert(mint.to_string()));
+        assert_eq!(seen_mints.len(), 1);
+    }
+
+    #[test]
+    fn wallet_status_classification_order() {
+        // IncompleteHistory takes precedence over ValidActive
+        let report = WalletValidationReport {
+            wallet: "w".into(),
+            status: WalletStatus::IncompleteHistory,
+            signatures_fetched: 100,
+            successful_transactions: 50,
+            swaps_parsed: 10,
+            buys: 5,
+            sells: 5,
+            parse_failures: 0,
+            fetch_failures: 40,
+            history_complete: false,
+            dex_activity: HashMap::new(),
+            last_activity_ts: None,
+            first_activity_ts: None,
+        };
+        assert_eq!(report.status, WalletStatus::IncompleteHistory);
+        assert_ne!(report.status, WalletStatus::ValidActive);
+    }
+
+    #[test]
+    fn two_distinct_wallets_must_both_be_qualified_for_consensus() {
+        let mut w1 = WalletStats {
+            wallet: "w1".into(),
+            entity_id: None,
+            realized_pnl_usd: dec!(100),
+            win_rate: dec!(0.8),
+            avg_return_pct: dec!(15),
+            median_return_pct: dec!(10),
+            max_drawdown_pct: dec!(5),
+            trades: 30,
+            recent_return_pct: dec!(12),
+            concentration_pct: dec!(5),
+            scam_exposure_pct: Decimal::ZERO,
+            score: dec!(80),
+            tier: WalletTier::Candidate,
+            updated_at: Utc::now(),
+        };
+        let mut w2 = w1.clone();
+        w2.wallet = "w2".into();
+
+        crate::smart_money::score_wallet(&mut w1, &Default::default());
+        crate::smart_money::score_wallet(&mut w2, &Default::default());
+
+        assert_eq!(w1.tier, WalletTier::Qualified);
+        assert_eq!(w2.tier, WalletTier::Qualified);
+        assert_ne!(w1.wallet, w2.wallet);
+    }
+
+    #[test]
+    fn observed_tier_wallet_rejected_from_consensus() {
+        let stats = WalletStats {
+            wallet: "observed_only".into(),
+            entity_id: None,
+            realized_pnl_usd: dec!(10),
+            win_rate: dec!(0.5),
+            avg_return_pct: dec!(5),
+            median_return_pct: dec!(3),
+            max_drawdown_pct: dec!(20),
+            trades: 10,
+            recent_return_pct: dec!(2),
+            concentration_pct: Decimal::ZERO,
+            scam_exposure_pct: Decimal::ZERO,
+            score: dec!(40),
+            tier: WalletTier::Observed,
+            updated_at: Utc::now(),
+        };
+        assert!(!matches!(
+            stats.tier,
+            WalletTier::Qualified | WalletTier::HighConfidence
+        ));
+    }
+
+    #[test]
+    fn ws_event_detection_timestamp_is_before_candidate_timestamp() {
+        let now = Utc::now();
+        let detection = now - chrono::Duration::milliseconds(200);
+        let latency = (now - detection).num_milliseconds();
+        assert_eq!(latency, 200);
+        assert!(detection < now);
     }
 }

@@ -462,6 +462,10 @@ mod tests {
                     assumed_avg_loss_pct: dec!(10),
                 },
             },
+            blockchain_timestamp: observed_at,
+            detection_timestamp: observed_at,
+            candidate_timestamp: observed_at,
+            detection_latency_ms: 0,
         }
     }
 
