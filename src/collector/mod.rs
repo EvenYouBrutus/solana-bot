@@ -112,7 +112,16 @@ impl CandidateCollector {
     ) -> CollectResult {
         let now = Utc::now();
         let base_mint = &config.strategy.base_mint;
-        let sol_price = config.economics.sol_price_usd.unwrap_or(dec!(150));
+        let Some(sol_price) = config.economics.sol_price_usd else {
+            tracing::error!(
+                "collect_live requires economics.sol_price_usd; no candidates produced"
+            );
+            return CollectResult::Candidates(vec![]);
+        };
+        if sol_price <= Decimal::ZERO {
+            tracing::error!(sol_price = %sol_price, "sol_price_usd must be positive; no candidates produced");
+            return CollectResult::Candidates(vec![]);
+        }
         let mut candidates = Vec::new();
 
         for mint in SCAN_MINTS {
@@ -171,7 +180,12 @@ impl CandidateCollector {
                     (input_value_usd * dec!(10000) / Decimal::from(quote.price_impact_bps))
                         .round_dp(2)
                 } else {
-                    dec!(10_000_000)
+                    // Zero price impact means the trade size is negligible
+                    // relative to pool depth. We cannot estimate liquidity
+                    // from impact, so we use the raw trade value as a
+                    // conservative lower bound. This may cause the candidate
+                    // to be rejected by min_liquidity_usd, which is correct.
+                    input_value_usd
                 },
                 volume_24h_usd: Decimal::ZERO,
                 volatility_pct: Decimal::ZERO,
@@ -186,63 +200,27 @@ impl CandidateCollector {
                 continue;
             }
 
-            // Safety: route_available is confirmed by the successful quote.
+            // Safety: only what we can verify from the successful quote.
             let safety = TokenSafety {
                 mint_authority_present: false,
                 freeze_authority_present: false,
-                holder_top10_pct: dec!(50),
-                token_age_secs: 86400 * 30,
-                liquidity_locked_or_burned: Some(true),
+                holder_top10_pct: Decimal::ZERO,
+                token_age_secs: 0,
+                liquidity_locked_or_burned: None,
                 sellable: Some(true),
                 route_available: Some(true),
-                creator_suspicious: Some(false),
-                abnormal_activity: Some(false),
-                liquidity_change_pct: Some(dec!(5)),
+                creator_suspicious: None,
+                abnormal_activity: None,
+                liquidity_change_pct: None,
                 observed_at: now,
             };
 
-            // Wallet consensus from quote quality.
-            let quality = if quote.price_impact_bps < 50 {
-                dec!(85)
-            } else if quote.price_impact_bps < 100 {
-                dec!(75)
-            } else {
-                dec!(65)
-            };
-            let wallets = vec![
-                WalletStats {
-                    wallet: format!("live_{mint}_a"),
-                    entity_id: Some(format!("entity_a_{mint}")),
-                    realized_pnl_usd: dec!(500),
-                    win_rate: dec!(0.72),
-                    avg_return_pct: dec!(15),
-                    median_return_pct: dec!(12),
-                    max_drawdown_pct: dec!(8),
-                    trades: 50,
-                    recent_return_pct: dec!(10),
-                    concentration_pct: dec!(5),
-                    scam_exposure_pct: dec!(0),
-                    score: quality,
-                    tier: crate::domain::wallet::WalletTier::Qualified,
-                    updated_at: now - chrono::Duration::minutes(5),
-                },
-                WalletStats {
-                    wallet: format!("live_{mint}_b"),
-                    entity_id: Some(format!("entity_b_{mint}")),
-                    realized_pnl_usd: dec!(320),
-                    win_rate: dec!(0.68),
-                    avg_return_pct: dec!(12),
-                    median_return_pct: dec!(10),
-                    max_drawdown_pct: dec!(10),
-                    trades: 40,
-                    recent_return_pct: dec!(8),
-                    concentration_pct: dec!(3),
-                    scam_exposure_pct: dec!(0),
-                    score: quality - dec!(5),
-                    tier: crate::domain::wallet::WalletTier::Qualified,
-                    updated_at: now - chrono::Duration::minutes(2),
-                },
-            ];
+            // No synthetic wallet consensus. Without real wallet tracking
+            // data, we cannot produce meaningful wallet stats. This path
+            // scans fixed well-known mints and does not have wallet-level
+            // trade history. Candidates from this path will be rejected
+            // by the min_consensus_wallets gate.
+            let wallets: Vec<WalletStats> = vec![];
 
             let priority_fee_usd = Decimal::from(config.execution.priority_fee_lamports)
                 / dec!(1_000_000_000)
@@ -255,23 +233,31 @@ impl CandidateCollector {
                 input: BreakEvenInputs {
                     position_size_usd: input_value_usd,
                     avg_priority_fee_usd: priority_fee_usd,
-                    avg_swap_fee_bps: dec!(30),
+                    // Swap fee is embedded in the Jupiter route; we record 0
+                    // because we cannot decompose the AMM fee from the quote.
+                    avg_swap_fee_bps: Decimal::ZERO,
                     avg_slippage_bps: Decimal::from(config.execution.slippage_bps),
                     avg_price_impact_bps: Decimal::from(quote.price_impact_bps),
-                    failed_tx_rate: dec!(0.05),
-                    avg_failed_tx_cost_usd: priority_fee_usd,
-                    assumed_win_loss_ratio: dec!(2),
-                    assumed_avg_loss_pct: dec!(10),
+                    // Failure data requires real execution history.
+                    failed_tx_rate: Decimal::ZERO,
+                    avg_failed_tx_cost_usd: Decimal::ZERO,
+                    // Win/loss assumptions must not be synthesized.
+                    assumed_win_loss_ratio: Decimal::ZERO,
+                    assumed_avg_loss_pct: Decimal::ZERO,
                 },
             };
 
+            // Expected return: without wallet consensus data, we have no
+            // basis for an expected return estimate. Using ZERO means the
+            // economic gate will reject this candidate if it requires a
+            // positive edge — which is the correct behavior.
             candidates.push(CandidateInput {
                 mint: mint.to_string(),
                 token_decimals: Some(6),
                 base_mint_decimals: Some(9),
                 input_amount: quote.input_amount,
                 position_usd: input_value_usd,
-                expected_gross_return_pct: dec!(15),
+                expected_gross_return_pct: Decimal::ZERO,
                 market,
                 safety,
                 wallets,
@@ -543,5 +529,55 @@ mod tests {
         let now = Utc::now();
         let result = collector.collect_from_jsonl("/nonexistent/path.jsonl", now, 3600);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn negative_expected_return_preserved() {
+        let mut collector = CandidateCollector::new();
+        let now = Utc::now();
+        let mut c = test_candidate("TOKEN_A", now - chrono::Duration::seconds(10));
+        c.expected_gross_return_pct = dec!(-5);
+        let batch = collector.collect_batch(vec![c], now, 3600);
+        // Negative expected return is valid data — the candidate should pass
+        // through collector validation. The strategy/economic gate will
+        // reject it later if it requires positive expectancy.
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].expected_gross_return_pct, dec!(-5));
+    }
+
+    #[test]
+    fn zero_expected_return_preserved() {
+        let mut collector = CandidateCollector::new();
+        let now = Utc::now();
+        let mut c = test_candidate("TOKEN_A", now - chrono::Duration::seconds(10));
+        c.expected_gross_return_pct = Decimal::ZERO;
+        let batch = collector.collect_batch(vec![c], now, 3600);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].expected_gross_return_pct, Decimal::ZERO);
+    }
+
+    #[test]
+    fn zero_cost_model_fields_preserved() {
+        let mut collector = CandidateCollector::new();
+        let now = Utc::now();
+        let mut c = test_candidate("TOKEN_A", now - chrono::Duration::seconds(10));
+        c.costs.input.avg_swap_fee_bps = Decimal::ZERO;
+        c.costs.input.failed_tx_rate = Decimal::ZERO;
+        c.costs.input.assumed_win_loss_ratio = Decimal::ZERO;
+        c.costs.input.assumed_avg_loss_pct = Decimal::ZERO;
+        let batch = collector.collect_batch(vec![c], now, 3600);
+        // Zero cost fields are valid — they represent unknown data rather
+        // than synthetic assumptions.
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn zero_position_usd_rejected() {
+        let mut collector = CandidateCollector::new();
+        let now = Utc::now();
+        let mut c = test_candidate("TOKEN_A", now - chrono::Duration::seconds(10));
+        c.position_usd = Decimal::ZERO;
+        let batch = collector.collect_batch(vec![c], now, 3600);
+        assert!(batch.is_empty());
     }
 }

@@ -337,6 +337,18 @@ impl WalletMonitor {
         rpc: Arc<RpcPool>,
         executor: Arc<dyn Executor>,
     ) -> Result<Self, anyhow::Error> {
+        if config.wallet_monitor.enabled {
+            // In live mode, SOL/USD price must be configured. A missing price
+            // means every fee conversion and position sizing calculation would
+            // use a synthetic fallback, which is unacceptable for real-money
+            // trading. Fail closed.
+            if config.economics.sol_price_usd.is_none() {
+                anyhow::bail!(
+                    "wallet_monitor requires economics.sol_price_usd to be configured; \
+                     refusing to start without a verified SOL/USD price"
+                );
+            }
+        }
         let wallets = load_wallets(&config.wallet_monitor.wallets_file)?;
         if wallets.is_empty() {
             tracing::warn!(
@@ -526,7 +538,11 @@ impl WalletMonitor {
         let mut first_ts: Option<i64> = None;
         let mut processed = HashSet::new();
         let mut accumulator = WalletAccumulator::new();
-        let sol_price = self.config.economics.sol_price_usd.unwrap_or(dec!(150));
+        let sol_price = self
+            .config
+            .economics
+            .sol_price_usd
+            .expect("sol_price_usd validated at WalletMonitor initialization");
         let mut observations: Vec<WalletTradeObservation> = Vec::new();
         let consensus_window = self.consensus_window_secs as i64;
         let now_for_window = Utc::now();
@@ -789,7 +805,11 @@ impl WalletMonitor {
             return Ok(());
         }
 
-        let sol_price = self.config.economics.sol_price_usd.unwrap_or(dec!(150));
+        let sol_price = self
+            .config
+            .economics
+            .sol_price_usd
+            .expect("sol_price_usd validated at WalletMonitor initialization");
 
         let mut tx_count = 0usize;
         let mut swaps_this_tick: Vec<ParsedSwap> = Vec::new();
@@ -952,12 +972,27 @@ impl WalletMonitor {
             }
         };
 
-        let sol_price = self.config.economics.sol_price_usd.unwrap_or(dec!(150));
+        let sol_price = self
+            .config
+            .economics
+            .sol_price_usd
+            .expect("sol_price_usd validated at WalletMonitor initialization");
         let base_mint_decimals = 9u8;
-        let input_amount = (self.position_usd / sol_price * dec!(1_000_000_000))
+        let input_amount = match (self.position_usd / sol_price * dec!(1_000_000_000))
             .to_string()
             .parse::<u64>()
-            .unwrap_or(4_000_000);
+        {
+            Ok(v) if v > 0 => v,
+            _ => {
+                tracing::warn!(
+                    mint = %mint,
+                    position_usd = %self.position_usd,
+                    sol_price = %sol_price,
+                    "failed to compute input_amount in lamports; candidate rejected"
+                );
+                return;
+            }
+        };
 
         let (market, price_impact_bps) = match fetch_market_snapshot(
             self.executor.as_ref(),
@@ -995,20 +1030,38 @@ impl WalletMonitor {
                 .sum::<Decimal>()
                 / Decimal::from(consensus_wallets.len())
         };
-        let expected_gross_return = avg_return.max(dec!(5));
+        // Expected return must come from observed wallet data. If the average
+        // is negative or zero, that is the real signal — do not inflate it.
+        let expected_gross_return = avg_return;
 
         let cost_model = CostModel {
             observed_at: now,
             input: BreakEvenInputs {
                 position_size_usd: self.position_usd,
-                avg_priority_fee_usd: dec!(0.0004),
-                avg_swap_fee_bps: dec!(30),
-                avg_slippage_bps: dec!(50),
+                // Priority fee is derived from the configured lamport amount
+                // and the verified SOL/USD price — not a synthetic constant.
+                avg_priority_fee_usd: Decimal::from(self.config.execution.priority_fee_lamports)
+                    / dec!(1_000_000_000)
+                    * sol_price,
+                // Swap fee is observable from the actual Jupiter quote route.
+                // The quote's price_impact_bps already embeds the pool fee;
+                // we record 0 here because we cannot independently measure it
+                // before fetching the quote. The economic gate will reject
+                // candidates where this incomplete model fails the
+                // round-trip cost check.
+                avg_swap_fee_bps: Decimal::ZERO,
+                avg_slippage_bps: Decimal::from(self.config.execution.slippage_bps),
                 avg_price_impact_bps: Decimal::from(price_impact_bps),
-                failed_tx_rate: dec!(0.05),
-                avg_failed_tx_cost_usd: dec!(0.002),
-                assumed_win_loss_ratio: dec!(2),
-                assumed_avg_loss_pct: dec!(10),
+                // Failure rate and cost are unknown until we have real
+                // execution data. Using zero means the break-even
+                // calculator does not add phantom failure costs.
+                failed_tx_rate: Decimal::ZERO,
+                avg_failed_tx_cost_usd: Decimal::ZERO,
+                // Win/loss ratio and average loss are strategy assumptions
+                // that must NOT be synthesized. If the economic gate
+                // requires them, it will reject — which is correct.
+                assumed_win_loss_ratio: Decimal::ZERO,
+                assumed_avg_loss_pct: Decimal::ZERO,
             },
             source: "wallet_monitor".into(),
             is_live_snapshot: true,

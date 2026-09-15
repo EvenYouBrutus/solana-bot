@@ -989,29 +989,59 @@ async fn tick(
             let _ = store.set_last_liquidity(&c.mint, c.market.liquidity_usd);
             // Register a quote from candidate market data so the deterministic
             // executor can serve it during process_entries.
-            let sol_price = config.economics.sol_price_usd.unwrap_or(dec!(150));
-            let input_value_usd = c.position_usd;
-            let tokens = if sol_price > Decimal::ZERO && c.market.price_usd > Decimal::ZERO {
-                (input_value_usd / c.market.price_usd * dec!(1_000_000) * dec!(1_000_000_000)
-                    / dec!(1_000_000))
-                .to_string()
-                .parse::<u64>()
-                .unwrap_or(c.input_amount)
-            } else {
-                c.input_amount
+            let Some(sol_price) = config.economics.sol_price_usd else {
+                tracing::error!(
+                    "sol_price_usd required for replay quote registration; skipping candidate"
+                );
+                continue;
             };
+            if sol_price <= Decimal::ZERO {
+                tracing::error!(sol_price = %sol_price, "sol_price_usd must be positive; skipping candidate");
+                continue;
+            }
+            let input_value_usd = c.position_usd;
+            let tokens = if c.market.price_usd > Decimal::ZERO {
+                let raw =
+                    input_value_usd / c.market.price_usd * dec!(1_000_000) * dec!(1_000_000_000)
+                        / dec!(1_000_000);
+                raw.to_string()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "failed to compute token amount for {}: input_value={} price={}",
+                            c.mint,
+                            input_value_usd,
+                            c.market.price_usd
+                        )
+                    })?
+            } else {
+                anyhow::bail!(
+                    "candidate {} has zero price_usd; cannot compute token amount",
+                    c.mint
+                );
+            };
+            let impact_bps: u32 = c
+                .costs
+                .input
+                .avg_price_impact_bps
+                .to_string()
+                .parse()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to parse price_impact_bps for {}: {} ({})",
+                        c.mint,
+                        c.costs.input.avg_price_impact_bps,
+                        e
+                    )
+                })?;
             deps.executor.register_quote(crate::execution::Quote {
                 input_mint: config.strategy.base_mint.clone(),
                 output_mint: c.mint.clone(),
                 input_amount: c.input_amount,
                 output_amount: tokens,
-                price_impact_bps: c
-                    .costs
-                    .input
-                    .avg_price_impact_bps
-                    .to_string()
-                    .parse()
-                    .unwrap_or(50),
+                price_impact_bps: impact_bps,
                 route: serde_json::json!({"source": "replay"}),
                 observed_at: now,
             });
@@ -1028,32 +1058,57 @@ async fn tick(
                 let count = wm_candidates.len();
                 for c in &wm_candidates {
                     let _ = store.set_last_liquidity(&c.mint, c.market.liquidity_usd);
-                    let sol_price = config.economics.sol_price_usd.unwrap_or(dec!(150));
+                    let Some(sol_price) = config.economics.sol_price_usd else {
+                        tracing::error!(
+                            "sol_price_usd required for wallet monitor quote; skipping candidate"
+                        );
+                        continue;
+                    };
+                    if sol_price <= Decimal::ZERO {
+                        tracing::error!(sol_price = %sol_price, "sol_price_usd must be positive; skipping candidate");
+                        continue;
+                    }
                     let input_value_usd = c.position_usd;
-                    let tokens = if sol_price > Decimal::ZERO && c.market.price_usd > Decimal::ZERO
-                    {
-                        (input_value_usd / c.market.price_usd
+                    let tokens = if c.market.price_usd > Decimal::ZERO {
+                        let raw = input_value_usd / c.market.price_usd
                             * dec!(1_000_000)
                             * dec!(1_000_000_000)
-                            / dec!(1_000_000))
-                        .to_string()
-                        .parse::<u64>()
-                        .unwrap_or(c.input_amount)
+                            / dec!(1_000_000);
+                        raw.to_string()
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|v| *v > 0)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                "failed to compute token amount for {}: input_value={} price={}",
+                                c.mint, input_value_usd, c.market.price_usd
+                            )
+                            })?
                     } else {
-                        c.input_amount
+                        tracing::warn!(mint = %c.mint, "zero price_usd; skipping wallet monitor candidate");
+                        continue;
                     };
+                    let impact_bps: u32 = c
+                        .costs
+                        .input
+                        .avg_price_impact_bps
+                        .to_string()
+                        .parse()
+                        .unwrap_or_else(|e| {
+                            tracing::error!(
+                                mint = %c.mint,
+                                value = %c.costs.input.avg_price_impact_bps,
+                                error = %e,
+                                "invalid price_impact_bps; using 0"
+                            );
+                            0
+                        });
                     deps.executor.register_quote(crate::execution::Quote {
                         input_mint: config.strategy.base_mint.clone(),
                         output_mint: c.mint.clone(),
                         input_amount: c.input_amount,
                         output_amount: tokens,
-                        price_impact_bps: c
-                            .costs
-                            .input
-                            .avg_price_impact_bps
-                            .to_string()
-                            .parse()
-                            .unwrap_or(50),
+                        price_impact_bps: impact_bps,
                         route: serde_json::json!({"source": "wallet_monitor"}),
                         observed_at: now,
                     });
@@ -1381,7 +1436,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             .collect();
         tracing::info!(
             mint = %mint,
-            position_usd = %c.position_usd,
+            candidate_position_usd = %c.position_usd,
             wallets = wallets.len(),
             "candidate evaluated"
         );
@@ -1403,13 +1458,43 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         if state.seen_signals.contains(&signal.id) {
             continue;
         }
-        if c.position_usd <= Decimal::ZERO || c.position_usd > config.risk.max_live_capital_usd {
-            tracing::warn!("position exceeds configured live-capital cap or is invalid");
-            continue;
-        }
+        // In live mode, position size is computed by the risk engine from
+        // current equity, risk limits, and stop-loss. The candidate's
+        // position_usd is only used as a hint for paper/backtest mode.
         state
             .risk
             .set_open_positions(state.portfolio.open_positions().len());
+        let effective_position_usd = if config.mode == crate::config::types::Mode::Live {
+            let max_pos = state
+                .risk
+                .max_position_usd(config.strategy.stop_loss_pct)
+                .unwrap_or(Decimal::ZERO);
+            if max_pos <= Decimal::ZERO {
+                tracing::warn!(mint=%mint, "risk engine computed zero position size; rejecting");
+                continue;
+            }
+            // Use the smaller of the risk-engine limit and the candidate's
+            // proposed size, but never exceed max_live_capital_usd.
+            let candidate_pos = c.position_usd;
+            let sized = if candidate_pos > Decimal::ZERO && candidate_pos <= max_pos {
+                candidate_pos
+            } else {
+                max_pos
+            };
+            if sized > config.risk.max_live_capital_usd {
+                config.risk.max_live_capital_usd
+            } else {
+                sized
+            }
+        } else {
+            c.position_usd
+        };
+        if effective_position_usd <= Decimal::ZERO
+            || effective_position_usd > config.risk.max_live_capital_usd
+        {
+            tracing::warn!(position_usd=%effective_position_usd, "position exceeds configured live-capital cap or is invalid");
+            continue;
+        }
         // Fresh quote before every entry: price impact and viability are
         // evaluated on live data, never on the feed's assertion.
         let quote = match deps
@@ -1429,7 +1514,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             }
         };
         if let Err(e) = state.risk.authorize(
-            c.position_usd,
+            effective_position_usd,
             c.market.liquidity_usd,
             config.execution.slippage_bps as u32,
             quote.price_impact_bps,
@@ -1440,7 +1525,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         }
         if let Err(e) = state
             .risk
-            .validate_position_size(c.position_usd, config.strategy.stop_loss_pct)
+            .validate_position_size(effective_position_usd, config.strategy.stop_loss_pct)
         {
             tracing::info!(signal_id = %signal.id, reason=%e, "risk-per-trade position sizing rejected entry");
             continue;
@@ -1461,7 +1546,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             input_mint: Some(config.strategy.base_mint.clone()),
             output_mint: Some(mint.clone()),
             input_amount_atomic: Some(c.input_amount),
-            input_value_usd: Some(c.position_usd),
+            input_value_usd: Some(effective_position_usd),
             output_mint_decimals: Some(token_decimals),
             state: OrderState::Pending,
             idempotency_key: key,
@@ -1481,7 +1566,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         let mut placed = order.clone();
         placed.transition(OrderState::Submitted).ok();
         store.update_order(&placed)?;
-        tracing::info!(order_id=%order.id, signal_id = %signal.id, position_id=%position_id, position_usd=%c.position_usd, qty_in=c.input_amount, expected_out=quote.output_amount, impact_bps=quote.price_impact_bps, "paper entry submitted");
+        tracing::info!(order_id=%order.id, signal_id = %signal.id, position_id=%position_id, position_usd=%effective_position_usd, qty_in=c.input_amount, expected_out=quote.output_amount, impact_bps=quote.price_impact_bps, "paper entry submitted");
         let request = ExecutionRequest {
             order_id: order.id.clone(),
             quote,
@@ -1490,7 +1575,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             min_output_amount: min_output,
             input_decimals: base_mint_decimals,
             output_decimals: token_decimals,
-            value_basis: ValueBasis::InputValueUsd(c.position_usd),
+            value_basis: ValueBasis::InputValueUsd(effective_position_usd),
         };
         match deps.executor.execute(request).await {
             Ok(mut fill) => {
@@ -1555,7 +1640,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                             c.costs.clone(),
                         );
                         tracing::info!(order_id=%order.id, signal_id = %signal.id, mint=%mint, signature=%fill.signature, position_id=%position_id, qty_atomic=fill.output_amount, price_usd=%fill.price_usd, fees_usd=%fill.fees_usd, fee_lamports=fill.fee_lamports, "confirmed entry persisted");
-                        state.risk.register_trade(c.position_usd);
+                        state.risk.register_trade(effective_position_usd);
                         state.risk.record_execution_success();
                         if fill.output_amount < min_output {
                             tracing::error!(order_id=%order.id, actual=fill.output_amount, min_output, "entry fill fell below the minimum accepted output");

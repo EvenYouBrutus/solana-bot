@@ -1,5 +1,4 @@
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use serde::Deserialize;
 
 use super::ConfigError;
@@ -251,7 +250,11 @@ pub struct WalletMonitorConfig {
     pub max_history_signatures: u32,
     #[serde(default = "default_consensus_window")]
     pub consensus_window_secs: u64,
-    #[serde(default = "default_position_usd")]
+    /// Position size in USD for wallet-monitor-derived candidates. In live
+    /// mode this is an initial hint; the risk engine overrides it based on
+    /// current equity and risk limits. Must be explicitly configured for
+    /// live mode — no default is provided to prevent accidental trading
+    /// with an unreviewed position size.
     pub position_usd: Decimal,
 }
 
@@ -260,9 +263,6 @@ fn default_max_history_sigs() -> u32 {
 }
 fn default_consensus_window() -> u64 {
     900
-}
-fn default_position_usd() -> Decimal {
-    dec!(4)
 }
 
 impl Default for WalletMonitorConfig {
@@ -273,7 +273,7 @@ impl Default for WalletMonitorConfig {
             poll_interval_secs: default_poll(),
             max_history_signatures: default_max_history_sigs(),
             consensus_window_secs: default_consensus_window(),
-            position_usd: default_position_usd(),
+            position_usd: Decimal::ZERO,
         }
     }
 }

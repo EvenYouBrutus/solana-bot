@@ -15,14 +15,15 @@ const MAX_AGE_PAGES: u32 = 10;
 
 /// Estimate pool liquidity from a real quote's price impact: a trade of size
 /// X causing `p` basis points of impact implies liquidity ≈ X / (p/10000).
-/// A zero (sub-bps-rounded) impact is treated as very deep liquidity with a
-/// large bounded estimate. Shared by entry pricing and exit evidence refresh
-/// so both directions use one consistent definition.
+/// A zero (sub-bps-rounded) impact means the trade is negligible relative to
+/// pool depth and we cannot estimate liquidity. We return zero, which will
+/// cause the candidate to be rejected by min_liquidity_usd — the correct
+/// fail-closed behavior.
 pub fn estimate_liquidity_usd(trade_size_usd: Decimal, price_impact_bps: u32) -> Decimal {
     if price_impact_bps > 0 {
         (trade_size_usd * dec!(10000) / Decimal::from(price_impact_bps)).round_dp(2)
     } else {
-        dec!(10_000_000)
+        Decimal::ZERO
     }
 }
 
@@ -196,4 +197,39 @@ pub async fn fetch_market_snapshot(
         },
         price_impact_bps,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn zero_impact_returns_zero_liquidity() {
+        // Zero price impact means the trade is negligible relative to pool
+        // depth. We cannot estimate liquidity, so we return zero (fail closed).
+        let liq = estimate_liquidity_usd(dec!(100), 0);
+        assert_eq!(liq, Decimal::ZERO);
+    }
+
+    #[test]
+    fn positive_impact_estimates_liquidity() {
+        // $100 trade causing 100 bps (1%) impact implies ~$10,000 liquidity.
+        let liq = estimate_liquidity_usd(dec!(100), 100);
+        assert_eq!(liq, dec!(10000));
+    }
+
+    #[test]
+    fn small_impact_implies_large_liquidity() {
+        // $100 trade causing 1 bps impact implies ~$1,000,000 liquidity.
+        let liq = estimate_liquidity_usd(dec!(100), 1);
+        assert_eq!(liq, dec!(1000000));
+    }
+
+    #[test]
+    fn large_impact_implies_small_liquidity() {
+        // $100 trade causing 1000 bps (10%) impact implies ~$1,000 liquidity.
+        let liq = estimate_liquidity_usd(dec!(100), 1000);
+        assert_eq!(liq, dec!(1000));
+    }
 }

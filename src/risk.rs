@@ -829,4 +829,72 @@ mod tests {
         let engine = RiskEngine::new(config(), dec!(100));
         assert!(engine.authorize_exit(0).is_err());
     }
+
+    // --- Risk engine position sizing tests ---
+
+    #[test]
+    fn risk_engine_position_sizing_from_equity_and_limits() {
+        // equity=1000, risk_per_trade=1%, stop_loss=5%
+        // max_position = 1000 * 1 / 5 = 200
+        let mut cfg = config();
+        cfg.max_risk_per_trade_percent = dec!(1);
+        let mut engine = RiskEngine::new(cfg, dec!(1000));
+        engine.state.equity_usd = dec!(1000);
+        let max = engine.max_position_usd(dec!(5)).unwrap();
+        assert_eq!(max, dec!(200));
+    }
+
+    #[test]
+    fn risk_engine_position_sizing_scales_with_equity() {
+        let mut cfg = config();
+        cfg.max_risk_per_trade_percent = dec!(1);
+        // equity=500 -> max_position = 500 * 1 / 5 = 100
+        let mut engine = RiskEngine::new(cfg, dec!(500));
+        engine.state.equity_usd = dec!(500);
+        assert_eq!(engine.max_position_usd(dec!(5)).unwrap(), dec!(100));
+
+        // equity=2000 -> max_position = 2000 * 1 / 5 = 400
+        engine.state.equity_usd = dec!(2000);
+        assert_eq!(engine.max_position_usd(dec!(5)).unwrap(), dec!(400));
+    }
+
+    #[test]
+    fn risk_engine_validate_position_size_enforces_computed_max() {
+        let mut cfg = config();
+        cfg.max_risk_per_trade_percent = dec!(1);
+        let mut engine = RiskEngine::new(cfg, dec!(1000));
+        engine.state.equity_usd = dec!(1000);
+        // max = 1000 * 1 / 5 = 200
+        assert!(engine.validate_position_size(dec!(200), dec!(5)).is_ok());
+        assert!(engine.validate_position_size(dec!(201), dec!(5)).is_err());
+    }
+
+    #[test]
+    fn risk_engine_rejects_zero_stop_loss_for_sizing() {
+        let engine = RiskEngine::new(config(), dec!(100));
+        assert!(engine.max_position_usd(Decimal::ZERO).is_none());
+    }
+
+    #[test]
+    fn risk_engine_rejects_negative_stop_loss_for_sizing() {
+        let engine = RiskEngine::new(config(), dec!(100));
+        assert!(engine.max_position_usd(dec!(-5)).is_none());
+    }
+
+    #[test]
+    fn candidate_position_usd_cannot_bypass_risk_engine() {
+        // Even if the candidate proposes a large position_usd, the risk
+        // engine's max_position_usd is the binding constraint.
+        let mut cfg = config();
+        cfg.max_risk_per_trade_percent = dec!(1);
+        cfg.max_live_capital_usd = dec!(500);
+        let mut engine = RiskEngine::new(cfg, dec!(1000));
+        engine.state.equity_usd = dec!(1000);
+        // max_position = 1000 * 1 / 5 = 200, but max_live_capital = 500
+        // authorize should reject anything > 200 from risk sizing
+        assert!(engine.validate_position_size(dec!(200), dec!(5)).is_ok());
+        assert!(engine.validate_position_size(dec!(201), dec!(5)).is_err());
+        // Even a candidate proposing $500 is rejected by risk sizing
+        assert!(engine.validate_position_size(dec!(500), dec!(5)).is_err());
+    }
 }
