@@ -264,7 +264,7 @@ impl WalletAccumulator {
         trades.sort_by_key(|t| t.exit_time);
 
         let count = trades.len() as u32;
-        if count == 0 {
+if count == 0 {
             return WalletStats {
                 wallet: wallet.to_string(),
                 entity_id: None,
@@ -282,8 +282,7 @@ impl WalletAccumulator {
                 updated_at: cutoff,
                 avg_win_pct: None,
                 avg_loss_pct: None,
-            };
-        }
+            }
 
         let wins = trades
             .iter()
@@ -863,10 +862,13 @@ impl WalletMonitor {
                 "recent BUY candidate gate"
             );
             let mut candidates = Vec::new();
-            let sol_price = self
-                .sol_price
-                .or(self.config.economics.sol_price_usd)
-                .unwrap_or_default();
+            let sol_price = match self.sol_price {
+            Some(p) => p,
+            None => {
+                tracing::debug!(mint = %mint, "SOL price unavailable; skipping candidate build");
+                return;
+            }
+        };
             self.check_and_build_candidate(mint, &mut candidates, now, sol_price)
                 .await;
             self.pending_candidates.extend(candidates);
@@ -1093,7 +1095,7 @@ impl WalletMonitor {
             }
         }
 
-        let stats = accumulator.build_stats(wallet, Some(now));
+        let stats = accumulator.build_stats(wallet, now);
         if stats.trades > 0 {
             self.wallet_tracker.upsert(stats);
         }
@@ -1168,7 +1170,7 @@ impl WalletMonitor {
             }
         }
 
-        let stats = accumulator.build_stats(&event.wallet, Some(now));
+        let stats = accumulator.build_stats(&event.wallet, now);
         if stats.trades > 0 {
             self.wallet_tracker.upsert(stats);
         }
@@ -1265,18 +1267,15 @@ impl WalletMonitor {
         }
         .to_string()
         .parse::<u64>()
-        {
-            Ok(v) if v > 0 => v,
-            _ => {
-                tracing::warn!(
-                    mint = %mint,
-                    position_usd = %self.position_usd,
-                    sol_price = %sol_price,
-                    "failed to compute input_amount in lamports; candidate rejected"
-                );
-                return;
-            }
-        };
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                mint = %mint,
+                position_usd = %self.position_usd,
+                sol_price = %sol_price,
+                "failed to compute input_amount in lamports; candidate rejected"
+            );
+            0u64
+        });
 
         let (market, price_impact_bps) = match fetch_market_snapshot(
             self.executor.as_ref(),
@@ -1955,6 +1954,8 @@ mod tests {
             score: dec!(70),
             tier: WalletTier::Observed, // Suspect wallets stay at Observed or below
             updated_at: Utc::now(),
+            avg_win_pct: None,
+            avg_loss_pct: None,
         };
         // Observed tier is NOT accepted by qualified_consensus_at
         assert!(!matches!(
@@ -2004,6 +2005,8 @@ mod tests {
             score: Decimal::ZERO,
             tier: WalletTier::Candidate,
             updated_at: Utc::now(),
+            avg_win_pct: None,
+            avg_loss_pct: None,
         };
         crate::smart_money::score_wallet(&mut stats, &Default::default());
         // 24 < 25 → Observed at best, NOT Qualified
@@ -2030,6 +2033,8 @@ mod tests {
             score: Decimal::ZERO,
             tier: WalletTier::Candidate,
             updated_at: Utc::now(),
+            avg_win_pct: None,
+            avg_loss_pct: None,
         };
         crate::smart_money::score_wallet(&mut stats, &Default::default());
         assert_eq!(stats.tier, WalletTier::Qualified);
@@ -2132,6 +2137,8 @@ mod tests {
             score: dec!(80),
             tier: WalletTier::Candidate,
             updated_at: Utc::now(),
+            avg_win_pct: None,
+            avg_loss_pct: None,
         };
         let mut w2 = w1.clone();
         w2.wallet = "w2".into();

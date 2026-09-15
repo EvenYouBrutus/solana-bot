@@ -477,6 +477,8 @@ mod tests {
                 score: Decimal::from(80),
                 tier: crate::domain::wallet::WalletTier::Qualified,
                 updated_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                avg_win_pct: None,
+                avg_loss_pct: None,
             }],
             costs: crate::economics::CostModel {
                 observed_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),

@@ -1012,6 +1012,8 @@ sqlite_path = ":memory:"
             score,
             tier: crate::domain::wallet::WalletTier::Qualified,
             updated_at: ts,
+            avg_win_pct: None,
+            avg_loss_pct: None,
         }
     }
 

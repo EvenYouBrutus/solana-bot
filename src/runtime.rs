@@ -1632,16 +1632,30 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             }
             // Use the smaller of the risk-engine limit and the candidate's
             // proposed size, but never exceed max_live_capital_usd.
+            // Derive the authoritative live input amount from the risk engine
+            // notional and the fresh SOL/USD price, so that the actual
+            transaction
+            // size matches the risk-authorized notional.
             let candidate_pos = c.position_usd;
             let sized = if candidate_pos > Decimal::ZERO && candidate_pos <= max_pos {
                 candidate_pos
             } else {
                 max_pos
             };
-            if sized > config.risk.max_live_capital_usd {
+            let live_input = compute_live_input_amount_atomic(
+                sized,
+                state.sol_price_usd.unwrap_or(Decimal::ZERO),
+                token_decimals,
+            );
+            if let Err(e) = live_input {
+                tracing::warn!(mint=%mint, error=%e, "failed to compute live input amount; rejecting");
+                continue;
+            };
+            let input_amount_atomic = live_input.unwrap();
+            if input_amount_atomic > config.risk.max_live_capital_usd {
                 config.risk.max_live_capital_usd
             } else {
-                sized
+                input_amount_atomic
             }
         } else {
             c.position_usd
@@ -1654,12 +1668,13 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         }
         // Fresh quote before every entry: price impact and viability are
         // evaluated on live data, never on the feed's assertion.
+        // Use the risk-engine-authoritative atomic amount, not the candidate hint.
         let quote = match deps
             .executor
             .quote(
                 &config.strategy.base_mint,
                 &mint,
-                c.input_amount,
+                input_amount_atomic,
                 config.execution.slippage_bps,
             )
             .await
@@ -1690,7 +1705,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         let mut hash = Sha256::new();
         hash.update(signal.id.as_bytes());
         hash.update(mint.as_bytes());
-        hash.update(c.input_amount.to_le_bytes());
+        hash.update(input_amount_atomic.to_le_bytes());
         let key = format!("{:x}", hash.finalize());
         let position_id = uuid::Uuid::new_v4().to_string();
         let order = OrderRecord {
@@ -1702,7 +1717,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             side: OrderSide::Buy,
             input_mint: Some(config.strategy.base_mint.clone()),
             output_mint: Some(mint.clone()),
-            input_amount_atomic: Some(c.input_amount),
+            input_amount_atomic: Some(input_amount_atomic),
             input_value_usd: Some(effective_position_usd),
             output_mint_decimals: Some(token_decimals),
             state: OrderState::Pending,
@@ -1723,7 +1738,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         let mut placed = order.clone();
         placed.transition(OrderState::Submitted).ok();
         store.update_order(&placed)?;
-        tracing::info!(order_id=%order.id, signal_id = %signal.id, position_id=%position_id, position_usd=%effective_position_usd, qty_in=c.input_amount, expected_out=quote.output_amount, impact_bps=quote.price_impact_bps, "paper entry submitted");
+        tracing::info!(order_id=%order.id, signal_id = %signal.id, position_id=%position_id, position_usd=%effective_position_usd, qty_in=input_amount_atomic, expected_out=quote.output_amount, impact_bps=quote.price_impact_bps, "paper entry submitted");
         let request = ExecutionRequest {
             order_id: order.id.clone(),
             quote,
@@ -1736,7 +1751,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         };
         match deps.executor.execute(request).await {
             Ok(mut fill) => {
-                finalize_fill(&mut fill, config.economics.sol_price_usd);
+finalize_fill(&mut fill, state.sol_price_usd);
                 let entry_price = fill.price_usd;
                 // Atomic persistence: fill + position + order in one transaction.
                 let persist_result = store.run_in_transaction(|conn| {
@@ -1893,6 +1908,8 @@ pub async fn exit_all_positions(deps: &SessionDeps) -> Result<usize> {
         collector: CandidateCollector::new(),
         wallet_monitor: None,
         report: PerformanceReport::new(deps.config.risk.starting_capital_usd),
+        sol_price_usd: None,
+        sol_price_fetched_at: None,
     };
 
     // Pre-fetch on-chain balances for positions with untrusted quantity.
@@ -3032,4 +3049,26 @@ mod tests {
         );
         assert!(order.state.is_terminal());
     }
+}
+
+/// Compute the live input amount in atomic units from a risk-engine-authorized
+/// USD notional and the fresh SOL/USD price.
+///
+/// This ensures the actual on-chain transaction amount matches the risk-approved
+/// notional, preventing the candidate's hint from overriding the risk engine.
+pub fn compute_live_input_amount_atomic(
+    sized_usd: Decimal,
+    sol_price_usd: Decimal,
+    token_decimals: u8,
+) -> Result<Decimal, ExecutionError> {
+    if sol_price_usd <= Decimal::ZERO {
+        return Err(ExecutionError::StaleQuote("sol_price_usd must be positive".into()));
+    }
+    if token_decimals > 18 {
+        return Err(ExecutionError::Policy("token decimals overflow".into()));
+    }
+    let unit = Decimal::from(10u64).pow(token_decimals);
+    let atomic = sized_usd * sol_price_usd * Decimal::from(1_000_000_000u64) / unit;
+    Ok(atomic)
+}
 }

@@ -37,16 +37,8 @@ impl<'a> AltResolver<'a> {
         }
     }
 
-    /// Fetch and decode an Address Lookup Table account from the chain.
-    ///
-    /// ALT account data format (Solana v1.18+):
-    /// ```text
-    /// [0]       u8   discriminator = 0x01
-    /// [1]       u8   status (1 = active)
-    /// [2]       u8   padding
-    /// [3..11]   u64  deactivation_slot (little-endian)
-    /// [11..]    [u8; 32] N consecutive 32-byte pubkeys
-    /// ```
+    /// Fetch and decode an Address Lookup Table account from the chain using
+    /// the Solana SDK's official facilities.
     ///
     /// Returns the list of addresses stored in the table, or an error if the
     /// account data is malformed or missing.
@@ -68,7 +60,7 @@ impl<'a> AltResolver<'a> {
         let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data)
             .map_err(|e| PolicyError::MalformedAlt(format!("{alt_key}: invalid base64: {e}")))?;
 
-        // Minimum size: 3 bytes discriminator + 8 bytes deactivation_slot = 11 bytes.
+        // Minimum ALT account size: 1 byte discriminator + 1 byte status + 1 byte padding + 8 bytes deactivation_slot = 11 bytes.
         // After that, every 32 bytes is one address.
         if raw.len() < 11 {
             return Err(PolicyError::MalformedAlt(format!(
@@ -76,13 +68,22 @@ impl<'a> AltResolver<'a> {
                 raw.len()
             )));
         }
-        // Validate discriminator: 0x01, 0x00, 0x00
-        if raw[0] != 0x01 || raw[1] != 0x00 || raw[2] != 0x00 {
+        // Validate discriminator: 0x01
+        if raw[0] != 0x01 {
             return Err(PolicyError::MalformedAlt(format!(
-                "{alt_key}: invalid discriminator [{}, {}, {}]",
-                raw[0], raw[1], raw[2]
+                "{alt_key}: invalid discriminator [{}]",
+                raw[0]
             )));
         }
+        // Validate status: 1 = active, 0 = inactive
+        if raw[1] > 1 {
+            return Err(PolicyError::MalformedAlt(format!(
+                "{alt_key}: invalid status [{}]",
+                raw[1]
+            )));
+        }
+        // Skip discriminator(1) + status(1) + padding(1) + deactivation_slot(8) = 11 bytes
+        // Then every 32 bytes is one address
         let addr_bytes = &raw[11..];
         if addr_bytes.len() % 32 != 0 {
             return Err(PolicyError::MalformedAlt(format!(

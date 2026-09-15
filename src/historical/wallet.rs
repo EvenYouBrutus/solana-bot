@@ -75,7 +75,7 @@ impl HistoricalWalletStats {
     /// backtest engine. `entity_id` is left `None` because the
     /// reconstruction has no external entity-attribution source.
     pub fn to_wallet_stats(&self) -> WalletStats {
-        WalletStats {
+WalletStats {
             wallet: self.wallet.clone(),
             entity_id: None,
             realized_pnl_usd: self.realized_pnl_usd,
@@ -90,6 +90,8 @@ impl HistoricalWalletStats {
             score: self.score,
             tier: self.tier.clone(),
             updated_at: self.updated_at,
+            avg_win_pct: self.avg_win_pct,
+            avg_loss_pct: self.avg_loss_pct,
         }
     }
 }

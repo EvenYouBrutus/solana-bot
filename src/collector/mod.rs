@@ -116,18 +116,17 @@ impl CandidateCollector {
         // Fetch fresh SOL/USD price from Jupiter's price API for LIVE mode.
         // Do NOT use the config value (e.g. 150.0) as an implicit real-market price.
         // If unavailable or stale, reject the candidate.
-        let sol_price = self.fetch_sol_price_usd().await;
-        match &sol_price {
+        let sol_price = match self.fetch_sol_price_usd().await {
             None => {
                 tracing::error!("collect_live: unavailable SOL/USD price; no candidates produced");
                 return CollectResult::Candidates(vec![]);
             }
-            Some(price) if *price <= Decimal::ZERO => {
+            Some(price) if price <= Decimal::ZERO => {
                 tracing::error!(sol_price = %price, "collect_live: invalid SOL/USD price; no candidates produced");
                 return CollectResult::Candidates(vec![]);
             }
-            _ => {}
-        }
+            Some(price) => price,
+        };
         let mut candidates = Vec::new();
 
         for mint in SCAN_MINTS {
@@ -274,32 +273,35 @@ impl CandidateCollector {
                 || costs.input.assumed_avg_loss_pct.is_zero()
             {
                 tracing::warn!(
-                    mint = %mint,
                     "LIVE candidate rejected: unknown cost component (swap_fee_bps={}, failed_tx_rate={}, failed_tx_cost_usd={}, win_loss_ratio={}, loss_pct)",
                     costs.input.avg_swap_fee_bps,
                     costs.input.failed_tx_rate,
                     costs.input.avg_failed_tx_cost_usd,
                     costs.input.assumed_win_loss_ratio,
                     costs.input.assumed_avg_loss_pct,
-),
+                );
                 continue;
             }
-            mint: mint.to_string(),
-            token_decimals: Some(6),
-            base_mint_decimals: Some(9),
-            input_amount: quote.input_amount,
-            position_usd: input_value_usd,
-            expected_gross_return_pct: Decimal::ZERO,
-            market,
-            safety,
-            wallets,
-            costs,
-            blockchain_timestamp: now,
-            detection_timestamp: now,
-            candidate_timestamp: now,
-detection_latency_ms: 0,
-            }
-        
+
+            // Construct and push candidate with verified on-chain data.
+            candidates.push(CandidateInput {
+                mint: mint.to_string(),
+                token_decimals: Some(6),
+                base_mint_decimals: Some(9),
+                input_amount: quote.input_amount,
+                position_usd: input_value_usd,
+                expected_gross_return_pct: Decimal::ZERO,
+                market,
+                safety,
+                wallets,
+                costs,
+                blockchain_timestamp: now,
+                detection_timestamp: now,
+                candidate_timestamp: now,
+                detection_latency_ms: 0,
+            });
+        }
+
         tracing::info!(
             count = candidates.len(),
             "live collection produced candidates"
@@ -368,10 +370,10 @@ detection_latency_ms: 0,
         };
         let price_opt = body["data"]["So11111111111111111111111111111111111111112"]["price"].as_f64();
         let price = match price_opt {
-            Some(p) if p > 0.0 => Decimal::from_f64(p).unwrap_or_else(|| {
+            Some(p) if p > 0.0 => {
                 let s = format!("{}", p);
                 rust_decimal::Decimal::from_str_radix(&s, 10).unwrap_or(Decimal::ZERO)
-            }),
+            }
             _ => return None,
         };
         Some(price)
@@ -442,6 +444,8 @@ mod tests {
                     score: dec!(82),
                     tier: WalletTier::Qualified,
                     updated_at: observed_at - chrono::Duration::minutes(5),
+                    avg_win_pct: None,
+                    avg_loss_pct: None,
                 },
                 WalletStats {
                     wallet: "wallet_bbb222".into(),
@@ -451,13 +455,14 @@ mod tests {
                     avg_return_pct: dec!(12),
                     median_return_pct: dec!(10),
                     max_drawdown_pct: dec!(10),
-                    trades: 40,
                     recent_return_pct: dec!(8),
                     concentration_pct: dec!(3),
                     scam_exposure_pct: dec!(0),
-                    score: dec!(75),
+score: dec!(75),
                     tier: WalletTier::Qualified,
                     updated_at: observed_at - chrono::Duration::minutes(2),
+                    avg_win_pct: None,
+                    avg_loss_pct: None,
                 },
             ],
             costs: CostModel {
