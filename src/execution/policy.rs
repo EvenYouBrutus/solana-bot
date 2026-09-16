@@ -226,6 +226,7 @@ pub async fn validate_provider_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
     use solana_sdk::{
         instruction::Instruction, message::Message, signature::Keypair, signer::Signer,
         transaction::Transaction,

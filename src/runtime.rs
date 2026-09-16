@@ -1621,6 +1621,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
         state
             .risk
             .set_open_positions(state.portfolio.open_positions().len());
+        let input_amount_atomic;
         let effective_position_usd = if config.mode == crate::config::types::Mode::Live {
             let max_pos = state
                 .risk
@@ -1634,7 +1635,7 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
             // proposed size, but never exceed max_live_capital_usd.
             // Derive the authoritative live input amount from the risk engine
             // notional and the fresh SOL/USD price, so that the actual
-            transaction
+            // transaction
             // size matches the risk-authorized notional.
             let candidate_pos = c.position_usd;
             let sized = if candidate_pos > Decimal::ZERO && candidate_pos <= max_pos {
@@ -1651,13 +1652,16 @@ async fn process_entries(deps: &SessionDeps, state: &mut SessionState) -> Result
                 tracing::warn!(mint=%mint, error=%e, "failed to compute live input amount; rejecting");
                 continue;
             };
-            let input_amount_atomic = live_input.unwrap();
-            if input_amount_atomic > config.risk.max_live_capital_usd {
+            let atomic = live_input.unwrap();
+            let capped = if atomic > config.risk.max_live_capital_usd {
                 config.risk.max_live_capital_usd
             } else {
-                input_amount_atomic
-            }
+                atomic
+            };
+            input_amount_atomic = atomic.to_string().parse::<u64>().unwrap_or(0);
+            capped
         } else {
+            input_amount_atomic = c.position_usd.to_string().parse::<u64>().unwrap_or(0);
             c.position_usd
         };
         if effective_position_usd <= Decimal::ZERO
@@ -2219,6 +2223,8 @@ mod tests {
             collector: CandidateCollector::new(),
             wallet_monitor: None,
             report: PerformanceReport::new(config.risk.starting_capital_usd),
+            sol_price_usd: None,
+            sol_price_fetched_at: None,
         };
         let rpc = Arc::new(
             crate::data::rpc::RpcPool::with_attempts(
@@ -3062,13 +3068,12 @@ pub fn compute_live_input_amount_atomic(
     token_decimals: u8,
 ) -> Result<Decimal, ExecutionError> {
     if sol_price_usd <= Decimal::ZERO {
-        return Err(ExecutionError::StaleQuote("sol_price_usd must be positive".into()));
+        return Err(ExecutionError::Policy("sol_price_usd must be positive".into()));
     }
     if token_decimals > 18 {
         return Err(ExecutionError::Policy("token decimals overflow".into()));
     }
-    let unit = Decimal::from(10u64).pow(token_decimals);
+    let unit = Decimal::from(10u64.pow(token_decimals as u32));
     let atomic = sized_usd * sol_price_usd * Decimal::from(1_000_000_000u64) / unit;
     Ok(atomic)
-}
 }

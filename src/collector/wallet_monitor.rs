@@ -264,7 +264,7 @@ impl WalletAccumulator {
         trades.sort_by_key(|t| t.exit_time);
 
         let count = trades.len() as u32;
-if count == 0 {
+        if count == 0 {
             return WalletStats {
                 wallet: wallet.to_string(),
                 entity_id: None,
@@ -282,7 +282,8 @@ if count == 0 {
                 updated_at: cutoff,
                 avg_win_pct: None,
                 avg_loss_pct: None,
-            }
+            };
+        }
 
         let wins = trades
             .iter()
@@ -866,7 +867,21 @@ impl WalletMonitor {
             Some(p) => p,
             None => {
                 tracing::debug!(mint = %mint, "SOL price unavailable; skipping candidate build");
-                return;
+                return WalletValidationReport {
+                    wallet: wallet.to_string(),
+                    status: WalletStatus::IncompleteHistory,
+                    signatures_fetched: 0,
+                    successful_transactions: 0,
+                    swaps_parsed: 0,
+                    buys: 0,
+                    sells: 0,
+                    parse_failures: 0,
+                    fetch_failures: 0,
+                    history_complete: false,
+                    dex_activity: HashMap::new(),
+                    last_activity_ts: None,
+                    first_activity_ts: None,
+                };
             }
         };
             self.check_and_build_candidate(mint, &mut candidates, now, sol_price)
@@ -1535,12 +1550,12 @@ mod tests {
         acc.record_observation("T", &SwapDirection::Buy, dec!(1), dec!(100), past);
         let future = Utc::now() + Duration::days(1);
         acc.record_sell("T", dec!(50), dec!(1.2), future);
-        let stats_now = acc.build_stats("W", Some(Utc::now()));
+        let stats_now = acc.build_stats("W", Utc::now());
         assert_eq!(
             stats_now.trades, 0,
             "future trade must not count in PIT stats"
         );
-        let stats_future = acc.build_stats("W", Some(future + Duration::seconds(1)));
+        let stats_future = acc.build_stats("W", future + Duration::seconds(1));
         assert_eq!(stats_future.trades, 1);
     }
 
@@ -1717,7 +1732,7 @@ mod tests {
         assert_eq!(lot.sol_spent, dec!(0.5));
         assert_eq!(acc.completed_trades.len(), 2);
         // Aggregate stats: 1 win, 1 loss; PnL = (0.5-0.25) + (0.1-0.25) = +0.10.
-        let stats = acc.build_stats("W", Some(t0 + Duration::seconds(1)));
+        let stats = acc.build_stats("W", t0 + Duration::seconds(1));
         assert_eq!(stats.trades, 2);
         assert_eq!(stats.win_rate, dec!(0.5));
         assert_eq!(stats.realized_pnl_usd, dec!(0.10));
@@ -1981,7 +1996,7 @@ mod tests {
     #[test]
     fn zero_completed_trades_never_qualifies() {
         let acc = WalletAccumulator::new();
-        let stats = acc.build_stats("w", Some(Utc::now()));
+        let stats = acc.build_stats("w", Utc::now());
         assert_eq!(stats.trades, 0);
         assert_eq!(stats.tier, WalletTier::Candidate);
     }
@@ -2168,6 +2183,8 @@ mod tests {
             score: dec!(40),
             tier: WalletTier::Observed,
             updated_at: Utc::now(),
+            avg_win_pct: None,
+            avg_loss_pct: None,
         };
         assert!(!matches!(
             stats.tier,

@@ -517,6 +517,7 @@ sqlite_path = ":memory:"
             "live mode still needs jupiter_api_key_env"
         );
         c.execution.jupiter_api_key_env = Some("JUPITER_API_KEY".into());
+        c.economics.sol_price_usd = Some(rust_decimal_macros::dec!(150));
         assert!(c.validate().is_ok());
     }
     #[test]
@@ -527,6 +528,7 @@ sqlite_path = ":memory:"
         c.execution.allowed_program_ids =
             vec!["JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".into()];
         c.execution.jupiter_api_key_env = Some("JUPITER_API_KEY".into());
+        c.economics.sol_price_usd = Some(rust_decimal_macros::dec!(150));
         c.runtime.reconcile_interval_secs = 60;
         assert!(c.validate().is_ok());
         c.execution.jupiter_api_url = "".into();
@@ -557,6 +559,7 @@ sqlite_path = ":memory:"
         );
         // With valid jupiter_api_key_env, live mode must pass.
         c.execution.jupiter_api_key_env = Some("JUPITER_API_KEY".into());
+        c.economics.sol_price_usd = Some(rust_decimal_macros::dec!(150));
         assert!(c.validate().is_ok());
     }
 

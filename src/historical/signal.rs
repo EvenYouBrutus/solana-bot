@@ -293,6 +293,8 @@ mod tests {
             score: Decimal::from(75),
             tier: WalletTier::Qualified,
             updated_at: Utc.timestamp_opt(ts, 0).unwrap(),
+            avg_win_pct: None,
+            avg_loss_pct: None,
             filtered_future_trades: 0,
         }
     }

@@ -273,7 +273,7 @@ impl CandidateCollector {
                 || costs.input.assumed_avg_loss_pct.is_zero()
             {
                 tracing::warn!(
-                    "LIVE candidate rejected: unknown cost component (swap_fee_bps={}, failed_tx_rate={}, failed_tx_cost_usd={}, win_loss_ratio={}, loss_pct)",
+                    "LIVE candidate rejected: unknown cost component (swap_fee_bps={}, failed_tx_rate={}, failed_tx_cost_usd={}, win_loss_ratio={}, loss_pct={})",
                     costs.input.avg_swap_fee_bps,
                     costs.input.failed_tx_rate,
                     costs.input.avg_failed_tx_cost_usd,
@@ -455,10 +455,11 @@ mod tests {
                     avg_return_pct: dec!(12),
                     median_return_pct: dec!(10),
                     max_drawdown_pct: dec!(10),
+                    trades: 50,
                     recent_return_pct: dec!(8),
                     concentration_pct: dec!(3),
                     scam_exposure_pct: dec!(0),
-score: dec!(75),
+                    score: dec!(75),
                     tier: WalletTier::Qualified,
                     updated_at: observed_at - chrono::Duration::minutes(2),
                     avg_win_pct: None,

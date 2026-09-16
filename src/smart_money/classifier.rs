@@ -68,6 +68,8 @@ mod tests {
             score: Decimal::ZERO,
             tier: WalletTier::Candidate,
             updated_at: Utc::now(),
+            avg_win_pct: None,
+            avg_loss_pct: None,
         }
     }
     #[test]

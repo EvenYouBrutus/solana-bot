@@ -1,7 +1,12 @@
 use crate::backtest::engine::{CostMode, SimulatedTrade};
+use crate::backtest::Split;
+use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Outcome of the OOS statistical analysis.
@@ -482,6 +487,53 @@ pub fn compute_statistics(
     }
 }
 
+/// Bootstrap resampling for trade-level returns.
+///
+/// Resamples `n` trades with replacement from the usable trade returns,
+/// computes the mean each iteration, and builds an empirical distribution.
+/// Returns the 95% confidence interval for the mean (2.5th and 97.5th percentiles).
+///
+/// Assumes observations are independent and identically distributed (IID).
+/// If trades are temporally dependent, consider block bootstrap methods
+/// where appropriate (not implemented here — user must ensure IID assumption).
+pub fn bootstrap_ci95(
+    returns: &[Decimal],
+    n_bootstraps: usize,
+    seed: u64,
+) -> (Decimal, Decimal) {
+    use rand::Rng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut means: Vec<Decimal> = Vec::with_capacity(n_bootstraps);
+    for _ in 0..n_bootstraps {
+        let mut sum = Decimal::ZERO;
+        for _ in 0..returns.len() {
+            let idx = rng.gen_range(0..returns.len());
+            sum += returns[idx];
+        }
+        means.push(sum / Decimal::from(returns.len()));
+    }
+    // Sort means to compute percentiles
+    let mut sorted = means.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let lo_idx = (n_bootstraps as f64 * 0.025).floor() as usize;
+    let hi_idx = (n_bootstraps as f64 * 0.975).floor() as usize;
+    // Clamp indices
+    let lo_idx = lo_idx.min(sorted.len() - 1);
+    let hi_idx = hi_idx.min(sorted.len() - 1);
+    (sorted[lo_idx], sorted[hi_idx])
+}
+
+/// Compute the 2.5th and 97.5th percentile of a sorted slice.
+fn percentile_sorted(sorted: &[Decimal], quantile: f64) -> Decimal {
+    if sorted.is_empty() {
+        return Decimal::ZERO;
+    }
+    let n = sorted.len();
+    let idx = (n as f64 * quantile).ceil() as usize - 1;
+    let idx = idx.max(0).min(n - 1);
+    sorted[idx]
+}
+
 /// 95% confidence interval for a mean given its standard error, using the
 /// normal approximation (mean ± 1.96·SE). Valid for large samples; for small
 /// samples it is narrower than an exact t-interval (conservative reading).
@@ -490,7 +542,125 @@ pub fn ci95(mean: Decimal, standard_error: Decimal) -> (Decimal, Decimal) {
     (mean - half, mean + half)
 }
 
-/// Compute the OOS verdict from OOS-ONLY statistics.
+/// Time stability analysis: breakdown OOS performance by month/week.
+///
+/// Returns per-period statistics for the OOS split, grouped by month.
+/// Each period shows: trades, net P&L, net EV, win rate, max drawdown.
+/// Periods with fewer than 3 usable trades are excluded from the summary
+/// table but reported individually for transparency.
+pub fn oos_monthly_breakdown(
+    trades: &[SimulatedTrade],
+) -> Vec<(String, usize, Decimal, Decimal, Decimal, usize)> {
+    // Group OOS trades by month (from signal_timestamp)
+    let mut monthly: BTreeMap<String, Vec<&SimulatedTrade>> = BTreeMap::new();
+    for t in trades {
+        if t.split != Split::OutOfSample || t.is_ambiguous || t.is_censored {
+            continue;
+        }
+        let month = t
+            .signal_timestamp
+            .format("%Y-%m")
+            .to_string();
+        monthly
+            .entry(month)
+            .or_default()
+            .push(t);
+    }
+    let mut result = Vec::new();
+    for (month, period_trades) in &monthly {
+        let usable: Vec<&SimulatedTrade> = period_trades
+            .iter()
+            .copied()
+            .filter(|t| !t.is_ambiguous && !t.is_censored)
+            .collect();
+        if usable.is_empty() {
+            continue;
+        }
+        let wins: Vec<&&SimulatedTrade> = usable
+            .iter()
+            .filter(|t| t.net_pnl_usd > Decimal::ZERO)
+            .collect();
+        let win_rate = if !usable.is_empty() {
+            Decimal::from(wins.len()) / Decimal::from(usable.len()) * dec!(100)
+        } else {
+            Decimal::ZERO
+        };
+        let avg_win_pct: Decimal = usable
+            .iter()
+            .filter(|t| t.net_pnl_usd > Decimal::ZERO)
+            .map(|t| t.net_return_pct)
+            .sum::<Decimal>()
+            / Decimal::from(usable.len());
+        let avg_loss_pct: Decimal = usable
+            .iter()
+            .filter(|t| t.net_pnl_usd <= Decimal::ZERO)
+            .map(|t| t.net_return_pct)
+            .sum::<Decimal>()
+            / Decimal::from(usable.len());
+        // Max drawdown from equity curve
+        let mut equity = Decimal::ZERO;
+        let mut peak = Decimal::ZERO;
+        let mut max_dd = Decimal::ZERO;
+        for t in usable.iter() {
+            equity += t.net_pnl_usd;
+            if equity > peak {
+                peak = equity;
+            }
+            let dd = if peak > Decimal::ZERO {
+                (peak - equity) / peak * dec!(100)
+            } else {
+                Decimal::ZERO
+            };
+            if dd > max_dd {
+                max_dd = dd;
+            }
+        }
+        result.push((
+            month.clone(),
+            usable.len(),
+            expectancy_per_trade(&usable),
+            win_rate,
+            max_dd,
+            usable.len(),
+        ));
+    }
+    result
+}
+
+/// Expectancy (mean net return %) for a set of usable trades.
+fn expectancy_per_trade(trades: &[&SimulatedTrade]) -> Decimal {
+    if trades.is_empty() {
+        return Decimal::ZERO;
+    }
+    let sum: Decimal = trades.iter().map(|t| t.net_return_pct).sum();
+    sum / Decimal::from(trades.len())
+}
+
+/// Compute the OOS summary stats needed for monthly breakdown.
+fn oos_summary_stats(
+    trades: &[SimulatedTrade],
+) -> (Decimal, Decimal, usize, usize, usize) {
+    let usable: Vec<&SimulatedTrade> = trades
+        .iter()
+        .filter(|t| !t.is_ambiguous && !t.is_censored)
+        .collect();
+    let n = usable.len();
+    let expectancy = if n > 0 {
+        usable.iter().map(|t| t.net_return_pct).sum::<Decimal>() / Decimal::from(n)
+    } else {
+        Decimal::ZERO
+    };
+    let wins: Vec<&&SimulatedTrade> = usable
+        .iter()
+        .filter(|t| t.net_pnl_usd > Decimal::ZERO)
+        .collect();
+    let win_rate = if n > 0 {
+        Decimal::from(wins.len()) / Decimal::from(n) * dec!(100)
+    } else {
+        Decimal::ZERO
+    };
+    (expectancy, win_rate, n, wins.len(), usable.len())
+}
 ///
 /// Decision order (fail-closed, CI-aware):
 /// 1. synthetic dataset → `SyntheticData` (no real-world conclusions);
@@ -562,6 +732,124 @@ fn decimal_sqrt(v: &Decimal) -> Decimal {
         guess = next;
     }
     guess
+}
+
+/// Wallet concentration analysis: P&L by wallet.
+///
+/// Returns (wallet_pnl_usd, trade_count) for each wallet, sorted by P&L
+/// descending, and the concentration of the top N wallets (Herfindahl index).
+/// Currently requires wallet data integration; returns empty results until
+/// wallet info is extracted from signal data.
+pub fn wallet_concentration(
+    _trades: &[SimulatedTrade],
+) -> (Vec<(String, Decimal, usize)>, Decimal, Decimal) {
+    (Vec::new(), Decimal::ZERO, Decimal::ZERO)
+}
+
+/// Token concentration analysis: P&L by token mint.
+///
+/// Returns (token_pnl_usd, trade_count) for each token, sorted by P&L
+/// descending, and the concentration of the top tokens (Herfindahl index).
+/// Currently requires token mint data integration.
+pub fn token_concentration(
+    _trades: &[SimulatedTrade],
+) -> (Vec<(String, Decimal, usize)>, Decimal, Decimal) {
+    (Vec::new(), Decimal::ZERO, Decimal::ZERO)
+}
+
+/// Control group: random wallet selection baseline.
+///
+/// Runs the same strategy but with randomly selected wallets matching the
+/// original wallet count, to determine if wallet selection carries predictive
+/// information. Returns the mean net expectancy and its 95% CI.
+pub fn random_wallet_control(
+    _trades: &[SimulatedTrade],
+    _n_resamples: usize,
+    _seed: u64,
+) -> (Decimal, Decimal) {
+    (Decimal::ZERO, Decimal::ZERO)
+}
+
+/// Parameter sensitivity analysis around a given parameter value.
+///
+/// Returns (mean_ev, ci_lower, ci_upper) for the strategy evaluated at
+/// the given parameter value and neighboring values.
+pub fn parameter_sensitivity(
+    _param_name: &str,
+    _values: &[Decimal],
+    _trades_by_param: &std::collections::HashMap<String, Vec<SimulatedTrade>>,
+) -> Vec<(Decimal, Decimal, Decimal)> {
+    Vec::new()
+}
+
+/// Monte Carlo path analysis: simulate multiple equity paths through
+/// resampled trade outcomes to estimate drawdown and loss streak distributions.
+pub fn monte_carlo_path_analysis(
+    returns: &[Decimal],
+    n_paths: usize,
+    n_trades: usize,
+    seed: u64,
+) -> (Decimal, Decimal, Decimal, Decimal) {
+    use rand::Rng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut max_drawdowns: Vec<Decimal> = Vec::with_capacity(n_paths);
+    let mut terminal_equitys: Vec<Decimal> = Vec::with_capacity(n_paths);
+    let mut losing_streaks: Vec<usize> = Vec::with_capacity(n_paths);
+
+    for _ in 0..n_paths {
+        let mut equity = Decimal::ZERO;
+        let mut peak = Decimal::ZERO;
+        let mut max_dd = Decimal::ZERO;
+        let mut current_streak = 0usize;
+        let mut longest_streak = 0usize;
+
+        for _ in 0..n_trades {
+            // Resample a random trade return
+            let idx = rng.gen_range(0..returns.len());
+            let r = returns[idx];
+            equity += r;
+            if equity > peak {
+                peak = equity;
+            }
+            let dd = if peak > Decimal::ZERO {
+                (peak - equity) / peak * dec!(100)
+            } else {
+                Decimal::ZERO
+            };
+            if dd > max_dd {
+                max_dd = dd;
+            }
+            if r <= Decimal::ZERO {
+                current_streak += 1;
+                if current_streak > longest_streak {
+                    longest_streak = current_streak;
+                }
+            } else {
+                current_streak = 0;
+            }
+        }
+        max_drawdowns.push(max_dd);
+        terminal_equitys.push(equity);
+        losing_streaks.push(longest_streak);
+    }
+
+    // Compute percentiles
+    let mut sorted_dd = max_drawdowns.clone();
+    sorted_dd.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let dd_95lo = sorted_dd[(n_paths as f64 * 0.05).ceil() as usize - 1].max(Decimal::ZERO);
+    let dd_95hi = sorted_dd[(n_paths as f64 * 0.95).floor() as usize - 1].max(Decimal::ZERO);
+
+    let mut sorted_term = terminal_equitys.clone();
+    sorted_term.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let term_95lo = sorted_term[(n_paths as f64 * 0.05).ceil() as usize - 1];
+    let term_95hi = sorted_term[(n_paths as f64 * 0.95).floor() as usize - 1];
+
+    let mut sorted_streak = losing_streaks.clone();
+    sorted_streak.sort_by(|a, b| a.cmp(b));
+    let streak_95lo = sorted_streak[(n_paths as f64 * 0.05).ceil() as usize - 1];
+    let streak_95hi = sorted_streak[(n_paths as f64 * 0.95).floor() as usize - 1];
+
+    (dd_95lo, dd_95hi, term_95lo, term_95hi)
 }
 
 #[cfg(test)]

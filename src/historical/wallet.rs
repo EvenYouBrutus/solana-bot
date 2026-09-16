@@ -65,6 +65,8 @@ pub struct HistoricalWalletStats {
     pub score: Decimal,
     pub tier: WalletTier,
     pub updated_at: DateTime<Utc>,
+    pub avg_win_pct: Option<Decimal>,
+    pub avg_loss_pct: Option<Decimal>,
     /// Number of trades discarded because they occurred after the
     /// requested point in time.
     pub filtered_future_trades: u32,
@@ -258,6 +260,8 @@ pub fn reconstruct_at(trades: &[WalletTrade], as_of: DateTime<Utc>) -> Historica
             score: Decimal::ZERO,
             tier: WalletTier::Candidate,
             updated_at: as_of,
+            avg_win_pct: None,
+            avg_loss_pct: None,
             filtered_future_trades,
         };
     }
@@ -367,6 +371,8 @@ pub fn reconstruct_at(trades: &[WalletTrade], as_of: DateTime<Utc>) -> Historica
         score: Decimal::ZERO,
         tier: WalletTier::Candidate,
         updated_at: as_of,
+        avg_win_pct: None,
+        avg_loss_pct: None,
         filtered_future_trades,
     };
     // Use the production scoring function so the backtest wallet

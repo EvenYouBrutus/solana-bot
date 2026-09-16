@@ -445,6 +445,8 @@ mod tests {
                 score: dec!(80),
                 tier: WalletTier::Qualified,
                 updated_at: wallet_updated_at,
+                avg_win_pct: None,
+                avg_loss_pct: None,
             }],
             costs: CostModel {
                 observed_at,
