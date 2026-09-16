@@ -1,16 +1,19 @@
 //! Real historical OHLCV ingestion from a Solana market-data provider.
 //!
-//! The default provider is the Birdeye public API
-//! (`https://public-api.birdeye.so`), the established Solana market-data
-//! provider with deep historical OHLCV support. The same request/response
-//! shape is implemented in `OhlcvProvider`, and the cache + retry +
-//! pagination + resume logic is provider-agnostic so the operator can
-//! point it at a different host via `OHLCV_PROVIDER_URL`.
+//! Two providers are supported:
+//!
+//! 1. **Birdeye** (`https://public-api.birdeye.so`) — the default.
+//!    Requires `BIRDEYE_API_KEY`. Returns OHLCV by token address directly.
+//!
+//! 2. **GeckoTerminal** (`https://api.geckoterminal.com`) — free fallback.
+//!    No API key required. Returns OHLCV by *pool* address, so the
+//!    provider auto-discovers the most liquid Solana pool for each token.
+//!    Activate with `OHLCV_PROVIDER=geckoterminal`.
 //!
 //! Required environment variables:
-//! - `BIRDEYE_API_KEY` (the API key sent in the `X-API-KEY` header).
-//!   Optional override:
-//! - `OHLCV_PROVIDER_URL` (defaults to the Birdeye public endpoint).
+//! - `BIRDEYE_API_KEY` — required when using Birdeye (default).
+//! - `OHLCV_PROVIDER` — set to `geckoterminal` to use the free fallback.
+//! - `OHLCV_PROVIDER_URL` — optional base URL override.
 //!
 //! All requests are bounded:
 //! - retry with exponential backoff on transient errors and 429/5xx;
@@ -99,6 +102,30 @@ impl OhlcvInterval {
         }
     }
 
+    /// GeckoTerminal timeframe string.
+    pub fn as_geckoterminal(self) -> &'static str {
+        match self {
+            OhlcvInterval::M1 => "minute",
+            OhlcvInterval::M5 => "minute",
+            OhlcvInterval::M15 => "minute",
+            OhlcvInterval::H1 => "hour",
+            OhlcvInterval::H4 => "hour",
+            OhlcvInterval::D1 => "day",
+        }
+    }
+
+    /// GeckoTerminal aggregate parameter (how many base intervals per candle).
+    pub fn geckoterminal_aggregate(self) -> u32 {
+        match self {
+            OhlcvInterval::M1 => 1,
+            OhlcvInterval::M5 => 5,
+            OhlcvInterval::M15 => 15,
+            OhlcvInterval::H1 => 1,
+            OhlcvInterval::H4 => 4,
+            OhlcvInterval::D1 => 1,
+        }
+    }
+
     pub fn as_label(self) -> &'static str {
         match self {
             OhlcvInterval::M1 => "1m",
@@ -123,10 +150,17 @@ impl OhlcvInterval {
     }
 }
 
+/// Which OHLCV backend to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    Birdeye,
+    GeckoTerminal,
+}
+
 /// Reasons a historical fetch can fail.
 #[derive(Debug, Error)]
 pub enum OhlcvError {
-    #[error("missing API key for OHLCV provider; set BIRDEYE_API_KEY env variable")]
+    #[error("missing API key for OHLCV provider; set BIRDEYE_API_KEY or OHLCV_PROVIDER=geckoterminal")]
     MissingApiKey,
     #[error("HTTP error: {0}")]
     Http(String),
@@ -145,6 +179,7 @@ pub enum OhlcvError {
 pub struct OhlcvProviderConfig {
     pub base_url: String,
     pub api_key: Option<String>,
+    pub provider_kind: ProviderKind,
     pub max_retries: u32,
     pub initial_backoff_ms: u64,
     pub page_seconds: i64,
@@ -153,23 +188,41 @@ pub struct OhlcvProviderConfig {
 
 impl OhlcvProviderConfig {
     /// Build the default config from environment variables:
-    /// - `BIRDEYE_API_KEY` required.
+    /// - `BIRDEYE_API_KEY` required when `OHLCV_PROVIDER` is not `geckoterminal`.
+    /// - `OHLCV_PROVIDER` optional: `birdeye` (default) or `geckoterminal`.
     /// - `OHLCV_PROVIDER_URL` optional override.
     /// - `OHLCV_CACHE_DIR` optional cache directory override.
     pub fn from_env(cache_dir: PathBuf) -> Result<Self, OhlcvError> {
+        let provider_kind = match std::env::var("OHLCV_PROVIDER")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .as_deref()
+        {
+            Some("geckoterminal") => ProviderKind::GeckoTerminal,
+            Some("birdeye") | None => ProviderKind::Birdeye,
+            Some(other) => {
+                tracing::warn!(provider = other, "unknown OHLCV_PROVIDER, falling back to birdeye");
+                ProviderKind::Birdeye
+            }
+        };
         let api_key = std::env::var("BIRDEYE_API_KEY")
             .ok()
             .filter(|v| !v.trim().is_empty());
-        let base_url = std::env::var("OHLCV_PROVIDER_URL")
-            .unwrap_or_else(|_| "https://public-api.birdeye.so".to_string());
-        if api_key.is_none() {
+        let base_url = match provider_kind {
+            ProviderKind::Birdeye => std::env::var("OHLCV_PROVIDER_URL")
+                .unwrap_or_else(|_| "https://public-api.birdeye.so".to_string()),
+            ProviderKind::GeckoTerminal => std::env::var("OHLCV_PROVIDER_URL")
+                .unwrap_or_else(|_| "https://api.geckoterminal.com".to_string()),
+        };
+        if provider_kind == ProviderKind::Birdeye && api_key.is_none() {
             return Err(OhlcvError::MissingApiKey);
         }
         Ok(Self {
             base_url,
             api_key,
-            max_retries: 5,
-            initial_backoff_ms: 500,
+            provider_kind,
+            max_retries: if provider_kind == ProviderKind::GeckoTerminal { 10 } else { 5 },
+            initial_backoff_ms: if provider_kind == ProviderKind::GeckoTerminal { 2000 } else { 500 },
             page_seconds: 7 * 86_400, // 7-day pages keep payloads small
             cache_dir,
         })
@@ -180,8 +233,22 @@ impl OhlcvProviderConfig {
         Self {
             base_url: base_url.into(),
             api_key,
+            provider_kind: ProviderKind::Birdeye,
             max_retries: 5,
             initial_backoff_ms: 250,
+            page_seconds: 7 * 86_400,
+            cache_dir,
+        }
+    }
+
+    /// Explicit constructor for GeckoTerminal.
+    pub fn new_geckoterminal(cache_dir: PathBuf) -> Self {
+        Self {
+            base_url: "https://api.geckoterminal.com".to_string(),
+            api_key: None,
+            provider_kind: ProviderKind::GeckoTerminal,
+            max_retries: 5,
+            initial_backoff_ms: 1500,
             page_seconds: 7 * 86_400,
             cache_dir,
         }
@@ -192,6 +259,8 @@ impl OhlcvProviderConfig {
 pub struct OhlcvProvider {
     cfg: OhlcvProviderConfig,
     client: reqwest::Client,
+    /// GeckoTerminal pool-id cache: token mint -> best pool id.
+    pool_cache: std::sync::RwLock<BTreeMap<String, String>>,
 }
 
 impl OhlcvProvider {
@@ -200,7 +269,16 @@ impl OhlcvProvider {
             .timeout(StdDuration::from_secs(30))
             .build()
             .map_err(|e| OhlcvError::Http(e.to_string()))?;
-        Ok(Self { cfg, client })
+        Ok(Self {
+            cfg,
+            client,
+            pool_cache: std::sync::RwLock::new(BTreeMap::new()),
+        })
+    }
+
+    /// Which provider backend is active.
+    pub fn provider_kind(&self) -> ProviderKind {
+        self.cfg.provider_kind
     }
 
     /// Fetch every candle in `[from, to]` for `mint` at `interval`,
@@ -260,6 +338,24 @@ impl OhlcvProvider {
         if let Some(cached) = read_cache(&cache_path)? {
             return Ok(cached);
         }
+        let candles = match self.cfg.provider_kind {
+            ProviderKind::Birdeye => self.fetch_page_birdeye(mint, interval, from, to).await?,
+            ProviderKind::GeckoTerminal => {
+                self.fetch_page_geckoterminal(mint, interval, from, to).await?
+            }
+        };
+        write_cache(&cache_path, &candles)?;
+        Ok(candles)
+    }
+
+    /// Birdeye OHLCV fetch.
+    async fn fetch_page_birdeye(
+        &self,
+        mint: &str,
+        interval: OhlcvInterval,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<OhlcvCandle>, OhlcvError> {
         let api_key = self
             .cfg
             .api_key
@@ -333,8 +429,215 @@ impl OhlcvProvider {
                 ));
             }
             let candles = parse_candles(body.data.items)?;
-            write_cache(&cache_path, &candles)?;
             return Ok(candles);
+        }
+    }
+
+    /// GeckoTerminal OHLCV fetch (paginated by page number).
+    async fn fetch_page_geckoterminal(
+        &self,
+        mint: &str,
+        interval: OhlcvInterval,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<OhlcvCandle>, OhlcvError> {
+        let pool_id = self.resolve_pool(mint).await?;
+        sleep_ms(2000).await;
+        let timeframe = interval.as_geckoterminal();
+        let aggregate = interval.geckoterminal_aggregate();
+        let mut all_candles: Vec<OhlcvCandle> = Vec::new();
+        let mut page = 1u32;
+        let max_pages = 50u32;
+        let from_ts = from.timestamp();
+        let to_ts = to.timestamp();
+        'pages: loop {
+            if page > max_pages {
+                tracing::warn!(mint, "geckoterminal: reached max pages, stopping");
+                break;
+            }
+            let url = format!(
+                "{}/api/v2/networks/solana/pools/{}/ohlcv/{}?aggregate={}&page={}",
+                self.cfg.base_url.trim_end_matches('/'),
+                pool_id,
+                timeframe,
+                aggregate,
+                page,
+            );
+            // Fetch with retry/backoff.
+            let mut attempt = 0u32;
+            let mut backoff_ms = self.cfg.initial_backoff_ms;
+            let candles: Vec<OhlcvCandle> = loop {
+                attempt += 1;
+                let resp = self.client.get(&url).send().await;
+                let resp = match resp {
+                    Ok(r) => r,
+                    Err(e) if attempt <= self.cfg.max_retries => {
+                        tracing::warn!(attempt, error = %e, "geckoterminal http error, retrying");
+                        sleep_ms(backoff_ms).await;
+                        backoff_ms = (backoff_ms * 2).min(60_000);
+                        continue;
+                    }
+                    Err(e) => return Err(OhlcvError::Http(e.to_string())),
+                };
+                let status = resp.status();
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    if attempt <= self.cfg.max_retries {
+                        let retry_after = resp
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(5);
+                        let wait = (retry_after * 1000 + 2000).max(backoff_ms);
+                        tracing::warn!(retry_after_secs = retry_after, wait_ms = wait, attempt, "geckoterminal rate limited, waiting");
+                        sleep_ms(wait).await;
+                        backoff_ms = (backoff_ms * 2).min(60_000);
+                        continue;
+                    }
+                    return Err(OhlcvError::RateLimited {
+                        retry_after_secs: backoff_ms / 1000 + 1,
+                    });
+                }
+                if status.is_server_error() && attempt <= self.cfg.max_retries {
+                    tracing::warn!(attempt, %status, "geckoterminal 5xx, retrying");
+                    sleep_ms(backoff_ms).await;
+                    backoff_ms = (backoff_ms * 2).min(60_000);
+                    continue;
+                }
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(OhlcvError::Provider(format!("geckoterminal status {status}: {body}")));
+                }
+                let body: GeckoTerminalOhlcvResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| OhlcvError::Invalid(format!("geckoterminal parse: {e}")))?;
+                break parse_geckoterminal_candles(body)?;
+            };
+            let count = candles.len();
+            if count == 0 {
+                break;
+            }
+            for c in &candles {
+                let ts = c.timestamp.timestamp();
+                if ts >= from_ts && ts <= to_ts {
+                    all_candles.push(c.clone());
+                }
+            }
+            let oldest_ts = candles.iter().map(|c| c.timestamp.timestamp()).min().unwrap_or(0);
+            if oldest_ts > from_ts && count >= 100 {
+                page += 1;
+                sleep_ms(3000).await;
+                continue 'pages;
+            }
+            break;
+        }
+        tracing::info!(
+            mint = mint,
+            timeframe = timeframe,
+            pool = pool_id,
+            candles = all_candles.len(),
+            "geckoterminal OHLCV fetched"
+        );
+        Ok(all_candles)
+    }
+
+    /// Resolve a token mint to the best GeckoTerminal pool id (highest liquidity).
+    async fn resolve_pool(&self, mint: &str) -> Result<String, OhlcvError> {
+        // Check in-memory cache first.
+        {
+            let cache = self.pool_cache.read().map_err(|e| OhlcvError::Invalid(e.to_string()))?;
+            if let Some(id) = cache.get(mint) {
+                return Ok(id.clone());
+            }
+        }
+        // Check disk cache.
+        let pool_cache_path = self.cfg.cache_dir.join(format!("pool_{}.json", mint));
+        if let Some(cached_id) = read_pool_cache(&pool_cache_path)? {
+            let mut cache = self.pool_cache.write().map_err(|e| OhlcvError::Invalid(e.to_string()))?;
+            cache.insert(mint.to_string(), cached_id.clone());
+            return Ok(cached_id);
+        }
+        // Fetch from GeckoTerminal API.
+        sleep_ms(2000).await; // respect rate limit
+        let url = format!(
+            "{}/api/v2/networks/solana/tokens/{}/pools?page=1",
+            self.cfg.base_url.trim_end_matches('/'),
+            mint,
+        );
+        let mut attempt = 0u32;
+        let mut backoff_ms = self.cfg.initial_backoff_ms;
+        loop {
+            attempt += 1;
+            let resp = self.client.get(&url).send().await;
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) if attempt <= self.cfg.max_retries => {
+                    tracing::warn!(attempt, error = %e, "geckoterminal pool lookup error, retrying");
+                    sleep_ms(backoff_ms).await;
+                    backoff_ms = (backoff_ms * 2).min(30_000);
+                    continue;
+                }
+                Err(e) => return Err(OhlcvError::Http(e.to_string())),
+            };
+            let status = resp.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                if attempt <= self.cfg.max_retries {
+                    let retry_after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(5);
+                    let wait = (retry_after * 1000 + 2000).max(backoff_ms);
+                    tracing::warn!(retry_after_secs = retry_after, wait_ms = wait, attempt, "geckoterminal pool rate limited, waiting");
+                    sleep_ms(wait).await;
+                    backoff_ms = (backoff_ms * 2).min(60_000);
+                    continue;
+                }
+                return Err(OhlcvError::RateLimited {
+                    retry_after_secs: backoff_ms / 1000 + 1,
+                });
+            }
+            if status.is_server_error() && attempt <= self.cfg.max_retries {
+                tracing::warn!(attempt, %status, "geckoterminal pool 5xx, retrying");
+                sleep_ms(backoff_ms).await;
+                backoff_ms = (backoff_ms * 2).min(60_000);
+                continue;
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(OhlcvError::Provider(format!("geckoterminal pool status {status}: {body}")));
+            }
+            let body: GeckoTerminalPoolResponse = resp
+                .json()
+                .await
+                .map_err(|e| OhlcvError::Invalid(format!("geckoterminal pool parse: {e}")))?;
+            // Pick the pool with highest liquidity (reserve_in_usd).
+            let best = body
+                .data
+                .iter()
+                .max_by(|a, b| {
+                    let liq_a = a.attributes
+                        .reserve_in_usd
+                        .as_ref()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let liq_b = b.attributes
+                        .reserve_in_usd
+                        .as_ref()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    liq_a.partial_cmp(&liq_b).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .ok_or_else(|| OhlcvError::Provider(format!("no pools found for token {mint}")))?;
+            // GeckoTerminal pool id format: "solana_{address}"
+            let pool_id = best.id.strip_prefix("solana_").unwrap_or(&best.id).to_string();
+            write_pool_cache(&pool_cache_path, &pool_id)?;
+            let mut cache = self.pool_cache.write().map_err(|e| OhlcvError::Invalid(e.to_string()))?;
+            cache.insert(mint.to_string(), pool_id.clone());
+            tracing::info!(mint = mint, pool = pool_id, "resolved GeckoTerminal pool");
+            return Ok(pool_id);
         }
     }
 
@@ -373,6 +676,41 @@ struct OhlcvData {
     #[serde(default)]
     #[allow(dead_code)]
     address: Option<String>,
+}
+
+/// GeckoTerminal OHLCV response.
+#[derive(Debug, Deserialize)]
+struct GeckoTerminalOhlcvResponse {
+    data: GeckoTerminalOhlcvData,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeckoTerminalOhlcvData {
+    attributes: GeckoTerminalOhlcvAttrs,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeckoTerminalOhlcvAttrs {
+    /// `[timestamp, open, high, low, close, volume]` arrays, newest-first.
+    ohlcv_list: Vec<Vec<f64>>,
+}
+
+/// GeckoTerminal pool list response.
+#[derive(Debug, Deserialize)]
+struct GeckoTerminalPoolResponse {
+    data: Vec<GeckoTerminalPool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeckoTerminalPool {
+    id: String,
+    attributes: GeckoTerminalPoolAttrs,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeckoTerminalPoolAttrs {
+    #[serde(default)]
+    reserve_in_usd: Option<String>,
 }
 
 /// Raw candle as returned by Birdeye: `[unix_ts, open, high, low, close, volume]`.
@@ -414,6 +752,84 @@ fn parse_candles(items: Vec<RawCandle>) -> Result<Vec<OhlcvCandle>, OhlcvError> 
         });
     }
     Ok(out)
+}
+
+/// Parse GeckoTerminal OHLCV response into chronological candles.
+/// GeckoTerminal returns arrays `[timestamp, open, high, low, close, volume]`
+/// in newest-first order.
+fn parse_geckoterminal_candles(
+    resp: GeckoTerminalOhlcvResponse,
+) -> Result<Vec<OhlcvCandle>, OhlcvError> {
+    let mut out: Vec<OhlcvCandle> = Vec::with_capacity(resp.data.attributes.ohlcv_list.len());
+    for row in &resp.data.attributes.ohlcv_list {
+        if row.len() < 6 {
+            tracing::warn!("geckoterminal: skipping short ohlcv row (len={})", row.len());
+            continue;
+        }
+        let ts = row[0] as i64;
+        let o = Decimal::try_from(row[1]).map_err(|e| OhlcvError::Invalid(format!("bad open: {e}")))?;
+        let h = Decimal::try_from(row[2]).map_err(|e| OhlcvError::Invalid(format!("bad high: {e}")))?;
+        let l = Decimal::try_from(row[3]).map_err(|e| OhlcvError::Invalid(format!("bad low: {e}")))?;
+        let c = Decimal::try_from(row[4]).map_err(|e| OhlcvError::Invalid(format!("bad close: {e}")))?;
+        let v = Decimal::try_from(row[5]).map_err(|e| OhlcvError::Invalid(format!("bad volume: {e}")))?;
+        let ts_dt = Utc
+            .timestamp_opt(ts, 0)
+            .single()
+            .ok_or_else(|| OhlcvError::Invalid(format!("bad unix timestamp {ts}")))?;
+        if o <= Decimal::ZERO || h <= Decimal::ZERO || l <= Decimal::ZERO || c <= Decimal::ZERO {
+            tracing::warn!(timestamp = %ts_dt, "geckoterminal: skipping non-positive OHLC candle");
+            continue;
+        }
+        if h < l {
+            tracing::warn!(timestamp = %ts_dt, "geckoterminal: skipping OHLC candle with high<low");
+            continue;
+        }
+        out.push(OhlcvCandle {
+            timestamp: ts_dt,
+            open_usd: o,
+            high_usd: h,
+            low_usd: l,
+            close_usd: c,
+            volume_usd: Some(v),
+            liquidity_usd: None,
+        });
+    }
+    // GeckoTerminal returns newest-first; reverse to chronological.
+    out.sort_by_key(|c| c.timestamp);
+    Ok(out)
+}
+
+fn read_pool_cache(path: &Path) -> Result<Option<String>, OhlcvError> {
+    let mut f = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    let mut buf = String::new();
+    f.read_to_string(&mut buf)?;
+    let trimmed = buf.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed))
+}
+
+fn write_pool_cache(path: &Path, pool_id: &str) -> Result<(), OhlcvError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(pool_id.as_bytes())?;
+        f.sync_data()?;
+    }
+    let _ = fs::remove_file(path);
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn read_cache(path: &Path) -> Result<Option<Vec<OhlcvCandle>>, OhlcvError> {
@@ -624,6 +1040,6 @@ mod tests {
     fn missing_api_key_is_typed_error() {
         let err = OhlcvError::MissingApiKey;
         assert!(matches!(err, OhlcvError::MissingApiKey));
-        assert!(err.to_string().contains("BIRDEYE_API_KEY"));
+        assert!(err.to_string().contains("BIRDEYE_API_KEY") || err.to_string().contains("geckoterminal"));
     }
 }

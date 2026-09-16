@@ -191,10 +191,20 @@ impl HistoricalBuilder {
                 _ => None,
             },
             unique_tokens: unique_tokens.len(),
-            providers: vec![
-                format!("birdeye ({})", self.ohclv_endpoint()),
-                "solana_rpc (getAccountInfo, getSignaturesForAddress, getTransaction)".into(),
-            ],
+            providers: {
+                let mut p = Vec::new();
+                let ohlcv_name = match self.ohclv.provider_kind() {
+                    crate::historical::ohlcv::ProviderKind::Birdeye => {
+                        format!("birdeye ({})", self.ohclv_endpoint())
+                    }
+                    crate::historical::ohlcv::ProviderKind::GeckoTerminal => {
+                        "geckoterminal (free, no API key)".to_string()
+                    }
+                };
+                p.push(ohlcv_name);
+                p.push("solana_rpc (getAccountInfo, getSignaturesForAddress, getTransaction)".into());
+                p
+            },
         })
     }
 

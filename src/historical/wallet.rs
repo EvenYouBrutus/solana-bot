@@ -135,7 +135,8 @@ impl WalletReconstructor {
     }
 
     /// Fetch every wallet trade up to `as_of`. Cached files are
-    /// re-used across runs.
+    /// re-used across runs. When `external_trades` is provided, those
+    /// trades are used instead of fetching from RPC.
     pub async fn fetch_wallet_trades(
         &self,
         wallet: &str,
